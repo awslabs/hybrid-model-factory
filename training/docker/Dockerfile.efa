@@ -1,0 +1,92 @@
+FROM nvcr.io/nvidia/pytorch:25.01-py3
+
+# Pre-install PyTorch 2.10.0 with CUDA 12.8
+RUN pip install --no-cache-dir \
+    torch==2.10.0+cu128 \
+    torchvision==0.25.0+cu128 \
+    torchaudio==2.10.0+cu128 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# Install core packages with build isolation disabled for CUDA kernels
+RUN pip install --no-cache-dir \
+    mistral-common \
+    tiktoken \
+    numpy==1.26.4
+
+RUN pip install --no-cache-dir --no-build-isolation \
+    flash-attn==2.8.3 \
+    mamba-ssm==2.3.0 \
+    causal-conv1d==1.6.0 \
+    flash-linear-attention==0.4.1 \
+    ring-flash-attn==0.1.8
+
+# Install HuggingFace packages
+RUN pip install --no-cache-dir \
+    yunchang==0.6.1 \
+    transformers==5.3.0 \
+    datasets==3.4.1 \
+    huggingface_hub==1.3.7 \
+    tokenizers==0.22.2
+
+# Install accelerator packages
+RUN pip install --no-cache-dir \
+    deepspeed==0.17.6 \
+    triton==3.6.0
+
+# Install metrics and evaluation packages
+RUN pip install --no-cache-dir \
+    nltk \
+    jieba \
+    rouge-chinese \
+    pytrec_eval \
+    rouge_score \
+    tensorboard
+
+# Apply Qwen3.5 position IDs patch
+COPY patches/qwen3_5_position_ids_fix.patch /tmp/
+RUN patch -p1 -N -d /usr/local/lib/python3.12/dist-packages < /tmp/qwen3_5_position_ids_fix.patch
+
+### Start EFA ###
+ARG EFA_INSTALLER_VERSION=1.47.0
+ARG AWS_OFI_NCCL_VERSION=1.18.0
+# EFA
+RUN apt-get update && \
+    cd /tmp && \
+    curl -O https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz  && \
+    tar -xf aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz && \
+    cd aws-efa-installer && \
+    ./efa_installer.sh -y -g -d --skip-kmod --skip-limit-conf && \
+    ldconfig && \
+    rm -rf /tmp/aws-efa-installer /var/lib/apt/lists/* && \
+    /opt/amazon/efa/bin/fi_info --version
+ENV LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+ENV PATH=/opt/amazon/efa/bin:$PATH
+# NCCL EFA Plugin
+RUN apt-get update && \
+    apt-get -y install libhwloc-dev && \
+    mkdir -p /tmp && \
+    cd /tmp && \
+    curl -LO https://github.com/aws/aws-ofi-nccl/archive/refs/tags/v${AWS_OFI_NCCL_VERSION}.tar.gz && \
+    tar -xzf /tmp/v${AWS_OFI_NCCL_VERSION}.tar.gz && \
+    rm /tmp/v${AWS_OFI_NCCL_VERSION}.tar.gz && \
+    mv aws-ofi-nccl-${AWS_OFI_NCCL_VERSION} aws-ofi-nccl && \
+    cd /tmp/aws-ofi-nccl && \
+    ./autogen.sh && \
+    ./configure --prefix=/opt/aws-ofi-nccl \
+        --with-libfabric=/opt/amazon/efa \
+        --with-cuda=/usr/local/cuda \
+        --enable-platform-aws \
+        --with-mpi=/opt/amazon/openmpi && \
+    make -j$(nproc) install && \
+    rm -rf /tmp/aws-ofi/nccl
+# NCCL
+RUN echo "/usr/local/lib"      >> /etc/ld.so.conf.d/local.conf && \
+    echo "/opt/amazon/efa/lib" >> /etc/ld.so.conf.d/efa.conf &&  \
+    ldconfig
+ENV OMPI_MCA_pml=^cm                \
+    OMPI_MCA_btl=tcp,self           \
+    OPAL_PREFIX=/opt/amazon/openmpi    
+ENV FI_PROVIDER=efa
+ENV LD_LIBRARY_PATH="/usr/local/lib:/opt/nccl/build/lib:/usr/local/cuda/lib64:/opt/amazon/efa/lib:/opt/amazon/openmpi/lib:/opt/aws-ofi-nccl/lib:${LD_LIBRARY_PATH}"
+ENV PATH="/usr/local/nvm/versions/node/v16.19.1/bin:/opt/amazon/efa/bin:/usr/local/lib/python3.8/dist-packages/torch_tensorrt/bin:/opt/amazon/openmpi/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin:/opt/tensorrt/bin:/opt/s5cmd"
+### End EFA ###

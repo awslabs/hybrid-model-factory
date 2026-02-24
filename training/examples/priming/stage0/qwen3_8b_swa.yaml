@@ -1,0 +1,6 @@
+# Qwen3-8B Transformer -> Fused Hybrid Qwen3-8B w/ every other Attention layer replaced with SWA
+base_model_name_or_path: Qwen/Qwen3-8B
+hybrid_override_pattern: "*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*-*DA-SWA*"
+swa:
+  window_size: 512
+output_dir: ./models/HQwen3-8B-SWA-Fused

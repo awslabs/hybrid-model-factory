@@ -1,0 +1,55 @@
+### Model ###
+model_name_or_path: ./models/HQwen3-8B-GKA-Fused/Stage1/checkpoint-<STEPS>_unfused
+
+### Hugging Face args ###
+cache_dir: ./hf_cache
+overwrite_cache: true
+
+### SFT training ###
+stage: sft
+
+### Dataset ###
+dataset: toy_data
+tokenized_path: path/to/pre-tokenized-sft-data
+cutoff_len: 32768
+mix_strategy: interleave_under
+preprocessing_num_workers: 32
+dataloader_num_workers: 4
+packing: true
+template: qwen3
+preserve_tokenizer_config: True # Copy over tokenizer_config.json from model_name_or_path to checkpoints
+
+### Training ###
+do_train: true
+finetuning_type: full
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1    # 2M token batch size on 64 GPUs
+learning_rate: 5.0e-5
+lr_scheduler_type: linear
+warmup_ratio: 0.03
+num_train_epochs: 2.0
+max_grad_norm: 1.0
+sequence_parallel_size: 1
+seed: 42
+
+### Precision & Performance ###
+pure_bf16: true                   # Load model in bf16 (remove if using deepspeed stage 3)
+bf16: true
+flash_attn: fa2
+disable_gradient_checkpointing: true
+torch_compile: false
+enable_liger_kernel: false
+
+### DeepSpeed ###
+deepspeed: examples/deepspeed/ds_z2_config.json
+ddp_timeout: 180000000
+
+### Output & Logging ###
+output_dir: ./models/HQwen3-8B-GKA-SFT-IT
+logging_steps: 1
+save_steps: 500
+plot_loss: false
+overwrite_output_dir: false
+save_only_model: false
+report_to: none
+resume_from_checkpoint: null

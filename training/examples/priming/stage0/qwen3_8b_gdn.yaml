@@ -1,0 +1,4 @@
+# Qwen3-8B Transformer -> Fused Hybrid Qwen3-8B w/ every other Attention layer replaced with GDN
+base_model_name_or_path: Qwen/Qwen3-8B
+hybrid_override_pattern: "*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*-*DA-GDN*"
+output_dir: ./models/HQwen3-8B-GDN-Fused

@@ -1,0 +1,16 @@
+# Qwen3-8B Transformer -> Fused Hybrid Qwen3-8B w/ every other Attention layer replaced with GKA
+base_model_name_or_path: Qwen/Qwen3-8B
+hybrid_override_pattern: "*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*-*DA-GKA*"
+gka:
+  use_alpha_connection: True
+  use_v_conv: True
+  gla_rescale: True
+  solver_type: "chebyshev"
+  bp_lambda: True
+  num_iter: 30
+  ridge_strength: 0.02
+  use_forgetting_gate: True
+  use_forgetting_gate_kk: True
+  use_beta_gate: True
+  use_gate: True
+output_dir: ./models/HQwen3-8B-GKA-Fused

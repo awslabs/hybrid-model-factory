@@ -1,0 +1,15 @@
+# hmf preprocess examples/tokenization/sft.yaml --shard_size 20000 --parallel_jobs 100
+model_name_or_path: Qwen/Qwen3-8B
+stage: sft
+dataset: tulu-3-sft-mixture
+cutoff_len: 32768
+sequence_parallel_size: 1
+tokenized_path: /path/to/save/tokenized/sft_data_128k_sp8
+preprocessing_num_workers: 32
+dataloader_num_workers: 4
+preprocessing_batch_size: 1000
+packing: true
+streaming: false
+mix_strategy: concat
+template: qwen3
+enable_thinking: false # Will add empty think tags when paired with template: qwen3

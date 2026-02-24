@@ -1,0 +1,13 @@
+# hmf preprocess examples/tokenization/pretraining_sp.yaml --shard_size 1000 --parallel_jobs 100
+model_name_or_path: Qwen/Qwen3-8B
+stage: pt
+dataset: pg19-sample
+tokenized_path: ./data/tokenized/Qwen3/pt_data_128k_sp8
+cutoff_len: 131072
+sequence_parallel_size: 8
+preprocessing_num_workers: 32
+dataloader_num_workers: 4
+preprocessing_batch_size: 1000
+packing: true
+streaming: false
+template: qwen3_nothink_pt # Use <|endoftext|> as EOS token

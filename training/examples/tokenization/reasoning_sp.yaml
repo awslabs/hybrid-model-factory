@@ -1,0 +1,16 @@
+model_name_or_path: Qwen/Qwen3-8B
+stage: sft
+dataset: Nemotron-Instruction-Following-Chat-v1-chat,Nemotron-Agentic-v1
+cutoff_len: 131072
+sequence_parallel_size: 8
+tokenized_path: /path/to/save/tokenized/reasoning_data_128k
+preprocessing_num_workers: 32
+dataloader_num_workers: 4
+preprocessing_batch_size: 1000
+packing: true
+streaming: false
+mix_strategy: interleave_fast
+template: qwen3
+interleave_probs: 0.5,0.5
+filter: repetition_ngram5_repeat10_window100_maxrun50 # runs ngram filter on each dataset
+packing_method: random

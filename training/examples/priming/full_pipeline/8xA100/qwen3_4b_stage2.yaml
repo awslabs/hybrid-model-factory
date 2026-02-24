@@ -1,0 +1,60 @@
+### Model ###
+model_name_or_path: ./models/HQwen3-4B-GKA-Fused/Stage1/checkpoint-10_unfused
+
+# Increase RoPE frequency and max position embeddings
+config_overrides_json: "{\"rope_parameters.rope_theta\": 5000000, \"max_position_embeddings\": 65536}"
+
+### Hugging Face args ###
+cache_dir: ./hf_cache
+overwrite_cache: true
+
+### Continued pre-training ###
+stage: pt
+
+### Train only sequence mixing params ###
+hybrid_learnable_params: gka,norm,self_attn
+
+### Dataset ###
+dataset: toy_data
+tokenized_path: ./data/tokenized/Qwen3/pt_data_64k_sp8
+cutoff_len: 65536
+mix_strategy: interleave_under
+preprocessing_num_workers: 32
+dataloader_num_workers: 4
+packing: true
+template: qwen3_nothink_pt
+preserve_tokenizer_config: True # Copy over tokenizer_config.json from model_name_or_path to checkpoints
+
+### Training ###
+do_train: true
+finetuning_type: full
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 32    # 2M token batch size on 8 GPUs
+learning_rate: 5.0e-5
+lr_scheduler_type: cosine
+warmup_steps: 1
+max_steps: 10
+max_grad_norm: 1.0
+sequence_parallel_size: 8          # Use SP8
+seed: 42
+
+### Precision & Performance ###
+bf16: true
+flash_attn: fa2
+disable_gradient_checkpointing: false
+torch_compile: false
+enable_liger_kernel: false
+
+### DeepSpeed ###
+deepspeed: examples/deepspeed/ds_z3_config.json
+ddp_timeout: 180000000
+
+### Output & Logging ###
+output_dir: ./models/HQwen3-4B-GKA-Fused/Stage1/checkpoint-10_unfused/Long-Ctx
+logging_steps: 1
+save_steps: 10
+plot_loss: false
+overwrite_output_dir: false
+save_only_model: false
+report_to: none
+resume_from_checkpoint: null

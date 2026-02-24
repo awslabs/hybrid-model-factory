@@ -1,0 +1,164 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hybrid-model-factory"
+dynamic = ["version"]
+description = "Efficient training of Hybrid LLMs."
+license = "Apache-2.0"
+requires-python = ">=3.11.0"
+authors = [
+    { name = "Elvis Nunez", email = "elvisnun@amazon.com" },
+    { name = "Prannay Kaul", email = "prannayk@amazon.com" },
+    { name = "Aditya Chattopadhyay", email = "achatto@amazon.com" },
+    { name = "Evan Becker", email = "evbecker@amazon.com" },
+    { name = "Ben Bowman", email = "bowmaben@amazon.com" },
+    { name = "Luca Zancato", email = "zancato@amazon.com" },
+]
+
+keywords = [
+    "AI",
+    "LLM",
+    "GPT",
+    "ChatGPT",
+    "Llama",
+    "Transformer",
+    "DeepSeek",
+    "Pytorch",
+    "Hybrid",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+dependencies = [
+    # core deps
+    "torch>=2.4.0",
+    "torchvision>=0.19.0",
+    "torchaudio>=2.4.0",
+    "transformers>=4.51.0,<=5.3.0,!=4.52.0,!=4.57.0",
+    "datasets>=2.16.0,<=4.0.0",
+    "accelerate>=1.3.0,<=1.11.0",
+    "peft>=0.18.0,<=0.18.1",
+    "trl>=0.18.0,<=0.24.0",
+    "torchdata>=0.10.0,<=0.11.0",
+    # gui
+    "gradio>=4.38.0,<=5.50.0",
+    "matplotlib>=3.7.0",
+    "tyro<0.9.0",
+    # ops
+    "einops",
+    "numpy",
+    "pandas",
+    "scipy",
+    # model and tokenizer
+    "sentencepiece",
+    "tiktoken",
+    "modelscope",
+    "hf-transfer",
+    "safetensors",
+    # python
+    "av>=10.0.0,<=16.0.0",
+    "fire",
+    "omegaconf",
+    "packaging",
+    "protobuf",
+    "pyyaml",
+    "pydantic",
+    # api
+    "uvicorn",
+    "fastapi",
+    "sse-starlette",
+]
+
+[project.scripts]
+hybridfactory = "hmf.cli:main"
+hmf = "hmf.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/awslabs/hybrid-model-factory"
+Repository = "https://github.com/awslabs/hybrid-model-factory"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hmf"]
+
+[tool.hatch.build.targets.wheel.shared-data]
+"src/hmf/scripts" = "hmf/scripts"
+
+[tool.hatch.build]
+include = [
+    "src/hmf/**/*.py",
+    "src/hmf/scripts/*.sh",
+]
+
+[tool.hatch.version]
+path = "src/hmf/extras/env.py"
+pattern = "VERSION = \"(?P<version>[^\"]+)\""
+
+[tool.ruff]
+target-version = "py311"
+line-length = 119
+indent-width = 4
+
+[tool.ruff.lint]
+ignore = [
+    "C408",  # collection
+    "C901",  # complex
+    "E501",  # line too long
+    "E731",  # lambda function
+    "E741",  # ambiguous var name
+    "UP007", # no upgrade union
+    "UP045", # no upgrade optional
+    "D100",  # no doc public module
+    "D101",  # no doc public class
+    "D102",  # no doc public method
+    "D103",  # no doc public function
+    "D104",  # no doc public package
+    "D105",  # no doc magic method
+    "D107",  # no doc __init__
+]
+extend-select = [
+    "C",      # complexity
+    "E",      # error
+    "F",      # pyflakes
+    "I",      # isort
+    "W",      # warning
+    "UP",     # pyupgrade
+    "D",      # pydocstyle
+    "PT009",  # pytest assert
+    "RUF022", # sort __all__
+]
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+known-first-party = ["hmf"]
+known-third-party = [
+    "accelerate",
+    "datasets",
+    "gradio",
+    "numpy",
+    "peft",
+    "torch",
+    "transformers",
+    "trl",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+skip-magic-trailing-comma = false
+line-ending = "auto"

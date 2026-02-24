@@ -1,0 +1,6 @@
+torchrun --nproc-per-node 8 conv1d.py --seqlen 4096 --dtype bf16 --exp_name "conv1d"
+torchrun --nproc-per-node 8 conv1d.py --seqlen 8192 --dtype bf16 --exp_name "conv1d"
+torchrun --nproc-per-node 8 conv1d.py --seqlen 16384 --dtype bf16 --exp_name "conv1d"
+torchrun --nproc-per-node 8 conv1d.py --seqlen 32768 --dtype bf16 --exp_name "conv1d"
+torchrun --nproc-per-node 8 conv1d.py --seqlen 65536 --dtype bf16 --exp_name "conv1d"
+torchrun --nproc-per-node 8 conv1d.py --seqlen 131072 --dtype bf16 --exp_name "conv1d"

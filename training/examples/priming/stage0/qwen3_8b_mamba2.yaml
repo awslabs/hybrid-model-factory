@@ -1,0 +1,7 @@
+# Qwen3-8B Transformer -> Fused Hybrid Qwen3-8B w/ every other Attention layer replaced with Mamba2
+base_model_name_or_path: Qwen/Qwen3-8B
+hybrid_override_pattern: "*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*-*DA-M2*"
+mamba2:
+  use_qk_norm: True
+  use_pos_emb: False
+output_dir: ./models/HQwen3-8B-Mamba2-Fused
