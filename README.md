@@ -288,7 +288,7 @@ Our Primed Hybrid models closely match Transformer (Qwen3) performance while ach
 
 Evaluated on [HELMET](https://github.com/princeton-nlp/HELMET), [MRCR](https://huggingface.co/datasets/openai/mrcr), and [BABILong](https://github.com/booydar/babilong) across context lengths from 8K to 128K, using a weighted average with geometrically increasing weights for longer contexts. 
 
-![Long-Context Benchmarks](assets/figures/long_context_results_8B_models.png)
+![Long-Context Benchmarks](assets/figures/long_context_results_8B_models_horizontal.png)
 
 #### Short-Context NLP Benchmarks
 
@@ -329,7 +329,7 @@ Benchmark descriptions are same as 8B Long-context Instruct models (see [above](
 
 The plot below shows performance averaged over context lengths from 8K to 128K.
 
-![Long-Context Benchmarks](assets/figures/long_context_results_32B_models.png)
+![Long-Context Benchmarks](assets/figures/long_context_results_32B_models_horizontal.png)
 
 #### Short-Context NLP Benchmarks
 
