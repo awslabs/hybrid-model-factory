@@ -19,20 +19,9 @@ from transformers import Seq2SeqTrainingArguments
 from transformers.training_args import _convert_str_dict
 
 from ..extras.misc import is_env_enabled, use_ray
-from ..extras.packages import is_mcore_adapter_available
 
 
-if is_env_enabled("USE_MCA"):
-    if not is_mcore_adapter_available():
-        raise ImportError(
-            "mcore_adapter is required when USE_MCA=1. Please install `mcore_adapter` and its dependencies."
-        )
-
-    from mcore_adapter import Seq2SeqTrainingArguments as McaSeq2SeqTrainingArguments
-
-    BaseTrainingArguments = McaSeq2SeqTrainingArguments
-else:
-    BaseTrainingArguments = Seq2SeqTrainingArguments
+BaseTrainingArguments = Seq2SeqTrainingArguments
 
 
 @dataclass
