@@ -25,6 +25,9 @@ USAGE = (
     + "|   hybridfactory prime-init -h: convert Transformer to Hybrid       |\n"
     + "|   hybridfactory prime-unfuse -h: convert fused to standard Hybrid  |\n"
     + "|   hybridfactory reassemble-vlm -h: wire hybrid LM into VL model    |\n"
+    + "|   hybridfactory prepare-cauldron -h: Cauldron->sharegpt parquet    |\n"
+    + "|   hybridfactory eval-format -h: VL eval format diagnostics         |\n"
+    + "|   hybridfactory test-toolcall -h: Qwen-native tool-call smoke      |\n"
     + "|   hybridfactory train -h: train models                             |\n"
     + "|   hybridfactory train-multinode -h: multi-node distributed train   |\n"
     + "|   hybridfactory export -h: merge LoRA adapters and export model    |\n"
@@ -182,6 +185,76 @@ def launch():
 
         reassemble_vlm(args.vl_model, args.text_backbone, args.output,
                        save_max_shard_size=args.save_max_shard_size)
+
+    elif command == "prepare-cauldron":
+        from .data.prepare_cauldron import (
+            DEFAULT_SUBSETS, filter_textvqa_boilerplate, prepare_all,
+        )
+
+        import argparse
+
+        parser = argparse.ArgumentParser(
+            description="Pre-process The Cauldron subsets to sharegpt parquet for VL SFT.",
+        )
+        sub = parser.add_subparsers(dest="action", required=True)
+
+        p_all = sub.add_parser("all", help="Prepare a default mix (or --subsets)")
+        p_all.add_argument("out_dir", help="Output root; one subdir per subset")
+        p_all.add_argument("--subsets", nargs="+", default=list(DEFAULT_SUBSETS))
+        p_all.add_argument("--cap", type=int, default=30000)
+
+        p_filt = sub.add_parser("filter-textvqa",
+                                help="Filter textvqa 'does not require reading' boilerplate rows")
+        p_filt.add_argument("src_parquet")
+        p_filt.add_argument("out_parquet")
+
+        args = parser.parse_args()
+        if args.action == "all":
+            prepare_all(args.out_dir, subsets=args.subsets, default_cap=args.cap)
+        elif args.action == "filter-textvqa":
+            filter_textvqa_boilerplate(args.src_parquet, args.out_parquet)
+
+    elif command == "eval-format":
+        from .eval.format_diagnostics import (
+            dump_predictions, report_chartqa, report_docvqa, report_mcq,
+        )
+
+        import argparse
+
+        parser = argparse.ArgumentParser(
+            description="VL eval format diagnostics: strict vs relaxed scoring.",
+        )
+        parser.add_argument(
+            "kind", choices=["chartqa", "docvqa", "mcq", "dump"],
+            help=("chartqa: numeric tolerance + first-number extraction. "
+                  "docvqa: refusal/verbose categorization. "
+                  "mcq: A-D letter extraction (MMStar/MMMU/AI2D). "
+                  "dump: print first N raw predictions."),
+        )
+        parser.add_argument("samples_jsonl", help="lmms-eval samples jsonl path")
+        parser.add_argument("-n", type=int, default=12)
+        args = parser.parse_args()
+
+        if args.kind == "chartqa":
+            report_chartqa(args.samples_jsonl)
+        elif args.kind == "docvqa":
+            report_docvqa(args.samples_jsonl)
+        elif args.kind == "mcq":
+            report_mcq(args.samples_jsonl)
+        else:
+            dump_predictions(args.samples_jsonl, n=args.n)
+
+    elif command == "test-toolcall":
+        from .eval.test_toolcall import run_toolcall_smoke
+
+        import argparse
+
+        parser = argparse.ArgumentParser(
+            description="Three-case Qwen-native tool-calling smoke test.",
+        )
+        parser.add_argument("model_path", help="Model path or HF id")
+        args = parser.parse_args()
+        sys.exit(run_toolcall_smoke(args.model_path))
 
     elif command == "chat":
         from .chat.chat_model import run_chat

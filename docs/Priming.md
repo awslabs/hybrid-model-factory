@@ -345,9 +345,17 @@ hmf reassemble-vlm \
     ./models/HQwen2.5-VL-7B-GKA-Fused/Stage1/checkpoint-<STEPS>_unfused \
     ./models/HQwen2.5-VL-7B-GKA-VLM
 
+# Optional: pre-process Cauldron VL SFT data (8 default subsets, sharegpt parquets)
+hmf prepare-cauldron all ./data/cauldron_sft
+
 # Stage 2: VLM SFT on the reassembled hybrid VL checkpoint
 hmf train examples/priming/stage2/hqwen2_5_vl_7b_gka_sft_vlm.yaml
 
+# Eval with lmms-eval (use --model hybrid_qwen2_5_vl, not qwen2_5_vl)
+python -m lmms_eval --model hybrid_qwen2_5_vl \
+    --model_args pretrained=./models/HQwen2.5-VL-7B-GKA-SFT-VLM \
+    --tasks chartqa,docvqa_val,mmmu_val,mmstar,ai2d,ocrbench \
+    --output_path ./eval/HQwen2.5-VL-7B-GKA-SFT-VLM
 ```
 
 ### What `hmf reassemble-vlm` does
@@ -360,7 +368,7 @@ To roundtrip correctly, the hybrid VL class must be registered with the Auto* cl
 
 - **Vision encoder is frozen during Stage 2.** Stage 1 distillation only trains the text backbone, so vision weights remain identical to the pretrained VL model. Set `freeze_vision_tower: true` in the Stage 2 config.
 - **MRoPE collapse.** Qwen2.5-VL uses 3D/4D MRoPE position_ids, but standard Qwen2 attention (and our hybrid GKA) expects 1D positions. The hybrid VL class collapses MRoPE to its temporal axis at the language-model boundary via a forward pre-hook. This is exact for text tokens and an approximation for image tokens (height/width axes dropped). Empirically this works well enough for VLM SFT and benchmark evaluation — a future MRoPE-aware GKA layer would be the principled fix.
-- **Evaluation.** Load the reassembled hybrid VL checkpoint with `AutoModelForImageTextToText.from_pretrained` after importing `hmf.model.hybrid_zoo.models.model_register` so the hybrid class is registered. For lmms-eval, register a custom `qwen2_5_vl`-style adapter that routes through `AutoModelForImageTextToText` (the upstream adapter calls `Qwen2_5_VLForConditionalGeneration` directly, which would drop GKA at load).
+- **Evaluation with lmms-eval.** Use `--model hybrid_qwen2_5_vl` instead of `qwen2_5_vl` so the harness loads the hybrid class via `AutoModelForImageTextToText`. The wrapper is at [evaluation/lmms-eval/lmms_eval/models/simple/hybrid_qwen2_5_vl.py](../evaluation/lmms-eval/lmms_eval/models/simple/hybrid_qwen2_5_vl.py).
 
 ### Verifying GKA layers round-trip
 
@@ -380,7 +388,31 @@ print('GKA tensors on disk:', sum(1 for k in keys if '.gka.' in k))
 
 A correct hybrid VL checkpoint shows `model_type: hybrid_qwen2_5_vl` and a non-zero GKA-tensor count. If GKA tensors are zero, the SFT pipeline has dropped the hybrid layers — re-check that `hmf reassemble-vlm` was used and that its output's `model_type` is `hybrid_qwen2_5_vl`.
 
+### VL data-prep utilities
 
+`hmf prepare-cauldron` pre-processes [The Cauldron](https://huggingface.co/datasets/HuggingFaceM4/the_cauldron) subsets into sharegpt parquets that hmf's converter can consume directly. The default mix is 8 subsets with concise short-answer VL data (chartqa, docvqa, ai2d, ocrvqa, tallyqa, textvqa, aokvqa, scienceqa). Each subset is written as one parquet with `<image>` tokens prepended to the first user message and a per-row health-check that flags suspicious top-frequency assistant responses (e.g. boilerplate refusals).
+
+```bash
+hmf prepare-cauldron all ./data/cauldron_sft
+hmf prepare-cauldron filter-textvqa \
+    ./data/cauldron_sft/textvqa/data.parquet \
+    ./data/cauldron_sft_clean/textvqa/data.parquet
+```
+
+The `filter-textvqa` step removes the ~2% of rows whose assistant response is the literal "Answering does not require reading text in the image." — left in, this can hijack downstream MCQ benchmarks like AI2D.
+
+### VL eval-format diagnostics
+
+`hmf eval-format` reports strict vs relaxed scoring on lmms-eval samples files to quantify how much of the hybrid-vs-dense gap is format vs reasoning:
+
+```bash
+hmf eval-format chartqa <path>/samples_chartqa.jsonl
+hmf eval-format mcq     <path>/samples_ai2d.jsonl    # MMStar / MMMU / AI2D
+hmf eval-format docvqa  <path>/samples_docvqa_val.jsonl
+hmf eval-format dump    <path>/samples_*.jsonl       # raw prediction inspection
+```
+
+`hmf test-toolcall <model_path>` runs three Qwen-native `<tool_call>` smoke cases (weather, math, translate) — useful as a regression check after tool-calling SFT.
 
 ---
 
