@@ -316,6 +316,74 @@ See [examples/priming/stage2/](../training/examples/priming/stage2/) for all ava
 
 ---
 
+## Vision-Language Models
+
+Vision-Language models (Qwen2.5-VL, Qwen3-VL, LLaVA, etc.) follow the same Stage 0 → Stage 1 → Stage 2 recipe, with one extra step between Stage 1 and Stage 2 to wire the distilled hybrid text backbone back into the multimodal wrapper.
+
+### How VL hybridization differs
+
+A VL model is a multimodal wrapper (vision encoder + projector + language model) around a text Transformer. `hmf prime-init` hybridizes only the **text backbone** — the vision encoder and projector are inherited unchanged. After Stage 0, the Hybrid text backbone is saved separately to `<output_dir>/text_backbone/` so Stage 1 can run pure text-only distillation on long-context corpora (e.g., pg19) without needing image data.
+
+### Pipeline
+
+```bash
+cd training
+
+# Stage 0: hybridize the VL model's text backbone
+hmf prime-init examples/priming/stage0/qwen2_5_vl_7b_gka.yaml
+# Outputs:
+#   ./models/HQwen2.5-VL-7B-GKA-Fused/                — full fused VL wrapper
+#   ./models/HQwen2.5-VL-7B-GKA-Fused/text_backbone/  — text backbone only (Stage 1 input)
+
+# Stage 1: distill on text-only data
+hmf train examples/priming/stage1/hqwen2_5_vl_7b_gka.yaml
+hmf prime-unfuse ./models/HQwen2.5-VL-7B-GKA-Fused/Stage1/checkpoint-<STEPS>
+
+# Reassemble: wire the unfused hybrid text backbone back into the VL wrapper
+hmf reassemble-vlm \
+    Qwen/Qwen2.5-VL-7B-Instruct \
+    ./models/HQwen2.5-VL-7B-GKA-Fused/Stage1/checkpoint-<STEPS>_unfused \
+    ./models/HQwen2.5-VL-7B-GKA-VLM
+
+# Stage 2: VLM SFT on the reassembled hybrid VL checkpoint
+hmf train examples/priming/stage2/hqwen2_5_vl_7b_gka_sft_vlm.yaml
+
+```
+
+### What `hmf reassemble-vlm` does
+
+`hmf reassemble-vlm` takes three arguments — the original VL model (provides the vision encoder + processor + structural config), the distilled hybrid text backbone (provides the GKA layers, norm, embed_tokens), and an output path — and saves a checkpoint with `model_type=hybrid_qwen2_5_vl`. This model_type is critical: it makes `AutoModelForImageTextToText.from_pretrained` rebuild the *hybrid* VL class (`HybridQwen2_5_VLForConditionalGeneration`) at load time so the GKA layers in the safetensors are honored. Saving with the stock VL model_type would silently drop GKA tensors at the next `from_pretrained` call.
+
+To roundtrip correctly, the hybrid VL class must be registered with the Auto* classes — Stage 2 SFT and lmms-eval both auto-register on import via `hmf.model.hybrid_zoo.models.model_register`.
+
+### VL-specific notes
+
+- **Vision encoder is frozen during Stage 2.** Stage 1 distillation only trains the text backbone, so vision weights remain identical to the pretrained VL model. Set `freeze_vision_tower: true` in the Stage 2 config.
+- **MRoPE collapse.** Qwen2.5-VL uses 3D/4D MRoPE position_ids, but standard Qwen2 attention (and our hybrid GKA) expects 1D positions. The hybrid VL class collapses MRoPE to its temporal axis at the language-model boundary via a forward pre-hook. This is exact for text tokens and an approximation for image tokens (height/width axes dropped). Empirically this works well enough for VLM SFT and benchmark evaluation — a future MRoPE-aware GKA layer would be the principled fix.
+- **Evaluation.** Load the reassembled hybrid VL checkpoint with `AutoModelForImageTextToText.from_pretrained` after importing `hmf.model.hybrid_zoo.models.model_register` so the hybrid class is registered. For lmms-eval, register a custom `qwen2_5_vl`-style adapter that routes through `AutoModelForImageTextToText` (the upstream adapter calls `Qwen2_5_VLForConditionalGeneration` directly, which would drop GKA at load).
+
+### Verifying GKA layers round-trip
+
+After Stage 2 SFT, the saved checkpoint should advertise `model_type=hybrid_qwen2_5_vl` and contain GKA tensors on disk:
+
+```bash
+python -c "
+import json
+ROOT='./models/HQwen2.5-VL-7B-GKA-SFT-VLM'
+cfg = json.load(open(f'{ROOT}/config.json'))
+print('model_type:', cfg['model_type'])
+print('arch:      ', cfg['architectures'])
+keys = list(json.load(open(f'{ROOT}/model.safetensors.index.json'))['weight_map'])
+print('GKA tensors on disk:', sum(1 for k in keys if '.gka.' in k))
+"
+```
+
+A correct hybrid VL checkpoint shows `model_type: hybrid_qwen2_5_vl` and a non-zero GKA-tensor count. If GKA tensors are zero, the SFT pipeline has dropped the hybrid layers — re-check that `hmf reassemble-vlm` was used and that its output's `model_type` is `hybrid_qwen2_5_vl`.
+
+
+
+---
+
 ## Supported Base Models
 
 The Priming pipeline currently supports the following Transformer architectures:
@@ -323,8 +391,11 @@ The Priming pipeline currently supports the following Transformer architectures:
 | Model Family | Supported Versions |
 |--------------|--------------------|
 | Qwen | Qwen3, Qwen3-MoE, Qwen2.5, Qwen3Next, Qwen3.5 |
+| Qwen-VL | Qwen3-VL (2B/4B/8B), Qwen2.5-VL (3B/7B) |
 | Llama | Llama3, Llama3.1 |
 | Mistral | Ministral3 |
+
+For Vision-Language models, see [Vision-Language Models](#vision-language-models) for the additional reassembly step required between Stage 1 and Stage 2.
 
 ---
 
@@ -441,3 +512,5 @@ hmf train examples/priming/stage2/hqwen3_8b_gka_long_ctx.yaml
 # If running after A, ensure model_name_or_path in the yaml points to A's output checkpoint.
 hmf train examples/priming/stage2/hqwen3_8b_gka_sft_it.yaml
 ```
+
+For a Vision-Language model (Qwen2.5-VL, Qwen3-VL, LLaVA), insert a `hmf reassemble-vlm` step between Stage 1 and Stage 2. See [Vision-Language Models](#vision-language-models).

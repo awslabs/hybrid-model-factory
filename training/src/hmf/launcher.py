@@ -24,6 +24,7 @@ USAGE = (
     + "| Usage:                                                             |\n"
     + "|   hybridfactory prime-init -h: convert Transformer to Hybrid       |\n"
     + "|   hybridfactory prime-unfuse -h: convert fused to standard Hybrid  |\n"
+    + "|   hybridfactory reassemble-vlm -h: wire hybrid LM into VL model    |\n"
     + "|   hybridfactory train -h: train models                             |\n"
     + "|   hybridfactory train-multinode -h: multi-node distributed train   |\n"
     + "|   hybridfactory export -h: merge LoRA adapters and export model    |\n"
@@ -164,6 +165,23 @@ def launch():
 
         save_dir = args.save_dir or args.model_dir.rstrip("/") + "_unfused"
         unfuse_model(args.model_dir, save_dir, args.save_max_shard_size)
+
+    elif command == "reassemble-vlm":
+        from .priming.reassemble_vlm import reassemble_vlm
+
+        import argparse
+
+        parser = argparse.ArgumentParser(
+            description="Wire a distilled hybrid text backbone back into a Vision-Language wrapper.",
+        )
+        parser.add_argument("vl_model", help="Original VL model path or HF id")
+        parser.add_argument("text_backbone", help="Distilled hybrid text backbone path")
+        parser.add_argument("output", help="Output path for the reassembled VLM")
+        parser.add_argument("--save_max_shard_size", type=str, default="5GB")
+        args = parser.parse_args()
+
+        reassemble_vlm(args.vl_model, args.text_backbone, args.output,
+                       save_max_shard_size=args.save_max_shard_size)
 
     elif command == "chat":
         from .chat.chat_model import run_chat

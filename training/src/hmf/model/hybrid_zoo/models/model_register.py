@@ -27,6 +27,7 @@ try:
         "hybrid-llama": "HybridLlamaConfig",
         "hybrid-ministral3": "HybridMinistral3Config",
         "hybrid-qwen2": "HybridQwen2Config",
+        "hybrid-qwen2-5-vl": "HybridQwen2_5_VLConfig",
         "hybrid-qwen3": "HybridQwen3Config",
         "hybrid-qwen3-moe": "HybridQwen3MoeConfig",
         "qwen3-next-hmf": "Qwen3NextHMFConfig",
@@ -198,6 +199,25 @@ def register_hybrid_models():
         Qwen3NextHMFForTokenClassification],
     )
     
+
+    # Hybrid Qwen2.5-VL — multimodal wrapper around HybridQwen2 text backbone
+    from .hybrid_qwen2_5_vl.configuration_hybrid_qwen2_5_vl import (
+        HybridQwen2_5_VLConfig,
+    )
+    from .hybrid_qwen2_5_vl.modeling_hybrid_qwen2_5_vl import (
+        HybridQwen2_5_VLForConditionalGeneration,
+        HybridQwen2_5_VLModel,
+    )
+    AutoConfig.register(HybridQwen2_5_VLConfig.model_type, HybridQwen2_5_VLConfig)
+    try:
+        from transformers import AutoModelForImageTextToText
+        AutoModelForImageTextToText.register(
+            HybridQwen2_5_VLConfig, HybridQwen2_5_VLForConditionalGeneration
+        )
+    except ImportError:
+        pass
+    AutoModel.register(HybridQwen2_5_VLConfig, HybridQwen2_5_VLModel)
+
     _models_registered = True
 
 

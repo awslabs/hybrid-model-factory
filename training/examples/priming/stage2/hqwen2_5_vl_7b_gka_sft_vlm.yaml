@@ -1,0 +1,68 @@
+### Stage 2: VLM SFT for HQwen2.5-VL-7B-GKA ###
+### Run after `hmf reassemble-vlm` wires the distilled hybrid text backbone ###
+### back into the Qwen2.5-VL multimodal wrapper. The reassembled checkpoint ###
+### must have model_type=hybrid_qwen2_5_vl so SFT loads the hybrid VL class ###
+### and saves GKA layers in the output. See docs/Priming.md "VL models". ###
+
+### Model ###
+model_name_or_path: ./models/HQwen2.5-VL-7B-GKA-VLM
+
+### SFT training ###
+stage: sft
+
+### Dataset ###
+# Cauldron 8-subset mix with concise short-answer VL data matching benchmark
+# format. Pre-processed via `hmf prepare-cauldron all`; for textvqa run
+# `hmf prepare-cauldron filter-textvqa` to remove the boilerplate-refusal
+# rows that otherwise hijack downstream MCQ benchmarks like AI2D.
+# plotqa is excluded — turn count exceeds cutoff_len=1024 and crashes
+# pyarrow batch writes when every row is dropped.
+dataset: cauldron_chartqa,cauldron_docvqa,cauldron_ai2d,cauldron_ocrvqa,cauldron_tallyqa,cauldron_textvqa,cauldron_aokvqa,cauldron_scienceqa
+cutoff_len: 1024
+preprocessing_num_workers: 32
+dataloader_num_workers: 4
+packing: false
+template: qwen2_vl
+preserve_tokenizer_config: True
+
+### Training ###
+# Gentle LR (5e-6) and half epoch — Stage 1's hybrid model has high baseline
+# capability from the unchanged 21 attention layers + vision encoder, and
+# aggressive SFT (1.0 epoch at 2e-5) over-specializes the model to Cauldron's
+# narrow distribution. 0.5 epoch at 5e-6 adapts without overwriting the
+# pretrained baseline.
+do_train: true
+finetuning_type: full
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 2
+learning_rate: 5.0e-6
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+num_train_epochs: 0.5
+max_grad_norm: 1.0
+seed: 42
+
+### Precision ###
+pure_bf16: false
+bf16: true
+flash_attn: disabled
+disable_gradient_checkpointing: false
+
+### DeepSpeed ###
+deepspeed: examples/deepspeed/ds_z3_offload_config.json
+ddp_timeout: 180000000
+
+### Output ###
+output_dir: ./models/HQwen2.5-VL-7B-GKA-SFT-VLM
+logging_steps: 10
+save_steps: 2000
+overwrite_output_dir: false
+save_only_model: true
+report_to: none
+
+### Vision freezing ###
+# Vision encoder is frozen — Stage 1 distillation only trained the text
+# backbone, so vision weights match the pretrained Qwen2.5-VL exactly and
+# don't need re-training during VLM SFT.
+freeze_vision_tower: true
+freeze_multi_modal_projector: false
