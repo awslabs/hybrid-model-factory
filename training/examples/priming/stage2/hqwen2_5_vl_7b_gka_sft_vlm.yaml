@@ -23,7 +23,7 @@ preprocessing_num_workers: 32
 dataloader_num_workers: 4
 packing: false
 template: qwen2_vl
-preserve_tokenizer_config: True
+preserve_tokenizer_config: true
 
 ### Training ###
 # Gentle LR (5e-6) and half epoch — Stage 1's hybrid model has high baseline

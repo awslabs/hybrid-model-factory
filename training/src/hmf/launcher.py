@@ -177,7 +177,8 @@ def launch():
         parser.add_argument("vl_model", help="Original VL model path or HF id")
         parser.add_argument("text_backbone", help="Distilled hybrid text backbone path")
         parser.add_argument("output", help="Output path for the reassembled VLM")
-        parser.add_argument("--save_max_shard_size", type=str, default="5GB")
+        parser.add_argument("--save_max_shard_size", type=str, default="5GB",
+                            help="Max shard size for saving (default: 5GB)")
         args = parser.parse_args()
 
         reassemble_vlm(args.vl_model, args.text_backbone, args.output,

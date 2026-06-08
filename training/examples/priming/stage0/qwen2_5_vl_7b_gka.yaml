@@ -1,0 +1,23 @@
+# Qwen2.5-VL-7B-Instruct Transformer -> Fused Hybrid Qwen2.5-VL with 25% GKA
+# 28 text layers -> 7 GKA + 21 Attention.
+# Layer placement: keep first 4 + last 5 attention layers untouched, replace
+# 7 evenly-spaced layers in the middle with GKA. The vision encoder is
+# preserved unchanged; only the language backbone is hybridized.
+
+base_model_name_or_path: Qwen/Qwen2.5-VL-7B-Instruct
+hybrid_override_pattern: "*DA-*DA-*DA-*DA-GKA*-*DA-*DA-GKA*-*DA-*DA-GKA*-*DA-*DA-GKA*-*DA-*DA-GKA*-*DA-*DA-GKA*-*DA-*DA-GKA*-*DA-*DA-*DA-*DA-*DA"
+
+gka:
+  use_alpha_connection: true
+  use_v_conv: true
+  gla_rescale: true
+  solver_type: "chebyshev"
+  bp_lambda: true
+  num_iter: 30
+  ridge_strength: 0.02
+  use_forgetting_gate: true
+  use_forgetting_gate_kk: true
+  use_beta_gate: true
+  use_gate: true
+
+output_dir: ./models/HQwen2.5-VL-7B-GKA-Fused
