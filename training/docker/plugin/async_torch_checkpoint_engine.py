@@ -35,7 +35,14 @@ def _background_disk_write(state_dict, path):
         torch.save(state_dict, path)
         print(f"[Async IO Worker] Successfully saved: {path}")
     except Exception as e:
-        print(f"[Async IO Worker] Error saving {path}: {e}")
+        print(f"\n[Async IO Worker] CRITICAL: Error saving {path}: {e}")
+        print("[Async IO Worker] Killing parent training process to prevent silent failure...")
+        # 1. Get the PID of the main training process
+        parent_pid: int = os.getppid()
+        # 2. Send a SIGTERM signal to cleanly terminate the main training loop
+        os.kill(parent_pid, signal.SIGTERM)
+        # 3. Exit the worker process itself
+        sys.exit(1)
 
 def _deep_clone_and_offload(obj):
     """
