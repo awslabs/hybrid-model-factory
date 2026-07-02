@@ -35,6 +35,7 @@ from ..trainer_utils import (
     create_custom_optimizer,
     create_custom_scheduler,
 )
+from ...extras import logging
 
 
 if TYPE_CHECKING:
@@ -42,6 +43,8 @@ if TYPE_CHECKING:
 
     from ...hparams import FinetuningArguments, ModelArguments, TrainingArguments
 
+
+logger = logging.get_logger(__name__)
 
 class CustomTrainer(SaveShardMixin, Trainer):
     r"""Inherit Trainer for custom optimizer."""
@@ -200,11 +203,10 @@ class CustomTrainer(SaveShardMixin, Trainer):
         # max_steps is the total number of steps defined in training args
         is_final_step = self.state.global_step >= self.args.max_steps
         if is_final_step:
-            print(f"\n[Final Save] Step {self.state.global_step} reached. Saving full HuggingFace-style model...")
+            logger.info_rank0(f"\n[Final Save] Step {self.state.global_step} reached. Saving full HuggingFace-style model...")
             # Call super()._save() which performs the standard HF saving logic
             # (saving config.json, tokenizer, and the consolidated/sharded weights)
             super()._save(output_dir, state_dict)
         else:
-            print("skipping HF style saving ...")
+            logger.info_rank0("skipping HF style saving ...")
 
-        return
