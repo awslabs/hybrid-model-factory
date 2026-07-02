@@ -425,3 +425,16 @@ class CustomTrainer(SaveShardMixin, Seq2SeqTrainer):
                     )
                     + "\n"
                 )
+
+    @override
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        # 1. Identify if this is the final save of the training run
+        # max_steps is the total number of steps defined in training args
+        is_final_step = self.state.global_step >= self.args.max_steps
+        if is_final_step:
+            logger.info_rank0(f"\n[Final Save] Step {self.state.global_step} reached. Saving full HuggingFace-style model...")
+            # Call super()._save() which performs the standard HF saving logic
+            # (saving config.json, tokenizer, and the consolidated/sharded weights)
+            super()._save(output_dir, state_dict)
+        else:
+            logger.info_rank0("skipping HF style saving ...")
