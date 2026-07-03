@@ -1,3 +1,25 @@
+"""
+DeepSpeed ZeRO to Hugging Face (HF) Checkpoint Converter.
+
+This script automates the process of reconstructing a unified full-precision (fp32) 
+Hugging Face model checkpoint from sharded DeepSpeed ZeRO (Stage 2 or 3) checkpoints. 
+It loads the sharded state dictionary, maps it back onto the base architecture, 
+and exports the finalized weights in a standard, shareable format.
+
+Usage:
+    python convert_ds_to_hf.py \
+        --base_model_name_or_path /path/to/base/model \
+        --ds_checkpoint_dir /path/to/deepspeed/global_stepXXX \
+        --output_dir /path/to/save/clean/hf/model
+
+Arguments:
+    --base_model_name_or_path (str): Path or Hub ID of the original model.
+    --ds_checkpoint_dir (str): Directory containing the DeepSpeed 'global_stepXXX' folder.
+    --output_dir (str): Target directory where the consolidated HF model files will be saved.
+    --max_shard_size (str): Max weight shard size (default: "5GB").
+    --safe_serialization (bool): If True, saves weights using safetensors format (default: True).
+"""
+
 import os
 import argparse
 import torch
