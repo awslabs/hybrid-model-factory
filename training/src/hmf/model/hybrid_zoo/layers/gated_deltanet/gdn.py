@@ -187,6 +187,7 @@ class GatedDeltaNet(nn.Module):
         self.conv_size = conv_size
         self.conv_bias = conv_bias
         self.sequence_parallel_group = None
+        self.register_buffer("_eye_cache", torch.eye(head_dim), persistent=False)
 
         self.head_dim = head_dim
         self.num_q_heads = num_q_heads
@@ -713,7 +714,7 @@ class GatedDeltaNet(nn.Module):
         beta_4B = torch.cat([beta_batch, beta_batch], dim=0)
 
         init_4B = torch.zeros(B4, H, D, D, device=q_batch.device, dtype=q_batch.dtype)
-        init_4B[B2:] = torch.eye(D, device=q_batch.device, dtype=q_batch.dtype)
+        init_4B[B2:] = self._eye_cache.to(dtype=q_batch.dtype)
 
         o_4B, state_4B = chunk_gated_delta_rule(
             q=q_4B, k=k_4B, v=v_4B, g=g_4B, beta=beta_4B,
