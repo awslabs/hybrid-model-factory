@@ -1,0 +1,29 @@
+# L2A Model Construction Config — Qwen3-8B
+# Converts Qwen3-8B into an L2A model by inserting L2A layers
+# (SWA + Router + conditional Global Attention) at all 36 layers.
+#
+# Usage:
+#   cd examples/research/L2A/construct
+#   python l2a_model.py --config ../configs/construct_qwen3_8b.yaml
+
+base_model_name_or_path: Qwen/Qwen3-8B
+
+# Initialize L2A layer weights from the base model's attention weights
+l2a_initfrombase: true
+
+# SWA window size for Local Attention
+sliding_window: 4095
+
+# Use a linear projection in the Router
+sigmoid_linear: true
+
+# Zero-init the Router projection (all tokens attend at init)
+sigmoid_linear_zero_init: true
+
+# Temperature for sigmoid routing
+sigmoid_temp: 0.1
+
+# Router input type: hidden_linearproj (linear projection on hidden states)
+sig_input_type: hidden_linearproj
+
+output_dir: ../models/L2A-Qwen3-8B

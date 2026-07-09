@@ -1,0 +1,59 @@
+# L2A Training Config — Qwen3-8B
+# Trains an L2A model for long-context extension (32K → 128K tokens).
+#
+# Usage (on each node):
+#   cd examples/research/L2A/train
+#   python train_multinode.py ../configs/train_l2a_qwen3_8b.yaml MASTER_ADDR NNODES NODE_RANK
+
+### Model ###
+model_name_or_path: ../models/L2A-Qwen3-8B
+config_overrides_json: "{\"rope_parameters.rope_theta\": 5000000, \"max_position_embeddings\": 131072}"
+cache_dir: ./hf_cache
+
+### Dataset ###
+stage: pt  # Use "pt" for HMF argument parsing; train.py always uses the L2A trainer regardless of stage
+dataset: toy_data
+tokenized_path: path/to/pre-tokenized-long-ctx-SP8-data
+cutoff_len: 131072
+sequence_parallel_size: 8
+preprocessing_num_workers: 32
+dataloader_num_workers: 1
+packing: true
+template: qwen3_nothink_pt
+
+### Training ###
+hybrid_learnable_params: self_attn,norm,sigmoid_linear
+do_train: true
+finetuning_type: full
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1 # 6M global batch size on 48 nodes
+learning_rate: 5.0e-5
+lr_scheduler_type: cosine
+max_steps: 3973
+warmup_steps: 209
+max_grad_norm: 1.0
+seed: 42
+
+### L2A Sparsity Regularization ###
+# Lambda for the Router sparsity regularization (Eq. 5 in the paper)
+lambda_reg: 0.00000001
+lambda_reg_scheduler: linear
+
+### Precision & Performance ###
+pure_bf16: true
+bf16: true
+flash_attn: fa2
+disable_gradient_checkpointing: false
+
+### DeepSpeed ###
+deepspeed: /path/to/hmf/training/examples/deepspeed/ds_z2_config.json
+ddp_timeout: 180000000
+
+### Output & Logging ###
+output_dir: ../models/L2A-Qwen3-8B-LongCtx-Train
+logging_steps: 1
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: false
+save_only_model: false
+report_to: none
