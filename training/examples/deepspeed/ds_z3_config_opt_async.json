@@ -14,7 +14,7 @@
     "stage": 3,
     "overlap_comm": true,
     "contiguous_gradients": true,
-    "async_ckpt": false,
+    "async_ckpt": true,
     "sub_group_size": 1e9,
     "reduce_bucket_size": 500000000,
     "stage3_prefetch_bucket_size": 50000000,
