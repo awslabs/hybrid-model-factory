@@ -10,12 +10,13 @@ index 811cdb9..56f0b3b 100644
 
 
  def create_checkpoint_engine(config_params, groups, zero_stage, has_moe_layers, optimize_dp_state):
-@@ -45,4 +46,8 @@ def create_checkpoint_engine(config_params, groups, zero_stage, has_moe_layers,
+@@ -45,4 +46,9 @@ def create_checkpoint_engine(config_params, groups, zero_stage, has_moe_layers,
                  )
                  return TorchCheckpointEngine(config_params)
 
 +        if config_params.zero_config.async_ckpt:
-+            print(f"enabling async checkpointing \n")
++            if dist.get_rank() == 0:
++                print("Enabling async checkpointing")
 +            return AsyncTorchCheckpointEngine(config_params)
 +
      return TorchCheckpointEngine(config_params)
