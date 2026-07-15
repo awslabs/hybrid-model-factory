@@ -161,7 +161,7 @@ class CustomSeq2SeqTrainer(SaveShardMixin, Seq2SeqTrainer):
         ):
             return SequentialSampler(self.train_dataset)
         return super()._get_train_sampler(*args, **kwargs)
-    
+
     @override
     def training_step(self, model, inputs, *args, **kwargs):
         # Sequence_parallel modes other than 'zigzag-ring' may not need dummy forward
@@ -188,11 +188,11 @@ class CustomSeq2SeqTrainer(SaveShardMixin, Seq2SeqTrainer):
                 half_len = seq_len // 2
                 first_half = pos_ids[0, :half_len]
                 second_half = pos_ids[0, half_len:]
-                
+
                 # Check for any decreases
                 first_half_valid = (first_half[1:] >= first_half[:-1]).all().item()
                 second_half_valid = (second_half[1:] >= second_half[:-1]).all().item()
-                
+
                 if not (first_half_valid and second_half_valid):
                     raise ValueError(
                         "Position IDs are not monotonically increasing. "
@@ -202,7 +202,7 @@ class CustomSeq2SeqTrainer(SaveShardMixin, Seq2SeqTrainer):
                         "position_ids [0, 1, ..., seq_len] before the zigzag split. "
                         "Please re-tokenize your data."
                     )
-            
+
             outputs = model(**inputs)
             logits, labels = (
                 outputs["logits"] if isinstance(outputs, dict) else outputs[1],
@@ -295,14 +295,41 @@ class CustomSeq2SeqTrainer(SaveShardMixin, Seq2SeqTrainer):
                 f.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
 
     @override
-    def _save(self, output_dir: Optional[str] = None, state_dict=None):
-        # 1. Identify if this is the final save of the training run
-        # max_steps is the total number of steps defined in training args
-        is_final_step = self.state.global_step >= self.args.max_steps
-        if is_final_step:
-            logger.info_rank0(f"\n[Final Save] Step {self.state.global_step} reached. Saving full HuggingFace-style model...")
-            # Call super()._save() which performs the standard HF saving logic
-            # (saving config.json, tokenizer, and the consolidated/sharded weights)
-            super()._save(output_dir, state_dict)
+    def _save(self, output_dir: Optional[str] = None, state_dict=None) -> None:
+        """Save model checkpoint, performing a full HuggingFace-style save only on the final step.
+
+        When async checkpointing is enabled, intermediate checkpoint saves are handled by
+        DeepSpeed's AsyncTorchCheckpointEngine (writing sharded state dicts to disk in the
+        background). The full HF-format export (config.json, tokenizer, safetensors) is
+        only performed on the final training step to avoid redundant serialization overhead.
+
+        When async checkpointing is not enabled, every save produces a full HF-format
+        checkpoint (the default Trainer behavior).
+
+        Args:
+            output_dir: Directory path where the model artifacts will be written.
+                Falls back to ``self.args.output_dir`` when not provided.
+            state_dict: Optional pre-computed state dictionary to save. If ``None``,
+                the default HF saving logic will gather the state from the model.
+        """
+        # Check if async checkpointing is enabled in the DeepSpeed ZeRO config
+        async_enabled = getattr(
+            self, "deepspeed", None
+        ) is not None and self.deepspeed.config.get("zero_optimization", {}).get(
+            "async_ckpt", False
+        )
+
+        if async_enabled:
+            # Only produce an HF-format checkpoint on the final step;
+            # intermediate saves are handled by DeepSpeed's checkpoint engine
+            is_final_step = self.state.global_step >= self.state.max_steps
+            if is_final_step:
+                logger.info_rank0(
+                    f"\n[Final Save] Step {self.state.global_step} reached. Saving full HuggingFace-style model..."
+                )
+                super()._save(output_dir, state_dict)
+            else:
+                logger.info_rank0("Skipping HF style saving ...")
         else:
-            logger.info_rank0("skipping HF style saving ...")
+            # Default behavior: full HF save at every checkpoint
+            super()._save(output_dir, state_dict)
