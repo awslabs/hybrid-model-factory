@@ -1,0 +1,13 @@
+diff --git a/deepspeed/runtime/zero/config.py b/deepspeed/runtime/zero/config.py
+index 79fbcb9..ad6a577 100644
+--- a/deepspeed/runtime/zero/config.py
++++ b/deepspeed/runtime/zero/config.py
+@@ -342,6 +342,8 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
+
+     mics_hierarchical_params_gather: bool = False
+
++    async_ckpt: bool = False
++
+     memory_efficient_linear: bool = True
+     """
+     Use memory efficient linear implementation, for Stage 3.

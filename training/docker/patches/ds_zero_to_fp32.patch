@@ -1,0 +1,43 @@
+--- a/deepspeed/utils/zero_to_fp32.py
++++ b/deepspeed/utils/zero_to_fp32.py
+@@ -232,8 +232,9 @@
+     total_params = 0
+     total_numel = 0
+     for name, shape in frozen_param_shapes.items():
++        shape = torch.Size(shape) if not isinstance(shape, torch.Size) else shape
+         total_params += 1
+-        unpartitioned_numel = shape.numel()
++        unpartitioned_numel = shape.numel() if _has_callable(shape, 'numel') else math.prod(shape)
+         total_numel += unpartitioned_numel
+ 
+         state_dict[name] = frozen_param_fragments[name]
+@@ -371,8 +372,9 @@
+     total_params = 0
+     total_numel = 0
+     for name, shape in zero_model_states[0].frozen_param_shapes.items():
++        shape = torch.Size(shape) if not isinstance(shape, torch.Size) else shape
+         total_params += 1
+-        unpartitioned_numel = shape.numel()
++        unpartitioned_numel = shape.numel() if _has_callable(shape, 'numel') else math.prod(shape)
+         total_numel += unpartitioned_numel
+ 
+         param_frags = tuple(model_state.frozen_param_fragments[name] for model_state in zero_model_states)
+@@ -449,7 +451,9 @@
+             print(f"{FP32_FLAT_GROUPS}[{i}].shape={fp32_flat_groups[i].shape}")
+ 
+         wanted_params = len(param_shapes)
+-        wanted_numel = sum(shape.numel() for shape in param_shapes.values())
++        wanted_numel = sum(
++            s.numel() if _has_callable(s, 'numel') else math.prod(s) for s in param_shapes.values()
++        )
+         # not asserting if there is a mismatch due to possible padding
+         avail_numel = fp32_flat_groups[0].numel() * world_size
+         print(f"Trainable params: Have {avail_numel} numels to process.")
+@@ -463,6 +467,7 @@
+     total_params = 0
+     flat_groups_offset = [0] + list(np.cumsum([flat_tensor.numel() for flat_tensor in fp32_flat_groups[0]]))
+     for name, shape in tqdm(param_shapes.items(), desc='Gathering sharded weights'):
++        shape = torch.Size(shape) if not isinstance(shape, torch.Size) else shape
+         unpartitioned_numel = shape.numel()
+         total_numel += unpartitioned_numel
+         total_params += 1

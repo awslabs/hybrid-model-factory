@@ -1,0 +1,22 @@
+diff --git a/deepspeed/runtime/checkpoint_engine/utils.py b/deepspeed/runtime/checkpoint_engine/utils.py
+index 811cdb9..56f0b3b 100644
+--- a/deepspeed/runtime/checkpoint_engine/utils.py
++++ b/deepspeed/runtime/checkpoint_engine/utils.py
+@@ -10,6 +10,7 @@ from deepspeed import comm as dist
+ from .decoupled_checkpoint_engine import DecoupledCheckpointEngine
+ from .fast_checkpoint_engine import FastCheckpointEngine
+ from .torch_checkpoint_engine import TorchCheckpointEngine
++from .async_torch_checkpoint_engine import AsyncTorchCheckpointEngine
+
+
+ def create_checkpoint_engine(config_params, groups, zero_stage, has_moe_layers, optimize_dp_state):
+@@ -45,4 +46,9 @@ def create_checkpoint_engine(config_params, groups, zero_stage, has_moe_layers,
+                 )
+                 return TorchCheckpointEngine(config_params)
+
++        if config_params.zero_config.async_ckpt:
++            if dist.get_rank() == 0:
++                print("Enabling async checkpointing")
++            return AsyncTorchCheckpointEngine(config_params)
++
+     return TorchCheckpointEngine(config_params)
