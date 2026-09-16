@@ -1,0 +1,16 @@
+LICENSE
+README.md
+pyproject.toml
+setup.py
+hope/__init__.py
+hope/baselines.py
+hope/calibrate.py
+hope/cli.py
+hope/prune.py
+hope/solve.py
+hope_pruning.egg-info/PKG-INFO
+hope_pruning.egg-info/SOURCES.txt
+hope_pruning.egg-info/dependency_links.txt
+hope_pruning.egg-info/entry_points.txt
+hope_pruning.egg-info/requires.txt
+hope_pruning.egg-info/top_level.txt

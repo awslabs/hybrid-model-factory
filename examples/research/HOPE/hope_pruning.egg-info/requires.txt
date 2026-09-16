@@ -1,0 +1,7 @@
+torch>=2.0
+transformers>=4.40
+numpy
+scipy
+h5py
+click
+tqdm
