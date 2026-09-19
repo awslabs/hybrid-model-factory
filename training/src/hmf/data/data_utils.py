@@ -324,7 +324,6 @@ def load_jsonl(filepath, dataset_attr, cache_dir=None):
         cache_dir=cache_dir,
         features=features,
     )
-    dataset.set_transform(deserialize_transform)
     return dataset
 
 

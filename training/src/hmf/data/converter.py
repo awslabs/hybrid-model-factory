@@ -239,6 +239,16 @@ class OpenAIDatasetConverter(DatasetConverter):
         }
 
         messages = example[self.dataset_attr.messages]
+        if isinstance(messages, str):
+            messages = json.loads(messages)
+
+        if self.dataset_attr.tools:
+            _tools_raw = example.get(self.dataset_attr.tools)
+            if _tools_raw is None:
+                example[self.dataset_attr.tools] = []
+            elif isinstance(_tools_raw, str):
+                example[self.dataset_attr.tools] = json.loads(_tools_raw)
+
         if (
             self.dataset_attr.system_tag
             and len(messages) != 0
@@ -257,7 +267,7 @@ class OpenAIDatasetConverter(DatasetConverter):
             content = message[self.dataset_attr.content_tag]
 
             if role in [self.dataset_attr.assistant_tag, self.dataset_attr.function_tag]:
-                if "tool_calls" in message and len(message["tool_calls"]) > 0:
+                if "tool_calls" in message and message["tool_calls"] is not None and len(message["tool_calls"]) > 0:
                     tool_calls_list = [tool["function"] for tool in message["tool_calls"]]
                     content = json.dumps(tool_calls_list, ensure_ascii=False)
                     role = self.dataset_attr.function_tag
