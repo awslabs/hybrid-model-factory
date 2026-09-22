@@ -336,3 +336,56 @@ deepspeed: examples/deepspeed/ds_z0_config.json  # or ds_z1, ds_z2, ds_z3
 ```
 
 See [training/examples/deepspeed/](../training/examples/deepspeed/) for config files.
+
+---
+
+## Async Checkpointing
+
+By default, DeepSpeed checkpointing is synchronous: training pauses while model and optimizer states are serialized to disk. For large models, this can take several minutes per checkpoint. Async checkpointing moves the disk I/O to a background process so training resumes immediately after capturing an in-memory snapshot.
+
+### How It Works
+
+1. At each checkpoint step, model/optimizer states are cloned to CPU memory (fast PCIe transfer)
+2. The actual disk write is dispatched to a background worker process
+3. Training resumes on the GPU while the write happens in parallel
+4. On process exit, any pending writes are drained to ensure no data corruption
+
+Intermediate checkpoints are saved in DeepSpeed's native sharded format. A full HuggingFace-format checkpoint (safetensors + config + tokenizer) is only produced on the final training step.
+
+### Enabling Async Checkpointing
+
+Add `"async_ckpt": true` to the `zero_optimization` block in your DeepSpeed config:
+
+```json
+{
+  "zero_optimization": {
+    "stage": 3,
+    "async_ckpt": true,
+    ...
+  }
+}
+```
+
+See [training/examples/deepspeed/ds_z3_config_opt_async.json](../training/examples/deepspeed/ds_z3_config_opt_async.json) for a complete example.
+
+### Converting Intermediate Checkpoints to HF Format
+
+Since intermediate checkpoints are in DeepSpeed's native format, use the `hmf ds2hf` command to convert them to HuggingFace format for evaluation or inference:
+
+```bash
+hmf ds2hf \
+    --base-model /path/to/base/model \
+    --ds-checkpoint /path/to/output/checkpoint-500 \
+    --output-dir /path/to/save/hf/model
+```
+
+| Argument | Description |
+|----------|-------------|
+| `--base-model` | Path or Hub ID of the original model used to start training |
+| `--ds-checkpoint` | Path to the checkpoint directory (containing the `global_stepXXX` folder) |
+| `--output-dir` | Target directory for the converted HF model |
+| `--max-shard-size` | Max safetensors shard size (default: `5GB`) |
+
+### Resuming Training
+
+Resuming from an async checkpoint is done the same way as a non-async checkpoint (DeepSpeed handles reassembling the sharded states automatically, no conversion is needed for resumption).

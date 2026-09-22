@@ -31,6 +31,7 @@ USAGE = (
     + "|   hybridfactory api -h: launch an OpenAI-style API server          |\n"
     + "|   hybridfactory chat -h: launch a chat interface in CLI            |\n"
     + "|   hybridfactory preprocess -h: sharded preprocess and tokenize     |\n"
+    + "|   hybridfactory ds2hf -h: convert DeepSpeed checkpoint to HF       |\n"
     + "|   hybridfactory env: show environment info                         |\n"
     + "|   hybridfactory version: show version info                         |\n"
     + "| Hint: You can use `hmf` as a shortcut for `hybridfactory`.         |\n"
@@ -248,6 +249,33 @@ def launch():
 
     elif command == "env":
         print_env()
+
+    elif command == "ds2hf":
+        import argparse
+        from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+        from .priming.fused_to_standard import load_model
+        import hmf.model.hybrid_zoo.models.model_register  # noqa: F401
+
+        parser = argparse.ArgumentParser(description="Convert DeepSpeed ZeRO checkpoint to HF format.")
+        parser.add_argument("--base-model", type=str, required=True,
+                            help="Path or Hub ID of the base model")
+        parser.add_argument("--ds-checkpoint", type=str, required=True,
+                            help="Path to the DeepSpeed global_stepXXX directory")
+        parser.add_argument("--output-dir", type=str, required=True,
+                            help="Target directory for the HF model")
+        parser.add_argument("--max-shard-size", type=str, default="5GB",
+                            help="Max shard size for saving (default: 5GB)")
+        args = parser.parse_args()
+
+        os.makedirs(args.output_dir, exist_ok=True)
+        logger.info_rank0(f"Converting DeepSpeed shards from {args.ds_checkpoint} to HF format. Saving to {args.output_dir}...")
+        state_dict = get_fp32_state_dict_from_zero_checkpoint(args.ds_checkpoint)
+        model, config, tokenizer = load_model(args.base_model)
+        model.load_state_dict(state_dict, strict=True)
+        model.eval()
+        model.save_pretrained(args.output_dir, max_shard_size=args.max_shard_size)
+        tokenizer.save_pretrained(args.output_dir)
+        logger.info_rank0(f"Successfully converted checkpoint to: {args.output_dir}")
 
     elif command == "version":
         print(WELCOME)
