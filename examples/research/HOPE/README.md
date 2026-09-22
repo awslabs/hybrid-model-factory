@@ -115,10 +115,12 @@ Any HuggingFace MoE model where expert layers use the `gate_up_proj` / `down_pro
 ## Citation
 
 ```bibtex
-@article{hope2026,
-    title={Higher-Order Pruning of Experts for MoE Language Models},
+@article{tseng2026hope,
+    title={Higher-Order Pruning of Experts in Mixture-of-Experts Language Models},
     author={Tseng, Alex M. and Kaul, Prannay and Zancato, Luca and Xia, Wei and Soatto, Stefano},
+    journal={arXiv preprint arXiv:2609.18916},
     year={2026},
+    url={https://arxiv.org/abs/2609.18916},
 }
 ```
 
