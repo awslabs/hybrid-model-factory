@@ -48,6 +48,7 @@ class GDNConfig:
     norm_eps: float = 1e-5
     kv_proj_rank: Optional[int] = None
     kv_learnable_residual: bool = False
+    use_state_passing_sp: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -89,6 +90,7 @@ def _construct_from_qwen_gdn(
         norm_eps=gdn_exp_config.get("norm_eps", config.rms_norm_eps),
         kv_proj_rank=gdn_exp_config.get("kv_proj_rank", None),
         kv_learnable_residual=gdn_exp_config.get("kv_learnable_residual", False),
+        use_state_passing_sp=gdn_exp_config.get("use_state_passing_sp", True),
     )
 
 
@@ -117,6 +119,7 @@ def _construct_from_transformer(
         norm_eps=gdn_exp_config.get("norm_eps", 1e-5),
         kv_proj_rank=gdn_exp_config.get("kv_proj_rank", None),
         kv_learnable_residual=gdn_exp_config.get("kv_learnable_residual", False),
+        use_state_passing_sp=gdn_exp_config.get("use_state_passing_sp", True),
     )
 
 
