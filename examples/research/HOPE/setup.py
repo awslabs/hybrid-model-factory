@@ -9,7 +9,7 @@ setup(
     python_requires=">=3.9",
     packages=find_packages(),
     install_requires=[
-        "transformers==5.2.0",
+        "transformers==5.10.1",
         "accelerate",
         "numpy",
         "scipy",
