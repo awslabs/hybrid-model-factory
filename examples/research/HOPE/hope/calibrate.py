@@ -57,6 +57,16 @@ class HOExpertObserver:
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts")
         ]
         for layer_i, moe_block in enumerate(moe_blocks):
+            experts = moe_block.experts
+            if not hasattr(experts, "gate_up_proj") or not hasattr(experts, "down_proj"):
+                raise ValueError(
+                    "Expected experts module with `gate_up_proj` and `down_proj`"
+                )
+            if experts.gate_up_proj.dim() != 3 or experts.down_proj.dim() != 3:
+                raise ValueError(
+                    "Expected 3D stacked expert weights"
+                )
+
             hook = moe_block.experts.register_forward_hook(
                 self._make_hook(layer_i)
             )
@@ -78,10 +88,6 @@ class HOExpertObserver:
             # Initialize accumulators on first call
             if layer_i not in self.stats:
                 self.stats[layer_i] = {
-                    "inner_prod_sums": torch.zeros(
-                        num_experts, num_experts,
-                        dtype=torch.float64, device=self.sdev,
-                    ),
                     "norm_prod_sums": torch.zeros(
                         num_experts, num_experts,
                         dtype=torch.float64, device=self.sdev,
@@ -170,23 +176,13 @@ class HOExpertObserver:
                     sel_j_expert_inds = top_k_index[:, sel_j]
 
                     gate_prob_prod = gate_probs[:, sel_i] * gate_probs[:, sel_j]
-                    inner_prods = (
-                        expert_out[:, sel_i].float()
-                        * expert_out[:, sel_j].float()
-                    ).sum(dim=-1)
                     norm_prods = norms[:, sel_i] * norms[:, sel_j]
-
-                    weighted_inner_prods = gate_prob_prod * inner_prods
                     weighted_norm_prods = gate_prob_prod * norm_prods
 
                     idx = (
                         (sel_i_expert_inds * num_experts) + sel_j_expert_inds
                     ).to(self.sdev)
 
-                    stats["inner_prod_sums"].view(-1).scatter_add_(
-                        0, idx,
-                        weighted_inner_prods.to(torch.float64).to(self.sdev),
-                    )
                     stats["norm_prod_sums"].view(-1).scatter_add_(
                         0, idx,
                         weighted_norm_prods.to(torch.float64).to(self.sdev),
@@ -202,12 +198,6 @@ class HOExpertObserver:
                             (sel_j_expert_inds * num_experts)
                             + sel_i_expert_inds
                         ).to(self.sdev)
-                        stats["inner_prod_sums"].view(-1).scatter_add_(
-                            0, idx_t,
-                            weighted_inner_prods.to(torch.float64).to(
-                                self.sdev
-                            ),
-                        )
                         stats["norm_prod_sums"].view(-1).scatter_add_(
                             0, idx_t,
                             weighted_norm_prods.to(torch.float64).to(

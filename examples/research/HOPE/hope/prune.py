@@ -192,6 +192,14 @@ def prune_model(src_model_path, pruneset_path, dst_model_path):
     pruneset = load_pruneset(pruneset_path, num_moe_layers)
     num_prune = len(next(iter(pruneset.values())))
     retained_count = num_experts - num_prune
+
+    top_k = moe_config.num_experts_per_tok
+    if retained_count < top_k:
+        raise ValueError(
+            "Pruning %d experts would leave %d per layer, which is fewer than "
+            "top_k=%d" % (num_prune, retained_count, top_k)
+        )
+
     print("Pruning %d/%d experts in each of %d layers" % (
         num_prune, num_experts, num_moe_layers
     ))

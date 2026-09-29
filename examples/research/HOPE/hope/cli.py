@@ -23,8 +23,8 @@ def cli():
               help="Path to the HuggingFace MoE model.")
 @click.option("--prompts", required=True,
               type=click.Path(exists=True, dir_okay=False),
-              help="Path to prompts file: .json (list of token ID lists) "
-                   "or .txt (one prompt per line).")
+              help="Path to prompts file: .json (list of strings, or list of "
+              "token ID lists) or .txt (one prompt per line).")
 @click.option("--out-path", required=True,
               help="Output HDF5 path for observations.")
 @click.option("--limit", type=float, default=None,
@@ -60,23 +60,16 @@ def calibrate(model_path, prompts, out_path, limit, seed, stats_on_cpu,
               type=click.Path(exists=True, dir_okay=False),
               help="Path to HDF5 observations from calibration.")
 @click.option("--prune-frac", required=True, type=float,
-              help="Fraction of experts to prune per layer.")
+              help="Fraction of experts to prune per layer, or integer number to prune per layer.")
 @click.option("--out-path", required=True,
               help="Output JSON path for the pruning set.")
-@click.option("--target", default="norm_prod_sums",
-              type=click.Choice(["inner_prod_sums", "norm_prod_sums"]),
-              help="F-matrix target.")
-@click.option("--normalization", default="cond",
-              type=click.Choice(["uncond", "cond"]),
-              help="Normalization for F-matrix entries.")
 @click.option("--task-id", default=None,
               help="Task ID in the HDF5 (default: first available).")
-def solve(obs_path, prune_frac, out_path, target, normalization, task_id):
+def solve(obs_path, prune_frac, out_path, task_id):
     """Solve the HOPE QP to find the optimal pruning set."""
     from hope.solve import solve as _solve
     _solve(
-        obs_path, prune_frac, out_path,
-        target=target, normalization=normalization, task_id=task_id,
+        obs_path, prune_frac, out_path, task_id=task_id,
     )
 
 
@@ -85,7 +78,7 @@ def solve(obs_path, prune_frac, out_path, target, normalization, task_id):
               type=click.Path(exists=True, dir_okay=False),
               help="Path to HDF5 observations from calibration.")
 @click.option("--prune-frac", required=True, type=float,
-              help="Fraction of experts to prune per layer.")
+              help="Fraction of experts to prune per layer, or integer number to prune per layer.")
 @click.option("--out-path", required=True,
               help="Output JSON path for the pruning set.")
 @click.option("--method", required=True,

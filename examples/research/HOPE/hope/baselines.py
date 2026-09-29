@@ -27,7 +27,7 @@ def solve_baselines(obs_path, prune_frac, out_path, method, task_id=None):
     Args:
         obs_path: Path to HDF5 observations from calibration.
         prune_frac: Fraction of experts to prune per layer (0 < frac < 1),
-            or an integer count.
+            or an integer count to prune per layer.
         out_path: Path to save the output JSON pruning set.
         method: One of 'reap', 'ean', 'man', 'freq'.
         task_id: Task ID in the HDF5. If None, uses the first available.
@@ -71,6 +71,7 @@ def solve_baselines(obs_path, prune_frac, out_path, method, task_id=None):
                 int(num_experts * prune_frac) if prune_frac < 1
                 else int(prune_frac)
             )
+            assert 0 < num_prune < num_experts
 
             indices = np.argsort(scores)
             pruneset[str(layer_i)] = sorted(indices[:num_prune].tolist())

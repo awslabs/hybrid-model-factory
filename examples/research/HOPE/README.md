@@ -36,9 +36,9 @@ hope calibrate \
     --out-path observations.h5
 ```
 
-Where `prompts.txt` has one prompt per line, or use a `.json` file with pre-tokenized token ID lists.
+Where `prompts.txt` has one prompt (string) per line. Alternatively, use `--prompts` to specify a `.json` file which contains a list of strings, or a list of lists of ints (pre-tokenized token IDs).
 
-This produces an HDF5 file which contains the F matrix (expert usage and co-usage statistics).
+This produces an HDF5 file which contains the statistics needed to construct the F matrix (expert usage and co-usage statistics).
 
 ### 2. Solve: Find the optimal pruning set
 
@@ -51,7 +51,7 @@ hope solve \
     --out-path pruneset.json
 ```
 
-This produces the actual prune-set (i.e. which experts to prune in each layer) as a JSON file. This is the main result of the HOPE algorithm.
+This materializes the F-matrix and solves the corresponding quadratic program to produce the actual prune-set (i.e. which experts to prune in each layer) as a JSON file. This is the main result of the HOPE algorithm.
 
 ### 3. Prune: Create the smaller model
 
@@ -106,9 +106,10 @@ See `examples/quickstart.py` for a complete end-to-end example.
 
 ## Supported Models
 
-Any HuggingFace MoE model where expert layers use the `gate_up_proj` / `down_proj` SwiGLU pattern. Tested on:
+HOPE's calibration step hooks into a HuggingFace MoE's expert Module. The observer requires that models use the stacked-experts layout, where all expert weights (in each MoE layer) are stored as a 3D tensor (`gate_up_proj` with shape `(num_experts, 2 * intermediate_size, hidden_size)` and `down_proj` with shape `(num_experts, hidden_size, intermediate_size)` on a single module). HOPE's code is tested on `transformers==5.2.0` and on the following model architectures:
 
 - Qwen3 MoE (e.g. Qwen3-30B-A3B)
+- Qwen3-Next
 - Qwen3.5 MoE (e.g. Qwen3.5-35B-A3B, Qwen3.5-122B-A10B)
 - GLM-4.5-Air
 

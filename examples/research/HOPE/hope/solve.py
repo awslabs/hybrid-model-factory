@@ -12,7 +12,7 @@ import scipy.optimize
 import h5py
 
 
-def build_f_matrix(obs_hdf5, task_id, layer_i, target, normalization):
+def build_f_matrix(obs_hdf5, task_id, layer_i):
     """
     Build the F-matrix for a given task and layer.
 
@@ -20,24 +20,15 @@ def build_f_matrix(obs_hdf5, task_id, layer_i, target, normalization):
         obs_hdf5: Open h5py File handle.
         task_id: Task group name in the HDF5.
         layer_i: Layer index (int).
-        target: 'inner_prod_sums' or 'norm_prod_sums'.
-        normalization: 'cond' (conditional on co-activation) or 'uncond'
-            (normalize by total tokens).
 
     Returns:
         An E x E numpy array (the F-matrix for this layer).
     """
-    assert target in ("inner_prod_sums", "norm_prod_sums")
-    assert normalization in ("cond", "uncond")
-
     layer_group = obs_hdf5[task_id]["layer_%d" % layer_i]
-    unnorm_matrix = layer_group[target][:]
+    unnorm_matrix = layer_group["norm_prod_sums"][:]
 
-    if normalization == "cond":
-        counts = layer_group["coselect_counts"][:].astype(np.float64)
-        matrix = np.where(counts > 0, unnorm_matrix / counts, 0)
-    else:
-        matrix = unnorm_matrix / float(layer_group["total_tokens"][()])
+    counts = layer_group["coselect_counts"][:].astype(np.float64)
+    matrix = np.where(counts > 0, unnorm_matrix / counts, 0)
 
     assert np.all(np.isfinite(matrix))
     return matrix
@@ -89,8 +80,6 @@ def solve(
     obs_path,
     prune_frac,
     out_path,
-    target="norm_prod_sums",
-    normalization="cond",
     task_id=None,
 ):
     """
@@ -100,10 +89,8 @@ def solve(
     Args:
         obs_path: Path to HDF5 observations from calibration.
         prune_frac: Fraction of experts to prune per layer (0 < frac < 1),
-            or an integer count.
+            or an integer count to prune per layer.
         out_path: Path to save the output JSON pruning set.
-        target: F-matrix target ('norm_prod_sums' or 'inner_prod_sums').
-        normalization: 'cond' or 'uncond'.
         task_id: Task ID in the HDF5. If None, uses the first available.
     """
     with h5py.File(obs_path, "r") as f:
@@ -117,13 +104,12 @@ def solve(
             )
 
         # Discover layers
-        layer_keys = sorted(
-            [k for k in f[task_id].keys()
-             if k.startswith("layer_") and "-" not in k],
-            key=lambda k: int(k.split("_")[1]),
-        )
+        layer_keys = [
+            k for k in f[task_id].keys()
+             if k.startswith("layer_") and "-" not in k
+        ]
         num_layers = len(layer_keys)
-        num_experts = f[task_id]["layer_0"]["inner_prod_sums"].shape[0]
+        num_experts = f[task_id]["layer_0"]["norm_prod_sums"].shape[0]
 
         num_prune = (
             int(prune_frac * num_experts) if prune_frac < 1
@@ -131,9 +117,6 @@ def solve(
         )
         assert 0 < num_prune < num_experts
 
-        print("Task: %s | Target: %s | Normalization: %s" % (
-            task_id, target, normalization
-        ))
         print("Pruning %d/%d experts per layer across %d layers" % (
             num_prune, num_experts, num_layers
         ))
@@ -141,8 +124,6 @@ def solve(
         pruneset = {}
         log_data = {
             "obs_path": obs_path,
-            "target": target,
-            "normalization": normalization,
             "prune_frac": prune_frac,
             "task_id": task_id,
             "num_layers": num_layers,
@@ -151,9 +132,7 @@ def solve(
         }
 
         for layer_i in range(num_layers):
-            matrix = build_f_matrix(
-                f, task_id, layer_i, target, normalization
-            )
+            matrix = build_f_matrix(f, task_id, layer_i)
             print("Solving QP for layer %d ..." % layer_i)
             b_bin, b_cont, obj_bin, obj_cont = solve_qp(matrix, num_prune)
 

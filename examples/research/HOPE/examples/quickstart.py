@@ -5,7 +5,8 @@ Usage:
     python examples/quickstart.py \
         --model-path /path/to/moe-model \
         --prompts calibration_prompts.txt \
-        --prune-frac 0.25
+        --prune-frac 0.25 \
+        --out-dir /path/to/out-dir
 
 If --prompts is not provided, a handful of built-in demo prompts are used.
 In practice, calibration should use hundreds to thousands of domain-specific
@@ -27,7 +28,10 @@ DEMO_PROMPTS = [
 
 
 def load_prompts(path):
-    """Load prompts from a .txt (one per line) or .json (list of strings)."""
+    """
+    Load prompts from a .txt (one string per line) or .json (list of strings,
+    or list of lists of ints (pre-tokenized prompts).
+    """
     if path.endswith(".json"):
         with open(path) as f:
             return json.load(f)
