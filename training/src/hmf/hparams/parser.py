@@ -95,6 +95,18 @@ def _set_transformers_logging() -> None:
         transformers.utils.logging.enable_explicit_format()
 
 
+def _tokenized_eval_split_exists(tokenized_path: Optional[str]) -> bool:
+    r"""Whether tokenized_path holds a tokenized dataset with a validation split (e.g. from hmf preprocess)."""
+    if tokenized_path is None:
+        return False
+    try:
+        with open(os.path.join(tokenized_path, "dataset_dict.json")) as f:
+            splits = json.load(f)["splits"]
+    except (OSError, ValueError, KeyError):
+        return False
+    return any(split == "validation" or split.startswith("validation_") for split in splits)
+
+
 def _set_env_vars() -> None:
     if is_torch_npu_available():
         # avoid JIT compile on NPU devices, see https://zhuanlan.zhihu.com/p/660875458
@@ -183,13 +195,30 @@ def _check_extra_dependencies(
 def _parse_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS:
     parser = HfArgumentParser(_TRAIN_ARGS)
     allow_extra_keys = is_env_enabled("ALLOW_EXTRA_ARGS")
-    return _parse_args(parser, args, allow_extra_keys=allow_extra_keys)
+    model_args, data_args, training_args, finetuning_args, generating_args = _parse_args(
+        parser, args, allow_extra_keys=allow_extra_keys
+    )
+
+    # Decision prompts are plain text rendered by a prompt format, not chat turns, so use the empty
+    # template rather than parsing one from the tokenizer's chat template
+    if finetuning_args.stage == "decision" and data_args.template is None:
+        data_args.template = "empty"
+
+    return model_args, data_args, training_args, finetuning_args, generating_args
 
 
 def _parse_infer_args(args: dict[str, Any] | list[str] | None = None) -> _INFER_CLS:
     parser = HfArgumentParser(_INFER_ARGS)
     allow_extra_keys = is_env_enabled("ALLOW_EXTRA_ARGS")
-    return _parse_args(parser, args, allow_extra_keys=allow_extra_keys)
+    model_args, data_args, finetuning_args, generating_args = _parse_args(
+        parser, args, allow_extra_keys=allow_extra_keys
+    )
+
+    # As in training, decision prompts do not use a chat template
+    if finetuning_args.stage == "decision" and data_args.template is None:
+        data_args.template = "empty"
+
+    return model_args, data_args, finetuning_args, generating_args
 
 
 def _parse_eval_args(args: dict[str, Any] | list[str] | None = None) -> _EVAL_CLS:
@@ -257,7 +286,9 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
         raise ValueError("Please specify dataset for training.")
 
     if (training_args.do_eval or training_args.do_predict or training_args.predict_with_generate) and (
-        data_args.eval_dataset is None and data_args.val_size < 1e-6
+        data_args.eval_dataset is None
+        and data_args.val_size < 1e-6
+        and not _tokenized_eval_split_exists(data_args.tokenized_path)
     ):
         raise ValueError("Please make sure eval_dataset be provided or val_size >1e-6")
 

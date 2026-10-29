@@ -35,6 +35,7 @@ from .pt import run_pt
 from .rm import run_rm
 from .sft import run_sft
 from .hkd import run_hkd
+from .decision import run_decision
 from .trainer_utils import (
     get_placement_group,
     get_ray_head_node_ip,
@@ -86,6 +87,8 @@ def _training_function(config: dict[str, Any]) -> None:
         run_kto(model_args, data_args, training_args, finetuning_args, callbacks)
     elif finetuning_args.stage == "hkd":
         run_hkd(model_args, data_args, training_args, finetuning_args, callbacks)
+    elif finetuning_args.stage == "decision":
+        run_decision(model_args, data_args, training_args, finetuning_args, callbacks)
     else:
         raise ValueError(f"Unknown task: {finetuning_args.stage}.")
 
@@ -146,6 +149,13 @@ def export_model(args: Optional[dict[str, Any]] = None) -> None:
         setattr(model.config, "torch_dtype", output_dtype)
         model = model.to(output_dtype)
         logger.info_rank0(f"Convert model dtype to: {output_dtype}.")
+
+        # Modules the model keeps in float32 whatever its dtype (e.g. a decision model's pointer head)
+        for module_name in getattr(model, "_keep_in_fp32_modules_strict", None) or []:
+            module = getattr(model, module_name, None)
+            if module is not None:
+                module.float()
+                logger.info_rank0(f"Keep {module_name} in float32.")
 
     model.save_pretrained(
         save_directory=model_args.export_dir,

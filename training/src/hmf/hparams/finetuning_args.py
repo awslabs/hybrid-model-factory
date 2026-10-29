@@ -466,6 +466,63 @@ class HybridizationArguments:
 
 
 @dataclass
+class DecisionArguments:
+    r"""Arguments pertaining to training decision models (stage `decision`)."""
+
+    decision_head_lr: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Learning rate of the decision model's pointer head. A model from hmf decision-init starts with a "
+                "random head, which usually needs a larger step than the rest of the model; a head that is already "
+                "trained (a merged model, or a saved adapter) usually does not. Defaults to learning_rate."
+            )
+        },
+    )
+    decision_pad_to_multiple_of: Optional[int] = field(
+        default=256,
+        metadata={
+            "help": (
+                "Pad each batch of decision prompts to a multiple of this many tokens, so only a few sequence "
+                "lengths occur. Kernels compiled per sequence length (e.g. the Triton kernels of linear attention "
+                "layers) are then compiled a few times rather than for almost every batch. None pads each batch "
+                "to its longest prompt."
+            )
+        },
+    )
+    decision_checkpoint_min_tokens: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "With gradient checkpointing on, checkpoint only batches of more padded tokens (rows x padded "
+                "length) than this, so short batches run without recomputation and long ones save memory. The "
+                "result is the same either way. 0 checkpoints every batch."
+            )
+        },
+    )
+    decision_anchor_kl_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight of the anchor term of the decision loss, KL(anchor || model), averaged over the rows of each "
+                "batch that have an anchor (row weights do not apply). Needs a label set with anchor targets "
+                "(decision_label_folder). 0 leaves the term out."
+            )
+        },
+    )
+    decision_teacher_kl_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight of the teacher term of the decision loss, KL(teacher || model), averaged over the rows of "
+                "each batch that have a teacher (row weights do not apply). Needs a label set with teacher targets "
+                "(decision_label_folder). 0 leaves the term out."
+            )
+        },
+    )
+
+
+@dataclass
 class FinetuningArguments(
     SwanLabArguments,
     BAdamArgument,
@@ -476,6 +533,7 @@ class FinetuningArguments(
     OFTArguments,
     FreezeArguments,
     HybridizationArguments,
+    DecisionArguments,
 ):
     r"""Arguments pertaining to which techniques we are going to fine-tuning with."""
 
@@ -483,7 +541,7 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to train model in purely bf16 precision (without AMP)."},
     )
-    stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto"] = field(
+    stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto", "decision"] = field(
         default="sft",
         metadata={"help": "Which stage will be performed in training."},
     )
