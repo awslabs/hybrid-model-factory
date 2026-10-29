@@ -276,3 +276,29 @@ class ZigZagScatter(Function):
 
         # Scale by 1/cp_size to account for all_gather
         return grad_full / cp_size, None, None, None, None
+
+
+class DifferentiableAllGather(Function):
+    """
+    All-gather with differentiable backward (reduce-scatter).
+
+    Forward: Gathers tensors from all ranks in the group.
+    Backward: Reduce-scatters gradients back to source ranks.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, group):
+        ctx.group = group
+        world_size = dist.get_world_size(group)
+        tensor = tensor.contiguous()
+        gathered = [torch.empty_like(tensor) for _ in range(world_size)]
+        dist.all_gather(gathered, tensor, group=group)
+        return torch.stack(gathered)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        group = ctx.group
+        grad_list = [g.contiguous() for g in grad_output.unbind(0)]
+        output = torch.empty_like(grad_list[0])
+        dist.reduce_scatter(output, grad_list, group=group)
+        return output, None
