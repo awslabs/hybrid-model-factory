@@ -1,0 +1,43 @@
+# An evaluation suite with the benchmarks that Strands Decider's v19 model was evaluated on. It fits the
+# calibration on the held-out tasks, evaluates each benchmark, and then runs JevBench. Each of these
+# sections is optional, and the run skips any section that is removed from this file.
+#
+#   hmf decision-eval run examples/decision/eval/strands_v19.yaml \
+#       model_name_or_path=path/to/decision-model adapter_name_or_path=path/to/lora \
+#       output_dir=reports/my-model jevbench.dir=path/to/jevbench
+#
+# The data files are built by Strands Decider (see examples/decision/README.md, "Before You Start").
+
+### The model ###
+model_name_or_path: null     # the decision model (from hmf decision-init)
+adapter_name_or_path: null   # its LoRA adapter (the training output_dir); null for a merged or fully trained model
+output_dir: null             # where the reports go
+max_len: 4096                # the most tokens a prompt may have. Benchmark rows that are longer are left out of the
+                             # scores (the reports count them); JevBench tasks that are longer get the end of their
+                             # state cut, so that every task still gets an answer.
+prompt_format: strands       # as in training (decision_prompt_format)
+force_bos: false             # as in training (decision_force_bos)
+
+### Calibration, fitted first, saved in the adapter's folder, and used by everything below ###
+calibration:
+  dataset: strands_holdout_v5_norule   # a name in data/dataset_info.json, or `data: path/to/file.jsonl`
+  split: calib                         # the half of the file to fit on (calib, test, or all)
+  limit: 4000                          # the most rows to use; 0 for all
+
+### Benchmarks, each evaluated in turn ###
+benchmarks:
+  - {name: heldout, dataset: strands_holdout_v5_norule, split: test, limit: 6000}    # tasks never trained on
+  - {name: multistep, dataset: strands_multistep_v14_eval, split: all, limit: 0}     # ContractNLI, MuSiQue, BoardgameQA, HotpotQA
+  - {name: generated_v16, dataset: strands_generated_v16_eval, split: all, limit: 0}
+  - {name: generated_v18, dataset: strands_generated_v18_eval, split: all, limit: 0}
+  - {name: helpsteer2, dataset: strands_adequacy_hs2_eval, split: all, limit: 0}     # does a response answer the request
+  - {name: adequacy_gen, dataset: strands_adequacy_gen_eval, split: all, limit: 0}
+
+### JevBench, run against a server on 127.0.0.1 that the suite starts and stops ###
+jevbench:
+  dir: null                  # a JevBench checkout (git clone https://github.com/fstandhartinger/jevbench)
+  commit: 1bcc55eb6c8cffde2306b3db03ede39b61c6152a   # the version Strands Decider's results used; the run stops if the checkout is at another
+  max_len: 4096              # the server's window (Strands Decider published v19 at 3072: 167 tasks; at 4096: 168)
+  port: 8099
+  compare:                   # reference runs, compared task by task (optional)
+    - {name: v19, results: path/to/strands-decider/research/data/jevbench_results.csv, run: v19}

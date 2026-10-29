@@ -1,0 +1,25 @@
+# Tokenize the Strands Decider v19 training mix for a decision model, without labels (the cross-entropy
+# baseline of examples/decision/recipes.md trains on it directly; strands_v19_replay.yaml adds the labels of
+# the v19 recipe)
+# hmf preprocess examples/decision/tokenization/qwen3_5_2b/strands_v19.yaml --shard_size 20000 --parallel_jobs 32
+model_name_or_path: ./models/Qwen3.5-2B-Base-Decision   # Only the tokenizer is loaded
+stage: decision
+dataset: strands_train_v5,strands_multistep_v14,strands_generated_v16,strands_generated_v18,strands_adequacy_hs2,strands_adequacy_gen
+tokenized_path: ./data/tokenized/decision/qwen3_5_2b/strands_v19
+cutoff_len: 4096                     # Longer prompts are dropped
+val_size: 0.03                       # Held out per task (stratified), rendered without augmentation
+seed: 0                              # Validation split and augmentations
+mix_strategy: concat
+preprocessing_num_workers: 32
+preprocessing_batch_size: 1000
+packing: false
+streaming: false
+
+### Decision prompts ###
+decision_prompt_format: strands
+decision_num_augmentations: 1        # Augmented copies of each row (option order, phrasing), one per training epoch
+decision_shuffle_options: true       # noul and choice options
+decision_reverse_score_prob: 0.5     # score rubrics are reversed instead of shuffled
+decision_vary_instructions: true     # Sample among each row's phrasings of the question
+decision_ordinal_smoothing: 0.1      # score targets put this much mass on neighboring levels
+decision_force_bos: false            # Prepend BOS if the tokenizer does not add it

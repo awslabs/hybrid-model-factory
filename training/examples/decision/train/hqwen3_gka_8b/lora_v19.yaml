@@ -1,0 +1,61 @@
+# Train GKA-primed-HQwen3-8B-Instruct as a decision model with LoRA on the Strands Decider v19 mix, with the
+# anchor and the replay of model 1 as the teacher (the v19 recipe's model 2; see examples/decision/recipes.md)
+# 1. Train model 1: examples/decision/train/hqwen3_gka_8b/lora_v14.yaml
+# 2. hmf preprocess examples/decision/tokenization/hqwen3_gka_8b/strands_v19_replay.yaml --shard_size 20000 --parallel_jobs 32
+# 3. hmf train examples/decision/train/hqwen3_gka_8b/lora_v19.yaml
+# Model 2 is a new student, which starts from the converted base model rather than from model 1.
+model_name_or_path: ./models/GKA-primed-HQwen3-8B-Instruct-Decision
+
+### Decision training ###
+stage: decision
+do_train: true
+do_eval: true
+finetuning_type: lora
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target: all                     # Every linear layer except the head, so attention, MLP, and GKA's projections
+# The pointer head trains in full alongside the adapter
+
+### Dataset ###
+dataset: strands_train_v5,strands_multistep_v14,strands_generated_v16,strands_generated_v18,strands_adequacy_hs2,strands_adequacy_gen
+tokenized_path: ./data/tokenized/decision/hqwen3_gka_8b/strands_v19
+cutoff_len: 4096
+dataloader_num_workers: 4
+train_sampling_strategy: group_by_length   # Batch prompts of similar length together (less padding)
+decision_pad_to_multiple_of: 256     # Few distinct batch lengths, so the hybrid layers' kernels compile only a few times
+
+### Anchor and teacher terms ###
+decision_label_folder: anchor-gka8b_teacher-replay-model1   # A folder name, not a path: <tokenized_path>/labels/<this>
+decision_anchor_kl_weight: 0.3       # KL(anchor || model), on the rows with an anchor (at most 9 options)
+decision_teacher_kl_weight: 1.0      # KL(teacher || model), on the rows with a teacher (the multi-step rows, model 1's answers)
+
+### Training ###
+num_train_epochs: 1.0                # One epoch per augmentation (decision_num_augmentations when tokenizing)
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 1       # Effective batch 32 on 8 GPUs
+learning_rate: 1.0e-4                # LoRA adapters
+decision_head_lr: 1.0e-3             # The head starts from a random initialization, so it needs a bigger step
+weight_decay: 0.01                   # Applies to the head's matrices only
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+adam_beta2: 0.95
+seed: 0
+
+### Precision & Performance ###
+bf16: true                           # The pointer head always computes in float32
+decision_checkpoint_min_tokens: 4096 # Checkpoint long batches only (without it, an 8B model needs ~12 MB per token)
+
+### Evaluation ###
+per_device_eval_batch_size: 8
+eval_strategy: steps
+eval_steps: 500
+
+### Output & Logging ###
+output_dir: ./models/GKA-primed-HQwen3-8B-Instruct-Decision/LoRA-strands-v19
+logging_steps: 20
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: false
+report_to: none

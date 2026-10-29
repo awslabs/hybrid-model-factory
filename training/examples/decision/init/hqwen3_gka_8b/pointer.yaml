@@ -1,0 +1,11 @@
+# Convert GKA-primed-HQwen3-8B-Instruct, an HMF hybrid with 18 Gated KalmaNet and 18 attention layers, to a
+# decision model, by removing its language model's head and putting a pointer head in its place
+# hmf decision-init examples/decision/init/hqwen3_gka_8b/pointer.yaml
+base_model_name_or_path: amazon/GKA-primed-HQwen3-8B-Instruct
+dtype: bf16                     # Backbone dtype; the pointer head is always stored in float32
+decision_head_dim: 256          # Width of the query and key projections
+decision_head_norm: true        # LayerNorm before the projections
+decision_head_dropout: 0.05     # 0 disables dropout
+decision_head_init: random      # PyTorch's default initialization
+seed: null                      # Set to seed the head's initialization (e.g. one per soup member)
+output_dir: ./models/GKA-primed-HQwen3-8B-Instruct-Decision

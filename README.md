@@ -45,6 +45,7 @@ Hybrid Model Factory extends [LlamaFactory](https://github.com/hiyouga/LlamaFact
 | Hybrid layer types | Gated KalmaNet (GKA), Gated DeltaNet (GDN), Mamba2, B'MOJO-F |
 | Hybrid models | Qwen3Next, Qwen3.5, Primed Qwen3-GKA, Primed Qwen3-BMOJOF, Primed Ministral3-GDN, ... |
 | Priming pipeline | Initialize (Stage 0) → Distill (Stage 1) → Fine-tune (Stage 2), with Qwen3, Qwen3-MoE, Qwen2.5, Llama3, Ministral3 as base Transformers |
+| Decision models | Conversion of a Transformer or Hybrid model into a decision model, which scores a list of options, then LoRA training with optional anchor and teacher targets, and calibrated evaluation |
 | Sequence Parallelism | Universal SP implementation for any SSM layer (GKA, GDN, Mamba2, ...) to train on 128K+ contexts across multiple GPUs. |
 | Inference | Optimized vLLM plugin for inference with continuous batching and tensor parallelism for Hybrid and Primed models (Qwen2.5/3/3-MoE,3-Next,3.5) |
 | Context extension | Training-free 2-4× context extension (experimental HF feature) [Hybrid cache composition](https://arxiv.org/abs/2502.17605) |
@@ -161,6 +162,19 @@ For a complete end-to-end pipeline (Stage 0 → Stage 1 → Stage 2) that runs w
 Each directory contains a `setup_docker.sh` to build and launch the container, and a `run_pipeline.sh` that runs the full priming pipeline inside it. The pipeline configs are in [`training/examples/priming/full_pipeline/`](training/examples/priming/full_pipeline/).
 
 All our code (including custom kernels and vLLM implementations) has been tested on A100 and H200 GPUs, with Sequence Parallel (SP) tested up to SP group size 8 for long-context training. Refer to [Tested Configurations](#tested-configurations) for a comprehensive list of hardware requirements for different model sizes and training stages.
+
+### Decision Models
+
+A decision model reads a situation, a question about it, and a list of possible answers, and returns the probability of each answer. Decision models suit choices that need a fast answer with a confidence you can trust, such as routing a request, checking whether a response answers the question, or rating text on a scale, for example inside agent workflows. HMF converts a language model, Transformer or Hybrid, into a decision model by replacing its language model head with a small head that scores the options. It then trains the model with LoRA, and calibrates and evaluates it.
+
+```bash
+cd training
+hmf decision-init examples/decision/init/qwen3_5_2b/pointer.yaml
+hmf preprocess examples/decision/tokenization/qwen3_5_2b/strands_v14.yaml
+hmf train examples/decision/train/qwen3_5_2b/lora_v14.yaml
+```
+
+[training/examples/decision/README.md](training/examples/decision/README.md) explains how to convert and train a model from the start, with example configs for Qwen3.5-2B-Base and GKA-primed-HQwen3-8B-Instruct, and how to fine-tune an existing decision model on your own data.
 
 ---
 
