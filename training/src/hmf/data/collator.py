@@ -27,6 +27,7 @@ from transformers import DataCollatorForSeq2Seq
 
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER
 from ..extras.packages import is_pillow_available
+from .decision_prompt import DECISION_KINDS
 
 
 if is_pillow_available():
@@ -34,7 +35,7 @@ if is_pillow_available():
 
 
 if TYPE_CHECKING:
-    from transformers import ProcessorMixin
+    from transformers import PreTrainedTokenizer, ProcessorMixin
 
     from .template import Template
 
@@ -361,4 +362,71 @@ class KTODataCollatorWithPadding(MultiModalDataCollatorForSeq2Seq):
             batch["kl_token_type_ids"] = kl_batch["token_type_ids"]
 
         batch["kto_tags"] = torch.tensor(kto_tags)
+        return batch
+
+
+@dataclass
+class DecisionDataCollator:
+    r"""
+    Collates tokenized decision rows (stage `decision`) into a right-padded batch.
+
+    Prompts are padded with the pad token, and their attention masks with 0. Rows with fewer
+    options than the widest row of the batch are padded with -1 in opt_idx (which the decision
+    model masks) and 0 in label_dist. kind is returned as kind_id, its index in DECISION_KINDS;
+    the other string columns are dropped.
+
+    Rows joined to a label set (decision_label_folder) also have ref_probs and teacher_probs,
+    padded with 0 like label_dist (a row without that target is all 0), and has_ref and
+    has_teacher, which say which rows have each target.
+
+    Args:
+        tokenizer: The tokenizer, for its pad token.
+        pad_to_multiple_of: If set, pad the prompts to a multiple of this length. Defaults to None.
+    """
+
+    tokenizer: "PreTrainedTokenizer"
+    pad_to_multiple_of: Optional[int] = None
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            raise ValueError("The tokenizer has no pad token.")
+
+        seq_len = max(len(feature["input_ids"]) for feature in features)
+        if self.pad_to_multiple_of:
+            seq_len = -(-seq_len // self.pad_to_multiple_of) * self.pad_to_multiple_of
+        num_options = max(len(feature["opt_idx"]) for feature in features)
+
+        input_ids = torch.full((len(features), seq_len), pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(features), seq_len), dtype=torch.long)
+        opt_idx = torch.full((len(features), num_options), -1, dtype=torch.long)
+        label_dist = torch.zeros((len(features), num_options), dtype=torch.float32)
+        for i, feature in enumerate(features):
+            length, options = len(feature["input_ids"]), len(feature["opt_idx"])
+            input_ids[i, :length] = torch.tensor(feature["input_ids"], dtype=torch.long)
+            attention_mask[i, :length] = 1
+            opt_idx[i, :options] = torch.tensor(feature["opt_idx"], dtype=torch.long)
+            label_dist[i, :options] = torch.tensor(feature["label_dist"], dtype=torch.float32)
+
+        batch = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "opt_idx": opt_idx,
+            "answer_idx": torch.tensor([feature["answer_idx"] for feature in features], dtype=torch.long),
+            "label": torch.tensor([feature["label"] for feature in features], dtype=torch.long),
+            "label_dist": label_dist,
+            "weight": torch.tensor([feature["weight"] for feature in features], dtype=torch.float32),
+            "kind_id": torch.tensor([DECISION_KINDS.index(feature["kind"]) for feature in features], dtype=torch.long),
+        }
+
+        # The targets of a label set
+        for probs_key, has_key in (("ref_probs", "has_ref"), ("teacher_probs", "has_teacher")):
+            if probs_key not in features[0]:
+                continue
+            probs = torch.zeros((len(features), num_options), dtype=torch.float32)
+            for i, feature in enumerate(features):
+                if feature[has_key]:
+                    probs[i, : len(feature[probs_key])] = torch.tensor(feature[probs_key], dtype=torch.float32)
+            batch[probs_key] = probs
+            batch[has_key] = torch.tensor([bool(feature[has_key]) for feature in features], dtype=torch.bool)
         return batch

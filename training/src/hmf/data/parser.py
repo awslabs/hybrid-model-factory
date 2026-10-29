@@ -30,7 +30,7 @@ class DatasetAttr:
     # basic configs
     load_from: Literal["hf_hub", "ms_hub", "om_hub", "script", "file"]
     dataset_name: str
-    formatting: Literal["alpaca", "sharegpt", "openai"] = "alpaca"
+    formatting: Literal["alpaca", "sharegpt", "openai", "decision"] = "alpaca"
     ranking: bool = False
     # extra configs
     subset: Optional[str] = None
@@ -64,6 +64,15 @@ class DatasetAttr:
     system_tag: Optional[str] = "system"
     pt_separator_tag: Optional[str] = "pt_separator"
     pt_content_tag: Optional[str] = "pt_content"
+    # decision columns
+    state: Optional[str] = "state"
+    instructions: Optional[str] = "instructions"
+    instruction_variants: Optional[str] = "instruction_variants"
+    kind: Optional[str] = "kind"
+    options: Optional[str] = "options"
+    label: Optional[str] = "label"
+    task: Optional[str] = "task"
+    weight: Optional[str] = "weight"
     # reasoning/thinking config
     thinking_prompt: Optional[Literal["on", "off", "auto", "none","passthrough"]] = "passthrough"
 
@@ -87,6 +96,12 @@ class DatasetAttr:
             column_names += ["images", "videos", "audios", "chosen", "rejected", "kto_tag"]
             for column_name in column_names:
                 self.set_attr(column_name, attr["columns"])
+
+            # Decision columns keep their default names unless mapped
+            decision_column_names = ["state", "instructions", "instruction_variants", "kind", "options", "label"]
+            decision_column_names += ["task", "weight"]
+            for column_name in decision_column_names:
+                self.set_attr(column_name, attr["columns"], default=getattr(self, column_name))
 
         if "tags" in attr:
             tag_names = ["role_tag", "content_tag"]

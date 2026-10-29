@@ -667,5 +667,53 @@
       "prompt": "content"
     },
     "folder": "python"
+  },
+  "strands_train_v5": {
+    "file_name": "strands-decider/train_v5.jsonl",
+    "formatting": "decision"
+  },
+  "strands_multistep_v14": {
+    "file_name": "strands-decider/multistep_v14.jsonl",
+    "formatting": "decision"
+  },
+  "strands_generated_v16": {
+    "file_name": "strands-decider/generated_v16.jsonl",
+    "formatting": "decision"
+  },
+  "strands_generated_v18": {
+    "file_name": "strands-decider/generated_v18.jsonl",
+    "formatting": "decision"
+  },
+  "strands_adequacy_hs2": {
+    "file_name": "strands-decider/adequacy_hs2.jsonl",
+    "formatting": "decision"
+  },
+  "strands_adequacy_gen": {
+    "file_name": "strands-decider/adequacy_gen.jsonl",
+    "formatting": "decision"
+  },
+  "strands_holdout_v5_norule": {
+    "file_name": "strands-decider/holdout_v5_norule.jsonl",
+    "formatting": "decision"
+  },
+  "strands_multistep_v14_eval": {
+    "file_name": "strands-decider/multistep_v14_eval.jsonl",
+    "formatting": "decision"
+  },
+  "strands_generated_v16_eval": {
+    "file_name": "strands-decider/generated_v16_eval.jsonl",
+    "formatting": "decision"
+  },
+  "strands_generated_v18_eval": {
+    "file_name": "strands-decider/generated_v18_eval.jsonl",
+    "formatting": "decision"
+  },
+  "strands_adequacy_hs2_eval": {
+    "file_name": "strands-decider/adequacy_hs2_eval.jsonl",
+    "formatting": "decision"
+  },
+  "strands_adequacy_gen_eval": {
+    "file_name": "strands-decider/adequacy_gen_eval.jsonl",
+    "formatting": "decision"
   }
 }

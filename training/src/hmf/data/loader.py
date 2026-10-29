@@ -28,8 +28,10 @@ from ..extras.constants import FILEEXT2TYPE
 from ..extras.misc import check_version, has_tokenized_data
 from .converter import align_dataset
 from .data_utils import get_dataset_module, merge_dataset, read_cloud_json, split_dataset, load_jsonl
+from .data_utils import load_decision_jsonl
 from .parser import get_dataset_list
 from .processor import (
+    DecisionDatasetProcessor,
     FeedbackDatasetProcessor,
     PackedSupervisedDatasetProcessor,
     PairwiseDatasetProcessor,
@@ -61,6 +63,11 @@ def _load_single_dataset(
 ) -> Union["Dataset", "IterableDataset"]:
     r"""Load a single dataset and aligns it to the standard format."""
     logger.info_rank0(f"Loading dataset {dataset_attr}...")
+    if dataset_attr.formatting == "decision" and (dataset_attr.load_from != "file" or data_args.streaming):
+        raise ValueError(
+            f"Decision dataset {dataset_attr} must be a local JSON/JSONL file or folder, without streaming."
+        )
+
     data_path, data_name, data_dir, data_files = None, None, None, None
     if dataset_attr.load_from in ["hf_hub", "ms_hub", "om_hub"]:
         data_path = dataset_attr.dataset_name
@@ -133,7 +140,13 @@ def _load_single_dataset(
     elif dataset_attr.load_from == "cloud_file":
         dataset = Dataset.from_list(read_cloud_json(data_path), split=dataset_attr.split)
     else:
-        if dataset_attr.load_from == "file" and "json" in data_path and dataset_attr.formatting in ("nemotron", "openai"):
+        if dataset_attr.formatting == "decision":
+            dataset = load_decision_jsonl(data_files, dataset_attr, cache_dir=model_args.cache_dir)
+        elif (
+            dataset_attr.load_from == "file"
+            and "json" in data_path
+            and dataset_attr.formatting in ("nemotron", "openai")
+        ):
             # TODO: Only nemotron and openai formats are supported for JSONL loading
             logger.info_rank0(f"Special loading of JSONL with tools: {data_files}")
             dataset = load_jsonl(data_files[0], dataset_attr, cache_dir=model_args.cache_dir)
@@ -170,6 +183,12 @@ def _load_single_dataset(
 
     # align to common llamafactory format
     dataset = align_dataset(dataset, dataset_attr, data_args, training_args)
+
+    if dataset_attr.formatting == "decision":
+        num_varied = sum(1 for variants in dataset["_instruction_variants"] if variants)
+        logger.info_rank0(
+            f"{dataset_attr}: {num_varied:,} of {len(dataset):,} rows have alternative phrasings of the question."
+        )
 
     # optionally apply additional filters
     if data_args.filter:
@@ -225,7 +244,7 @@ def _get_merged_dataset(
     model_args: "ModelArguments",
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
-    stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+    stage: Literal["pt", "sft", "rm", "ppo", "kto", "decision"],
     return_dict: bool = False,
 ) -> Optional[Union["Dataset", "IterableDataset", dict[str, "Dataset"]]]:
     r"""Return the merged datasets in the standard format."""
@@ -247,14 +266,25 @@ def _get_merged_dataset(
 
 def _get_dataset_processor(
     data_args: "DataArguments",
-    stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+    stage: Literal["pt", "sft", "rm", "ppo", "kto", "decision"],
     template: "Template",
     tokenizer: "PreTrainedTokenizer",
     processor: Optional["ProcessorMixin"],
     do_generate: bool = False,
+    is_eval: bool = False,
+    seed: int = 0,
 ) -> "DatasetProcessor":
     r"""Return the corresponding dataset processor."""
-    if stage == "pt":
+    if stage == "decision":
+        return DecisionDatasetProcessor(
+            template=template,
+            tokenizer=tokenizer,
+            processor=processor,
+            data_args=data_args,
+            is_eval=is_eval,
+            seed=seed,
+        )
+    elif stage == "pt":
         dataset_processor_class = PretrainDatasetProcessor
     elif stage == "sft" and not do_generate:
         if data_args.packing:
@@ -303,7 +333,7 @@ def _get_preprocessed_dataset(
     dataset: Optional[Union["Dataset", "IterableDataset"]],
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
-    stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+    stage: Literal["pt", "sft", "rm", "ppo", "kto", "decision"],
     template: "Template",
     tokenizer: "PreTrainedTokenizer",
     processor: Optional["ProcessorMixin"] = None,
@@ -314,7 +344,14 @@ def _get_preprocessed_dataset(
         return None
 
     dataset_processor = _get_dataset_processor(
-        data_args, stage, template, tokenizer, processor, do_generate=(training_args.predict_with_generate and is_eval)
+        data_args,
+        stage,
+        template,
+        tokenizer,
+        processor,
+        do_generate=(training_args.predict_with_generate and is_eval),
+        is_eval=is_eval,
+        seed=training_args.seed,
     )
     column_names = list(next(iter(dataset)).keys())
     kwargs = {}
@@ -389,7 +426,7 @@ def get_dataset(
     model_args: "ModelArguments",
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
-    stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+    stage: Literal["pt", "sft", "rm", "ppo", "kto", "decision"],
     tokenizer: "PreTrainedTokenizer",
     processor: Optional["ProcessorMixin"] = None,
 ) -> "DatasetModule":
@@ -400,6 +437,12 @@ def get_dataset(
             logger.warning_rank0("Loading dataset from disk will ignore other data arguments.")
             tokenized_data = load_from_disk(data_args.tokenized_path)
             dataset_module = get_dataset_module(tokenized_data)
+            if stage == "decision" and data_args.decision_label_folder is not None:
+                from .decision_label import load_decision_labels
+
+                dataset_module["train_dataset"] = load_decision_labels(
+                    dataset_module["train_dataset"], data_args.tokenized_path, data_args.decision_label_folder
+                )
             if data_args.streaming:
                 dataset_module["train_dataset"] = dataset_module["train_dataset"].to_iterable_dataset()
 
@@ -408,6 +451,12 @@ def get_dataset(
 
         if data_args.streaming:
             raise ValueError("Turn off `streaming` when saving dataset to disk.")
+
+    if stage == "decision" and data_args.decision_label_folder is not None:
+        raise ValueError(
+            "decision_label_folder needs labeled tokenized data: tokenize to tokenized_path with hmf preprocess, label it "
+            "with hmf decision-label, then train from tokenized_path."
+        )
 
     # Load and preprocess dataset
     with training_args.main_process_first(desc="load dataset", local=(not data_args.data_shared_file_system)):
@@ -423,7 +472,13 @@ def get_dataset(
 
     with training_args.main_process_first(desc="pre-process dataset", local=(not data_args.data_shared_file_system)):
         # move front to make sure eval_dataset(if contain or split) can preprocessed appropriately
-        train_dict, eval_dict = split_dataset(dataset, eval_dataset, data_args, seed=training_args.seed)
+        train_dict, eval_dict = split_dataset(
+            dataset,
+            eval_dataset,
+            data_args,
+            seed=training_args.seed,
+            stratify_by="_task" if stage == "decision" else None,
+        )
 
         if "train" in train_dict:
             train_dict["train"] = _get_preprocessed_dataset(

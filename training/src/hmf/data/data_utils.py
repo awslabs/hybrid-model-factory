@@ -13,15 +13,18 @@
 # limitations under the License.
 
 import json
+import os
+import random
 from enum import Enum, unique
-from typing import TYPE_CHECKING, Any, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Any, Iterator, Optional, TypedDict, Union
 import numpy as np
 
 import fsspec
 from datasets import DatasetDict, concatenate_datasets, interleave_datasets
-from datasets import Dataset, Features, Value
+from datasets import Dataset, Features, Sequence, Value
 
 from ..extras import logging
+from .decision_prompt import render_content
 
 
 if TYPE_CHECKING:
@@ -131,15 +134,50 @@ def merge_dataset(
         f"Choose from: 'concat', 'interleave_under', 'interleave_over', 'interleave_once', 'interleave_fast'."
     )
 
+def stratified_split(dataset: "Dataset", val_size: float, stratify_by: str, seed: int) -> tuple["Dataset", "Dataset"]:
+    """
+    Splits a dataset into train and validation sets with the same proportion of each value of a
+    column, so that small groups (e.g. small tasks) are represented in the validation set.
+
+    Args:
+        dataset: The dataset to split.
+        val_size: The validation fraction in [0, 1), or the number of validation rows if > 1.
+        stratify_by: The column whose values define the groups.
+        seed: Seed of the split.
+
+    Returns:
+        The train and validation datasets. A group with a single row goes to the train set.
+    """
+    fraction = val_size if val_size < 1 else val_size / len(dataset)
+    groups: dict[Any, list[int]] = {}
+    for index, value in enumerate(dataset[stratify_by]):
+        groups.setdefault(value, []).append(index)
+
+    rng = random.Random(seed)
+    train_indices, val_indices = [], []
+    for value in sorted(groups, key=str):
+        indices = groups[value]
+        rng.shuffle(indices)
+        num_train = max(1, int(len(indices) * (1 - fraction))) if len(indices) > 1 else 1
+        train_indices += indices[:num_train]
+        val_indices += indices[num_train:]
+
+    rng.shuffle(train_indices)
+    rng.shuffle(val_indices)
+    return dataset.select(train_indices), dataset.select(val_indices)
+
+
 def split_dataset(
     dataset: Optional[Union["Dataset", "IterableDataset"]],
     eval_dataset: Optional[Union["Dataset", "IterableDataset", dict[str, "Dataset"]]],
     data_args: "DataArguments",
     seed: int,
+    stratify_by: Optional[str] = None,
 ) -> tuple[dict, dict]:
     r"""Split the dataset and returns two dicts containing train set and validation set.
 
-    Support both map dataset and iterable dataset.
+    Support both map dataset and iterable dataset. If stratify_by names a column, a map dataset is
+    split with the same validation fraction in each group of that column (see stratified_split).
 
     Returns:
         train_dict: Dictionary containing training data with key "train"
@@ -159,6 +197,10 @@ def split_dataset(
             if data_args.streaming:
                 eval_dict["validation"] = dataset.take(int(data_args.val_size))
                 train_dict["train"] = dataset.skip(int(data_args.val_size))
+            elif stratify_by is not None:
+                train_dict["train"], eval_dict["validation"] = stratified_split(
+                    dataset, data_args.val_size, stratify_by, seed
+                )
             else:
                 val_size = int(data_args.val_size) if data_args.val_size > 1 else data_args.val_size
                 split_result = dataset.train_test_split(test_size=val_size, seed=seed)
@@ -385,3 +427,128 @@ def fast_interleave_with_limit(
     
     logger.info_rank0(f"Shuffling {len(combined):,} samples...")
     return combined.shuffle(seed=seed)
+
+# Columns of a decision row, as named in DatasetAttr (which maps them to the source's column names)
+DECISION_COLUMNS = ("state", "instructions", "instruction_variants", "kind", "options", "label", "task", "weight")
+
+DECISION_FEATURES = Features(
+    {
+        "state": Value("string"),
+        "instructions": Value("string"),
+        "instruction_variants": Sequence(Value("string")),
+        "kind": Value("string"),
+        "options": Sequence(Sequence(Value("string"))),
+        "label": Value("int64"),
+        "task": Value("string"),
+        "weight": Value("float64"),
+        "source": Value("string"),
+        "row_index": Value("int64"),
+    }
+)
+
+# The same columns after DecisionDatasetConverter, which prefixes them with an underscore
+DECISION_ALIGNED_FEATURES = Features({f"_{name}": feature for name, feature in DECISION_FEATURES.items()})
+
+
+def flatten_decision_row(values: dict[str, Any]) -> dict[str, Any]:
+    """
+    Flattens a decision row's structured content (state, instructions, option descriptions) to text.
+    Optional columns may be missing, e.g. in a row read straight from its data file.
+    """
+    variants, options = values.get("instruction_variants"), values.get("options")
+    return {
+        **values,
+        "state": render_content(values["state"]),
+        "instructions": render_content(values["instructions"]),
+        "instruction_variants": None if variants is None else [render_content(v) for v in variants],
+        "options": None
+        if options is None
+        else [[str(name), None if desc is None else render_content(desc)] for name, desc in options],
+    }
+
+
+def decision_dataset_files(dataset_attr, dataset_dir: str) -> list[str]:
+    """The files of a local decision dataset, which are its file or the files of its folder."""
+    local_path = os.path.join(dataset_dir, dataset_attr.dataset_name)
+    if os.path.isdir(local_path):
+        return [os.path.join(local_path, name) for name in os.listdir(local_path)]
+    if os.path.isfile(local_path):
+        return [local_path]
+    raise ValueError(f"File {local_path} not found.")
+
+
+def decision_sources(filepaths: list[str], dataset_attr) -> list[tuple[str, str]]:
+    """
+    The (file, source) pairs of a decision dataset's files, in the order they are read. A row's
+    source is the dataset's file name, plus the file's name for a dataset that is a folder.
+    """
+    filepaths = sorted(filepaths)
+    if len(filepaths) == 1:
+        return [(filepaths[0], dataset_attr.dataset_name)]
+    return [(path, f"{dataset_attr.dataset_name}/{os.path.basename(path)}") for path in filepaths]
+
+
+def read_decision_rows(filepaths: list[str], dataset_attr) -> Iterator[tuple[str, int, dict[str, Any]]]:
+    """
+    Reads the rows of a decision dataset's files as they are stored, without flattening structured
+    content. Columns are renamed with the column names in dataset_attr.
+
+    Args:
+        filepaths: The files of the dataset.
+        dataset_attr: The dataset's attributes.
+
+    Yields:
+        The (source, row_index, row) of each row, where row_index is the row's index among the file's
+        rows (its non-empty lines, for JSON Lines).
+    """
+    column_mapping = {name: getattr(dataset_attr, name) for name in DECISION_COLUMNS}
+    for filepath, source in decision_sources(filepaths, dataset_attr):
+        with open(filepath, "r", encoding="utf-8") as f:
+            if filepath.endswith(".json"):
+                rows = json.load(f)
+            else:
+                rows = (json.loads(line) for line in f if line.strip())
+
+            for row_index, row in enumerate(rows):
+                yield source, row_index, {name: row.get(column) for name, column in column_mapping.items()}
+
+
+def _decision_generator(filepaths: list[str], dataset_attr, file_stats):
+    """
+    Yields the decision rows of each file, flattened, with their source and their index in that file.
+    file_stats is unused, and only makes the datasets cache key change when a file changes.
+    """
+    for source, row_index, row in read_decision_rows(filepaths, dataset_attr):
+        yield {**flatten_decision_row(row), "source": source, "row_index": row_index}
+
+
+def load_decision_jsonl(filepaths: list[str], dataset_attr, cache_dir: Optional[str] = None) -> "Dataset":
+    """
+    Loads decision rows from JSONL (or JSON) files, using the column names in dataset_attr.
+
+    Structured content (a dict or list state, instructions, or option description) is rendered to
+    text here, as datasets cannot hold a column whose type varies between rows. Each row records
+    where it came from, as its source (the dataset's file name, plus the file for a directory) and its
+    index among the file's rows. This identity is stable across machines and shuffles, so
+    per-row data computed elsewhere (e.g. teacher distributions) can be joined on it.
+
+    Args:
+        filepaths: The files of the dataset.
+        dataset_attr: The dataset's attributes.
+        cache_dir: Where datasets caches the loaded rows.
+
+    Returns:
+        A dataset with the columns of DECISION_FEATURES. Missing optional columns are None.
+    """
+    filepaths = sorted(filepaths)
+    # Size and modification time are part of the cache key, so an edited file is loaded again
+    file_stats = [(os.path.getsize(path), os.path.getmtime(path)) for path in filepaths]
+
+    logger.info_rank0(f"Decision column mapping: { {name: getattr(dataset_attr, name) for name in DECISION_COLUMNS} }")
+    return Dataset.from_generator(
+        _decision_generator,
+        gen_kwargs={"filepaths": filepaths, "dataset_attr": dataset_attr, "file_stats": file_stats},
+        split=dataset_attr.split,
+        cache_dir=cache_dir,
+        features=DECISION_FEATURES,
+    )

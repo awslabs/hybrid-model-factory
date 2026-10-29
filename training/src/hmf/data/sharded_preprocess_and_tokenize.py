@@ -8,9 +8,14 @@ Usage:
 
     # Or invoked directly as a module:
     python -m hmf.data.sharded_preprocess_and_tokenize config.yaml [--shard_size N] [--parallel_jobs J] [--cleanup]
+
+For stage `decision`, a config with labeling keys (decision_label_folder, and an anchor or a teacher) is
+also labeled after tokenization, on the GPUs (see data/decision_label.py).
 """
 
 import os
+# The GPUs visible to the caller, given back to the labeling step, because tokenization hides them
+ORIGINAL_CUDA_VISIBLE_DEVICES = os.environ.get("CUDA_VISIBLE_DEVICES")
 os.environ["CUDA_VISIBLE_DEVICES"] = ""  # Must be before any torch/CUDA imports
 
 import argparse
@@ -18,6 +23,7 @@ import json
 import multiprocessing
 import shutil
 import signal
+import subprocess
 import sys
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -30,7 +36,8 @@ from datasets import DatasetDict, concatenate_datasets, load_from_disk
 
 from .loader import _load_single_dataset, _get_preprocessed_dataset, _get_sequence_parallel_dataset
 from .parser import get_dataset_list
-from .data_utils import merge_dataset
+from .data_utils import merge_dataset, stratified_split
+from .decision_label import LABELING_KEYS, check_labeling_config, is_labeled, labels_path
 from .template import get_template_and_fix_tokenizer
 from ..model import load_tokenizer
 from ..hparams.parser import _parse_train_args
@@ -143,8 +150,12 @@ def phase1_merge_and_shard(
     aligned_dir: str,
     shard_size: int,
     seed: int,
+    stage: str = "sft",
 ) -> tuple[bool, int]:
-    """Phase 1: Merge aligned datasets and shard."""
+    """
+    Phase 1: Merge aligned datasets and shard. For decision data with val_size > 0, the validation
+    rows are split off first (stratified by task) and saved unsharded in aligned_dir/validation.
+    """
     
     print("\n" + "=" * 60)
     print("PHASE 1: Merging and sharding")
@@ -204,6 +215,15 @@ def phase1_merge_and_shard(
     if data_args.mix_strategy == "concat":
         print("Shuffling merged dataset...")
         merged = merged.shuffle(seed=seed)
+
+    num_validation = 0
+    if stage == "decision" and data_args.val_size > 1e-6:
+        merged, validation = stratified_split(merged, data_args.val_size, stratify_by="_task", seed=seed)
+        num_validation = len(validation)
+        validation.reset_format()
+        validation.save_to_disk(os.path.join(aligned_dir, "validation"))
+        print(f"Validation split: {num_validation:,} examples (stratified by task), {len(merged):,} left to train")
+        total = len(merged)
     
     # Calculate shards (ceil division)
     num_shards = (total + shard_size - 1) // shard_size
@@ -226,6 +246,7 @@ def phase1_merge_and_shard(
         "max_merged_samples": max_merged_samples,
         "mix_strategy": data_args.mix_strategy,
         "dataset_sizes": dataset_sizes,
+        "num_validation": num_validation,
     }
     with open(sharding_info_path, "w") as f:
         json.dump(info, f, indent=2)
@@ -285,6 +306,35 @@ def tokenize_shard_worker(args: tuple) -> tuple[int, bool, str]:
     
     except Exception as e:
         return (shard_index, False, str(e)[:300])
+
+
+def tokenize_validation(config_path: str, aligned_dir: str, encoded_dir: str, stage: str) -> bool:
+    """Tokenizes the validation rows saved by phase 1, as evaluation rows (no augmentation)."""
+    validation_path = os.path.join(aligned_dir, "validation")
+    output_path = os.path.join(encoded_dir, "validation")
+    if not Path(f"{validation_path}/state.json").exists() or Path(f"{output_path}/state.json").exists():
+        return True
+
+    print("Tokenizing validation split...")
+    model_args, data_args, training_args, _, _ = get_args_from_config(config_path)
+    tokenizer_module = load_tokenizer(model_args)
+    tokenizer = tokenizer_module["tokenizer"]
+    template = get_template_and_fix_tokenizer(tokenizer, data_args)
+
+    dataset = _get_preprocessed_dataset(
+        dataset=load_from_disk(validation_path),
+        data_args=data_args,
+        training_args=training_args,
+        stage=stage,
+        template=template,
+        tokenizer=tokenizer,
+        processor=tokenizer_module.get("processor"),
+        is_eval=True,
+    )
+    os.makedirs(encoded_dir, exist_ok=True)
+    dataset.save_to_disk(output_path)
+    print(f"Validation split tokenized: {len(dataset):,} examples")
+    return True
 
 
 def phase2_parallel_tokenize(
@@ -407,8 +457,15 @@ def phase3_concatenate_fast(encoded_path: str, output_path: str, num_shards: int
         train_out / "dataset_info.json"
     )
 
+    splits = ["train"]
+    validation_path = Path(encoded_path) / "validation"
+    if (validation_path / "state.json").exists():
+        print("Copying validation split...")
+        load_from_disk(str(validation_path)).save_to_disk(str(Path(output_path) / "validation"))
+        splits.append("validation")
+
     with open(Path(output_path) / "dataset_dict.json", "w") as f:
-        json.dump({"splits": ["train"]}, f)
+        json.dump({"splits": splits}, f)
 
     print(f"Done: {num_files} files hardlinked")
     return True
@@ -430,11 +487,16 @@ def run_preprocess(
         cfg = yaml.safe_load(f)
 
     stage = cfg.get("stage", "sft")
-    assert stage in ("sft", "pt"), f"Only 'sft' and 'pt' stages are supported, got '{stage}'"
+    assert stage in ("sft", "pt", "decision"), f"Only 'sft', 'pt' and 'decision' stages are supported, got '{stage}'"
     assert not cfg.get("streaming", False), "Streaming mode is not supported for sharded preprocessing"
     
     tokenized_path = cfg["tokenized_path"]
     datasets = [d.strip() for d in cfg["dataset"].split(",")]
+
+    # Labeling keys are checked now rather than after tokenization
+    labeling = stage == "decision" and any(cfg.get(key) is not None for key in LABELING_KEYS)
+    if labeling:
+        check_labeling_config(config_path)
     batch_size = cfg.get("preprocessing_batch_size", 1000)
     seed = cfg.get("seed", 42)
     
@@ -470,32 +532,75 @@ def run_preprocess(
     
     if Path(f"{tokenized_path}/dataset_dict.json").exists():
         print(f"\nAlready complete: {tokenized_path}")
-        return 0
-    
-    if not phase0_parallel_align(config_path, datasets, aligned_dir, parallel_jobs):
+    elif not _tokenize(config_path, datasets, aligned_dir, encoded_dir, tokenized_path, shard_size, parallel_jobs,
+                       seed, stage, cleanup):
         return 1
-    
+
+    return _label(config_path, tokenized_path, cfg["decision_label_folder"]) if labeling else 0
+
+
+def _tokenize(
+    config_path: str,
+    datasets: list[str],
+    aligned_dir: str,
+    encoded_dir: str,
+    tokenized_path: str,
+    shard_size: int,
+    parallel_jobs: int,
+    seed: int,
+    stage: str,
+    cleanup: bool,
+) -> bool:
+    """Tokenizes the config's datasets to tokenized_path. Returns whether it succeeded."""
+    if not phase0_parallel_align(config_path, datasets, aligned_dir, parallel_jobs):
+        return False
+
     success, num_shards = phase1_merge_and_shard(
-        config_path, datasets, aligned_dir, shard_size, seed
+        config_path, datasets, aligned_dir, shard_size, seed, stage
     )
     if not success:
-        return 1
-    
+        return False
+
     if not phase2_parallel_tokenize(config_path, aligned_dir, encoded_dir, num_shards, parallel_jobs, stage):
-        return 1
-    
+        return False
+
+    if not tokenize_validation(config_path, aligned_dir, encoded_dir, stage):
+        return False
+
     if not phase3_concatenate_fast(encoded_dir, tokenized_path, num_shards):
-        return 1
-    
+        return False
+
     if cleanup:
         print("\nCleaning up...")
         shutil.rmtree(aligned_dir, ignore_errors=True)
         shutil.rmtree(encoded_dir, ignore_errors=True)
-    
+
     print("\n" + "=" * 60)
     print(f"COMPLETE: {tokenized_path}")
     print("=" * 60)
-    return 0
+    return True
+
+
+def _label(config_path: str, tokenized_path: str, name: str) -> int:
+    """
+    Labels the tokenized data (hmf decision-label), unless the label set is complete. It runs in a new
+    process that sees the caller's GPUs, because CUDA_VISIBLE_DEVICES was emptied for tokenization, and CUDA
+    reads it only once per process.
+    """
+    if is_labeled(tokenized_path, name):
+        path = labels_path(tokenized_path, name)
+        print(f"\nAlready labeled: {path} (delete it or change decision_label_folder to relabel)")
+        return 0
+
+    print("\n" + "=" * 60)
+    print(f"LABELING: {name}")
+    print("=" * 60)
+    env = dict(os.environ)
+    if ORIGINAL_CUDA_VISIBLE_DEVICES is None:
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = ORIGINAL_CUDA_VISIBLE_DEVICES
+    return subprocess.run([sys.executable, "-m", "hmf.data.decision_label", config_path], env=env).returncode
 
 
 def main():

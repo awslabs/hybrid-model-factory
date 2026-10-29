@@ -167,6 +167,111 @@ class DataArguments:
         default=False,
         metadata={"help": "Whether or not to use a shared file system for the datasets."},
     )
+    decision_prompt_format: str = field(
+        default="strands",
+        metadata={"help": "Prompt format used to render decision rows (stage `decision`)."},
+    )
+    decision_num_augmentations: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Number of augmentations of each decision training row. An augmentation is one augmented copy of "
+                "a row, rendered with its options in one order (shuffled for noul and choice, possibly "
+                "reversed for score) and one phrasing of its question. Epoch e trains on augmentation e (modulo "
+                "the number of augmentations)."
+            )
+        },
+    )
+    decision_shuffle_options: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to shuffle the options of noul and choice training rows."},
+    )
+    decision_reverse_score_prob: float = field(
+        default=0.5,
+        metadata={"help": "Probability of reversing the rubric (and the label) of a score training row."},
+    )
+    decision_vary_instructions: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to sample among the phrasings of a decision training row's question."},
+    )
+    decision_ordinal_smoothing: float = field(
+        default=0.1,
+        metadata={"help": "Probability mass moved to the neighboring levels in the targets of score rows."},
+    )
+    decision_force_bos: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether or not to start decision prompts with the BOS token if the tokenizer does not add it."
+        },
+    )
+    decision_label_folder: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Folder of a label set of tokenized decision data, as a folder name rather than a path. The label "
+                "set is stored in <tokenized_path>/labels/<decision_label_folder>/, next to the tokens it was made "
+                "for. In a tokenization config, labeling (hmf preprocess or hmf decision-label) writes it; in a "
+                "training config with stage `decision`, training reads it and joins it to the training rows."
+            )
+        },
+    )
+    decision_anchor_model: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Causal LM whose own answers are the anchor targets (hmf decision-label), given by its probabilities "
+                "for the options' labels (1, 2, ...) after the answer marker. Must use the tokenizer the data was "
+                "tokenized with."
+            )
+        },
+    )
+    decision_teacher_model: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Model whose answers are the teacher targets (hmf decision-label), either a causal LM, which reads "
+                "each row through decision_teacher_prompt, or a decision model (an hmf_decision checkpoint), which "
+                "reads it as in training. Exclusive with decision_teacher_file."
+            )
+        },
+    )
+    decision_teacher_adapter: str | None = field(
+        default=None,
+        metadata={"help": "LoRA adapter of a decision teacher model, merged before labeling."},
+    )
+    decision_teacher_prompt: str = field(
+        default="decision",
+        metadata={
+            "help": (
+                "How a causal LM teacher model is asked each row, either `decision` (the decision prompt the student "
+                "trains on) or `strands` (Strands Decider's chat prompt, for instruction-tuned models)."
+            )
+        },
+    )
+    decision_teacher_max_len: int | None = field(
+        default=None,
+        metadata={
+            "help": "Rows whose teacher prompt is longer than this many tokens get no teacher. Defaults to no limit."
+        },
+    )
+    decision_teacher_file: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Teacher file whose probabilities are the teacher targets (hmf decision-label), in JSON Lines of "
+                '{"source": ..., "row_index": ..., "probs": [...]}, one line per row; see data/README.md.'
+            )
+        },
+    )
+    decision_teacher_datasets: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Datasets whose rows get teacher targets (hmf decision-label). Use commas to separate multiple "
+                "datasets. Defaults to all datasets."
+            )
+        },
+    )
 
     def __post_init__(self):
         def split_arg(arg):
@@ -176,6 +281,7 @@ class DataArguments:
 
         self.dataset = split_arg(self.dataset)
         self.eval_dataset = split_arg(self.eval_dataset)
+        self.decision_teacher_datasets = split_arg(self.decision_teacher_datasets)
 
         if self.media_dir is None:
             self.media_dir = self.dataset_dir
@@ -208,6 +314,15 @@ class DataArguments:
 
         if self.neat_packing:
             self.packing = True
+
+        if self.decision_num_augmentations < 1:
+            raise ValueError("`decision_num_augmentations` must be at least 1.")
+
+        if not 0.0 <= self.decision_reverse_score_prob <= 1.0:
+            raise ValueError("`decision_reverse_score_prob` must be in [0, 1].")
+
+        if not 0.0 <= self.decision_ordinal_smoothing < 1.0:
+            raise ValueError("`decision_ordinal_smoothing` must be in [0, 1).")
 
 
     def to_dict(self) -> dict[str, Any]:

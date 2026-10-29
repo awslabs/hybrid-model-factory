@@ -18,7 +18,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 from ..extras import logging
-from .data_utils import Role
+from .data_utils import DECISION_ALIGNED_FEATURES, Role
+from .decision_prompt import DECISION_KINDS
 
 
 if TYPE_CHECKING:
@@ -537,11 +538,43 @@ class NemotronDatasetConverter(DatasetConverter):
         return output
 
 
+@dataclass
+class DecisionDatasetConverter(DatasetConverter):
+    """
+    Converts decision rows loaded by load_decision_jsonl, which has already mapped the source's
+    column names and rendered structured content to text. Fills in the optional columns and checks
+    the required ones.
+    """
+
+    def __call__(self, example: dict[str, Any]) -> dict[str, Any]:
+        where = f"{example['source']} row {example['row_index']}"
+        if example["kind"] not in DECISION_KINDS:
+            raise ValueError(f"{where}: unknown kind {example['kind']!r}. Supported kinds: {DECISION_KINDS}.")
+        if example["label"] is None:
+            raise ValueError(f"{where}: missing label.")
+        if example["kind"] != "noul" and not example["options"]:
+            raise ValueError(f"{where}: a {example['kind']} row needs options.")
+
+        return {
+            "_state": example["state"],
+            "_instructions": example["instructions"],
+            "_instruction_variants": example["instruction_variants"] or [],
+            "_kind": example["kind"],
+            "_options": example["options"] or [],
+            "_label": example["label"],
+            "_task": example["task"] if example["task"] is not None else "unknown",
+            "_weight": example["weight"] if example["weight"] is not None else 1.0,
+            "_source": example["source"],
+            "_row_index": example["row_index"],
+        }
+
+
 DATASET_CONVERTERS = {
     "alpaca": AlpacaDatasetConverter,
     "sharegpt": SharegptDatasetConverter,
     "openai": OpenAIDatasetConverter,
     'nemotron': NemotronDatasetConverter,
+    "decision": DecisionDatasetConverter,
 }
 
 
@@ -586,6 +619,11 @@ def align_dataset(
             load_from_cache_file=(not data_args.overwrite_cache) or (training_args.local_process_index != 0),
             desc="Converting format of dataset",
         )
+
+    if dataset_attr.formatting == "decision":
+        # An explicit schema, so a column that is empty in every row (e.g. no row has alternative
+        # phrasings) keeps its type and the dataset can be merged with others
+        kwargs["features"] = DECISION_ALIGNED_FEATURES
 
     dataset_converter = get_dataset_converter(dataset_attr.formatting, dataset_attr, data_args)
     return dataset.map(
