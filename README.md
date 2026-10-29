@@ -17,6 +17,7 @@ Building Next Generation Hybrid models, however, spans the full AI software stac
 - **Priming**: Bootstrap training of Hybrid architectures from a pre-trained Transformer's weights to preserve most of the base Transformer's knowledge without training from scratch.
 - **Training**: Distill, fine-tune Hybrid models, and extend their context length (128K+) with built-in Sequence Parallelism.
 - **Inference**: Deploy Hybrid Primed models through an optimized vLLM plugin.
+- **Decision models**: Convert a Transformer or Hybrid model into a decision model, which chooses among a list of options with a calibrated confidence, for tasks such as routing a request, classifying text, or rating a response.
 
 ---
 
@@ -26,6 +27,7 @@ Building Next Generation Hybrid models, however, spans the full AI software stac
 - [Getting Started](#getting-started)
 - [Tested Configurations](#tested-configurations)
 - [Priming Pipeline Overview](#priming-pipeline-overview)
+- [Decision Models](#decision-models)
 - [Supported Architectures](#supported-architectures)
 - [Performance](#performance)
 - [Research](#our-research)
@@ -163,9 +165,9 @@ Each directory contains a `setup_docker.sh` to build and launch the container, a
 
 All our code (including custom kernels and vLLM implementations) has been tested on A100 and H200 GPUs, with Sequence Parallel (SP) tested up to SP group size 8 for long-context training. Refer to [Tested Configurations](#tested-configurations) for a comprehensive list of hardware requirements for different model sizes and training stages.
 
-### Decision Models
+### Training Decision Models
 
-A decision model reads a situation, a question about it, and a list of possible answers, and returns the probability of each answer. Decision models suit choices that need a fast answer with a confidence you can trust, such as routing a request, checking whether a response answers the question, or rating text on a scale, for example inside agent workflows. HMF converts a language model, Transformer or Hybrid, into a decision model by replacing its language model head with a small head that scores the options. It then trains the model with LoRA, and calibrates and evaluates it.
+[Decision models](#decision-models) use the same training environment as above. These commands convert Qwen3.5-2B-Base into a decision model and train it:
 
 ```bash
 cd training
@@ -174,7 +176,7 @@ hmf preprocess examples/decision/tokenization/qwen3_5_2b/strands_v14.yaml
 hmf train examples/decision/train/qwen3_5_2b/lora_v14.yaml
 ```
 
-[training/examples/decision/README.md](training/examples/decision/README.md) explains how to convert and train a model from the start, with example configs for Qwen3.5-2B-Base and GKA-primed-HQwen3-8B-Instruct, and how to fine-tune an existing decision model on your own data.
+[training/examples/decision/README.md](training/examples/decision/README.md) explains each step, and how to fine-tune an existing decision model on your own data.
 
 ---
 
@@ -262,6 +264,16 @@ See [training/examples/priming/stage2/](training/examples/priming/stage2/) for a
 ### Training-Free Context Length Extension
 
 Hybrid models also support training-free context extension up to 2-4× their native size via experimental Hybrid state composition (e.g. [PICASO](https://arxiv.org/abs/2502.17605)). See [docs/StateComposition.md](docs/StateComposition.md) for usage.
+
+---
+
+## Decision Models
+
+A decision model reads a situation, a question about it, and a list of possible answers, and returns the probability of each answer. It answers in a single forward pass, without generating text, and its probabilities are calibrated, so its confidence shows when to trust an answer and when to hand the question to a larger model or a person. This suits the many small decisions inside agent workflows, such as routing a request, checking whether a response answers the question, or rating text on a scale.
+
+HMF converts a language model, Transformer or Hybrid, into a decision model by replacing its language model head with a small head that scores the options. It then trains the model with LoRA, optionally learning from the base model's and a teacher model's answers, and calibrates and evaluates it. An existing decision model, including one published by [Strands Decider](https://github.com/strands-labs/strands-decider), can also be converted and fine-tuned on your own questions.
+
+[training/examples/decision/README.md](training/examples/decision/README.md) walks through both, with example configs for Qwen3.5-2B-Base and GKA-primed-HQwen3-8B-Instruct.
 
 ---
 
