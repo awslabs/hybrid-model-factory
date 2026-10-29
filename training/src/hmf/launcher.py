@@ -25,6 +25,10 @@ USAGE = (
     + "|   hybridfactory prime-init -h: convert Transformer to Hybrid       |\n"
     + "|   hybridfactory prime-unfuse -h: convert fused to standard Hybrid  |\n"
     + "|   hybridfactory reassemble-vlm -h: wire hybrid LM into VL model    |\n"
+    + "|   hybridfactory decision-init -h: convert LM to decision model     |\n"
+    + "|   hybridfactory decision-label -h: add targets to decision data    |\n"
+    + "|   hybridfactory decision-eval -h: evaluate decision models         |\n"
+    + "|   hybridfactory decision-serve -h: serve a decision model locally  |\n"
     + "|   hybridfactory train -h: train models                             |\n"
     + "|   hybridfactory train-multinode -h: multi-node distributed train   |\n"
     + "|   hybridfactory export -h: merge LoRA adapters and export model    |\n"
@@ -183,6 +187,33 @@ def launch():
 
         reassemble_vlm(args.vl_model, args.text_backbone, args.output,
                        save_max_shard_size=args.save_max_shard_size)
+
+    elif command == "decision-init":
+        from .priming.decision_init import load_config, init_decision_model
+
+        import argparse
+
+        parser = argparse.ArgumentParser(description="Convert a causal LM to a decision model.")
+        parser.add_argument("config", help="Path to the YAML config file for the conversion")
+        args = parser.parse_args()
+
+        decision_config = load_config(args.config)
+        init_decision_model(decision_config)
+
+    elif command == "decision-label":
+        from .data.decision_label import main
+
+        main()
+
+    elif command == "decision-eval":
+        from .eval.decision.cli import eval_main
+
+        eval_main()
+
+    elif command == "decision-serve":
+        from .eval.decision.cli import serve_main
+
+        serve_main()
 
     elif command == "chat":
         from .chat.chat_model import run_chat
