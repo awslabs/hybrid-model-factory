@@ -199,16 +199,20 @@ def patch_model(
     is_trainable: bool,
     add_valuehead: bool,
 ) -> None:
-    gen_config = model.generation_config  # check and fix generation config
-    if not gen_config.do_sample and (
+    # Check and fix the generation config, for models that generate (e.g. not decision models)
+    gen_config = getattr(model, "generation_config", None)
+    if gen_config is not None and not gen_config.do_sample and (
         (gen_config.temperature is not None and gen_config.temperature != 1.0)
         or (gen_config.top_p is not None and gen_config.top_p != 1.0)
         or (gen_config.typical_p is not None and gen_config.typical_p != 1.0)
     ):
         gen_config.do_sample = True
 
-    if getattr(model.config, "model_type", None) not in ["minicpmv", "minicpmo"] and "GenerationMixin" not in str(
-        model.generate.__func__
+    generate = getattr(model, "generate", None)
+    if (
+        generate is not None
+        and getattr(model.config, "model_type", None) not in ["minicpmv", "minicpmo"]
+        and "GenerationMixin" not in str(generate.__func__)
     ):
         model.generate = MethodType(GenerationMixin.generate, model)
 

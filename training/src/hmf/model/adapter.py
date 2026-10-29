@@ -127,6 +127,9 @@ def _setup_freeze_tuning(
     if not finetuning_args.freeze_multi_modal_projector and model_type in COMPOSITE_MODELS:
         trainable_layers.append(COMPOSITE_MODELS[model_type].projector_key)
 
+    if model_type == "hmf_decision":  # the pointer head always trains, whichever layers are frozen
+        trainable_layers.append("decision_head")
+
     forbidden_modules = get_forbidden_modules(model.config, finetuning_args)
     for name, param in model.named_parameters():
         if any(trainable_layer in name for trainable_layer in trainable_layers) and not any(
@@ -250,6 +253,15 @@ def _setup_lora_tuning(
             finetuning_args.additional_target = module_names
             logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
 
+        # A decision model's pointer head is small and has no LoRA: train it in full and save it with the
+        # adapter. It starts from the model's head, random for a model from hmf decision-init and trained
+        # for a merged one
+        is_decision_model = getattr(model.config, "model_type", None) == "hmf_decision"
+        if is_decision_model:
+            additional_target = set(finetuning_args.additional_target or []) | {"decision_head"}
+            finetuning_args.additional_target = sorted(additional_target)
+            logger.info_rank0("Decision model: the pointer head is trained in full and saved with the adapter.")
+
         if finetuning_args.finetuning_type == "lora":
             peft_kwargs = {
                 "r": finetuning_args.lora_rank,
@@ -297,15 +309,18 @@ def _setup_lora_tuning(
                     logger.info_rank0(f"Using PiSSA initialization with FSVD steps {finetuning_args.pissa_iter}.")
                     peft_kwargs["init_lora_weights"] = f"pissa_niter_{finetuning_args.pissa_iter}"
 
+            # A decision model takes option positions rather than labels, so it gets the generic PEFT
+            # wrapper rather than the causal LM one
+            task_type = None if is_decision_model else TaskType.CAUSAL_LM
             if finetuning_args.finetuning_type == "lora":
                 peft_config = LoraConfig(
-                    task_type=TaskType.CAUSAL_LM,
+                    task_type=task_type,
                     inference_mode=False,
                     **peft_kwargs,
                 )
             elif finetuning_args.finetuning_type == "oft":
                 peft_config = OFTConfig(
-                    task_type=TaskType.CAUSAL_LM,
+                    task_type=task_type,
                     inference_mode=False,
                     **peft_kwargs,
                 )

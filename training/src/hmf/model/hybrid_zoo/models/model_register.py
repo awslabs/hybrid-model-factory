@@ -218,6 +218,11 @@ def register_hybrid_models():
         pass
     AutoModel.register(HybridQwen2_5_VLConfig, HybridQwen2_5_VLModel)
 
+    # Decision models (any AutoModel backbone with a pointer head instead of an LM head)
+    from .decision.configuration_decision import DecisionConfig
+    from .decision.modeling_decision import DecisionModel
+    register_model_family(DecisionConfig, [DecisionModel])
+
     _models_registered = True
 
 

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Optional, TypedDict
 import torch
 from transformers import (
     AutoConfig,
+    AutoModel,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForSeq2SeqLM,
@@ -249,7 +250,9 @@ def load_model(
         if model_args.mixture_of_depths == "load":
             model = load_mod_pretrained_model(**init_kwargs)
         else:
-            if type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
+            if getattr(config, "model_type", None) == "hmf_decision":  # a decision model has no LM head
+                load_class = AutoModel
+            elif type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
                 load_class = AutoModelForImageTextToText
             elif type(config) in AutoModelForSeq2SeqLM._model_mapping.keys():  # audio-text
                 load_class = AutoModelForSeq2SeqLM

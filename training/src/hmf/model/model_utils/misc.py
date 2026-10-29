@@ -37,6 +37,9 @@ def find_all_linear_modules(model: "PreTrainedModel", freeze_vision_tower: bool)
     if model_type in COMPOSITE_MODELS:
         forbidden_modules.add(COMPOSITE_MODELS[model_type].projector_key)
 
+    if model_type == "hmf_decision":  # the pointer head is trained in full, not with LoRA
+        forbidden_modules.add("decision_head")
+
     if freeze_vision_tower and model_type in COMPOSITE_MODELS:
         forbidden_modules.update(COMPOSITE_MODELS[model_type].vision_model_keys)
 
