@@ -157,7 +157,7 @@ class DefaultToolUtils(ToolUtils):
         for tool in tools:
             tool = tool.get("function", "") if tool.get("type") == "function" else tool
             param_text = ""
-            for name, param in tool["parameters"]["properties"].items():
+            for name, param in tool.get("parameters", {}).get("properties", {}).items():
                 required, enum, items = "", "", ""
                 if name in tool["parameters"].get("required", []):
                     required = ", required"
