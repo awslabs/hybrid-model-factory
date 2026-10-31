@@ -258,6 +258,14 @@ def hybridize_model(hybrid_config: HybridConfig) -> None:
             config=config,
             hybrid_config=hybrid_config,
         )
+    elif model_type == "qwen3_5_text":
+        # Qwen3.5 (dense) is also already a hybrid model (attention + GDN)
+        from .convert_qwen3_5 import construct_hybrid_qwen3_5
+        hybrid_model = construct_hybrid_qwen3_5(
+            base_model=transformer_model,
+            config=config,
+            hybrid_config=hybrid_config,
+        )
     elif "qwen" in model_type:
         if "qwen2" in model_type:
             version = 2

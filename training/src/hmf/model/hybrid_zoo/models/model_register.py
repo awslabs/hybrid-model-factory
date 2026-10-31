@@ -33,6 +33,8 @@ try:
         "qwen3-next-hmf": "Qwen3NextHMFConfig",
         "qwen3-5-moe-hmf-text": "Qwen3_5MoeHMFTextConfig",
         "qwen3-5-moe-hmf": "Qwen3_5MoeHMFConfig",
+        "qwen3-5-hmf-text": "Qwen3_5HMFTextConfig",
+        "qwen3-5-hmf": "Qwen3_5HMFConfig",
     })
 except ImportError:
     pass  # Older transformers versions may not have this module
@@ -165,9 +167,13 @@ def register_hybrid_models():
         Qwen3_5MoeHMFForCausalLM,
         Qwen3_5MoeHMFForConditionalGeneration,
         Qwen3_5MoeHMFModel,
+        Qwen3_5MoeHMFTextModel,
     )
     AutoConfig.register(Qwen3_5MoeHMFTextConfig.model_type, Qwen3_5MoeHMFTextConfig)
     AutoModelForCausalLM.register(Qwen3_5MoeHMFTextConfig, Qwen3_5MoeHMFForCausalLM)
+    # The text backbone alone, which a decision model rebuilds from its text_config. Registered in the
+    # mapping directly, as the text model inherits config_class (the composite config) from its base class
+    AutoModel._model_mapping.register(Qwen3_5MoeHMFTextConfig, Qwen3_5MoeHMFTextModel, exist_ok=True)
     # Qwen3.5-MoE (HMF) composite (ForConditionalGeneration uses full Config)
     register_model_family(
         Qwen3_5MoeHMFConfig,
@@ -177,6 +183,31 @@ def register_hybrid_models():
     # (bypasses config_class annotation check that auto_class.register() enforces)
     AutoModelForCausalLM._model_mapping.register(
         Qwen3_5MoeHMFConfig, Qwen3_5MoeHMFForCausalLM, exist_ok=True
+    )
+
+    # Qwen3.5 Dense (HMF) — text-only (ForCausalLM uses TextConfig)
+    from .qwen3_5_hmf.configuration_qwen3_5_hmf import (
+        Qwen3_5HMFConfig,
+        Qwen3_5HMFTextConfig,
+    )
+    from .qwen3_5_hmf.modeling_qwen3_5_hmf import (
+        Qwen3_5HMFForCausalLM,
+        Qwen3_5HMFForConditionalGeneration,
+        Qwen3_5HMFModel,
+        Qwen3_5HMFTextModel,
+    )
+    AutoConfig.register(Qwen3_5HMFTextConfig.model_type, Qwen3_5HMFTextConfig)
+    AutoModelForCausalLM.register(Qwen3_5HMFTextConfig, Qwen3_5HMFForCausalLM)
+    # The text backbone alone, which a decision model rebuilds from its text_config. Registered in the
+    # mapping directly, as the text model inherits config_class (the composite config) from its base class
+    AutoModel._model_mapping.register(Qwen3_5HMFTextConfig, Qwen3_5HMFTextModel, exist_ok=True)
+    # Qwen3.5 Dense (HMF) composite (ForConditionalGeneration uses full Config)
+    register_model_family(
+        Qwen3_5HMFConfig,
+        [Qwen3_5HMFForConditionalGeneration, Qwen3_5HMFModel],
+    )
+    AutoModelForCausalLM._model_mapping.register(
+        Qwen3_5HMFConfig, Qwen3_5HMFForCausalLM, exist_ok=True
     )
 
     # Qwen3-Next (HMF)

@@ -3,10 +3,10 @@ Shared Qwen GDN Model to HMF Conversion Module
 
 This module provides model-agnostic functionality for converting HuggingFace Qwen
 models that use the Gated DeltaNet (GDN) + gated attention architecture to Hybrid
-Model Factory (HMF) model variants. Currently supports Qwen3-Next and Qwen3.5-MoE.
+Model Factory (HMF) model variants. Currently supports Qwen3-Next, Qwen3.5, and Qwen3.5-MoE.
 
 Each source model has its own weight layout in the GDN layers (e.g., fused interleaved
-projections in Qwen3-Next vs separate projections in Qwen3.5-MoE), so weight extraction
+projections in Qwen3-Next vs separate projections in Qwen3.5 and Qwen3.5-MoE), so weight extraction
 is handled by model-specific functions. This module provides the shared logic that
 operates on the extracted weights.
 

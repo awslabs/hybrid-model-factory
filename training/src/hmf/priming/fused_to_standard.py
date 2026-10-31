@@ -32,6 +32,9 @@ from hmf.model.hybrid_zoo.models.qwen3_next_hmf.modeling_qwen3_next_hmf import (
 from hmf.model.hybrid_zoo.models.qwen3_5_moe_hmf.modeling_qwen3_5_moe_hmf import (
     Qwen3_5MoeHMFForCausalLM,
 )
+from hmf.model.hybrid_zoo.models.qwen3_5_hmf.modeling_qwen3_5_hmf import (
+    Qwen3_5HMFForCausalLM,
+)
 from hmf.model.hybrid_zoo.models.utils import LAYER_TYPE_PATTERNS
 
 
@@ -97,6 +100,8 @@ def get_model_type(model: nn.Module) -> type:
         return HybridQwen2ForCausalLM
     elif "qwen3_5_moe" in model_type:
         return Qwen3_5MoeHMFForCausalLM
+    elif "qwen3_5" in model_type:
+        return Qwen3_5HMFForCausalLM
     elif "qwen3_moe" in model_type:
         return HybridQwen3MoeForCausalLM
     elif "qwen3_next" in model_type:
