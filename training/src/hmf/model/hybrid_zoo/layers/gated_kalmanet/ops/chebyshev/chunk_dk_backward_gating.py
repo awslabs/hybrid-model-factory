@@ -182,6 +182,7 @@ def chunk_bwd_dk_gating_kernel_forloop(
     # outputs:
     dk2_ptr,
     dgkk2_ptr,
+    h_kk_suffix_sum_final_ptr,
     # constants:
     T,
     H: tl.constexpr,
@@ -193,6 +194,10 @@ def chunk_bwd_dk_gating_kernel_forloop(
 
     Second pass of two-pass backward: processes chunks sequentially in reverse order,
     accumulating h_kk_suffix_sum to compute gradients from later timesteps.
+
+    After the first chunk, h_kk_suffix_sum is twice the gradient through the adaptive ridge
+    (λ_t = ridge_ratio * ||H_t||_F) with respect to the initial state, in the pre-negated
+    convention of chunk_bwd_dh. It is stored to h_kk_suffix_sum_final ([B, H, D, D]).
 
     Grid: (B, H) - one thread block per batch-head pair (sequential over chunks)
     Block size: Processes [chunk_size, D] vectors per block
@@ -283,6 +288,12 @@ def chunk_bwd_dk_gating_kernel_forloop(
         )
         tl.store(p_dgkk2, dgkk2.to(p_dgkk2.dtype.element_ty), boundary_check=(0,))
 
+    p_s_final = tl.make_block_ptr(
+        h_kk_suffix_sum_final_ptr + (b_id * H + h_id).to(tl.int64) * D * D,
+        (D, D), (D, 1), (0, 0), (D, D), (1, 0),
+    )
+    tl.store(p_s_final, h_kk_suffix_sum.to(p_s_final.dtype.element_ty), boundary_check=(0, 1))
+
 
 def chunk_bwd_dk_gating(
     h_kk: Tensor,
@@ -294,7 +305,8 @@ def chunk_bwd_dk_gating(
     gkk: Tensor,
     chunk_size: int = 64,
     ridge_ratio: float = 0.02,
-) -> Tuple[Tensor, Tensor]:
+    return_dh0_ridge: bool = False,
+):
     """
     Computes key and gating gradients with adaptive ridge strength.
 
@@ -312,10 +324,15 @@ def chunk_bwd_dk_gating(
         gkk: Cumulative gating values with shape [B, L, H]
         chunk_size: Chunk size for parallel processing. Defaults to 64
         ridge_ratio: Base regularization parameter. Defaults to 0.02
+        return_dh0_ridge: Also return dh0_ridge. Defaults to False
 
     Returns:
         dk: Key gradient with shape [B, L, H, D]
         dgkk: Gating gradient with shape [B, L, H]
+        dh0_ridge (only if return_dh0_ridge): The gradient through the adaptive ridge with
+            respect to the initial state (h_kk[:, 0]), in chunk_bwd_dh's pre-negated convention,
+            with shape [B, H, D, D] in fp32. chunk_bwd_dh's dh0 covers the solve alone, so with
+            an initial state (sequence parallelism) this must be added to it.
     """
 
     B, T, H, D = k.shape
@@ -351,6 +368,7 @@ def chunk_bwd_dk_gating(
 
     dk2 = torch.empty_like(k)
     dgkk2 = torch.empty_like(dgkk)
+    h_kk_suffix_sum_final = torch.empty(B, H, D, D, dtype=torch.float32, device=k.device)
     chunk_bwd_dk_gating_kernel_forloop[(B, H)](
         # inputs:
         h_kk,
@@ -360,6 +378,7 @@ def chunk_bwd_dk_gating(
         # inputs & outputs:
         dk2,
         dgkk2,
+        h_kk_suffix_sum_final,
         # constants:
         T,
         H,
@@ -370,4 +389,7 @@ def chunk_bwd_dk_gating(
     dgkk.add_(dgkk2)
     dgkk = chunk_local_cumsum(-dgkk, chunk_size=chunk_size, reverse=True)
 
+    if return_dh0_ridge:
+        # The suffix sum is built with w = 2 r (dq·x) / ||H||, i.e. twice the gradient
+        return dk, dgkk, 0.5 * h_kk_suffix_sum_final
     return dk, dgkk

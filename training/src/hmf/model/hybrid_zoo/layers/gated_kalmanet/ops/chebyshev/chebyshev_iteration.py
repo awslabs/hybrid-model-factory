@@ -650,6 +650,11 @@ class ChebyshevIteration(torch.autograd.Function):
             scale=1,
         )
 
+        # With an initial state (sequence parallelism), λ_t = r * ||H_t||_F also depends on h0.
+        # chunk_bwd_dh's dh0 covers the solve alone; the dk kernels return the rest.
+        need_dh0_ridge = bp_lambda and h0 is not None
+        dh0_ridge = None
+
         if gkk is None:
             if bp_lambda:
                 dk = chunk_bwd_dk(
@@ -662,14 +667,17 @@ class ChebyshevIteration(torch.autograd.Function):
                     h_kk_final,
                     chunk_size=chunk_size,
                     ridge_ratio=ridge_ratio,
+                    return_dh0_ridge=need_dh0_ridge,
                 )
+                if need_dh0_ridge:
+                    dk, dh0_ridge = dk
             else:
                 dk = chunk_dh_kk_to_dk(k, x_out, d_kk, dq, ctx.chunk_size)
 
             dgk = None
         else:  # use gating
             if bp_lambda:
-                dk, dgk = chunk_bwd_dk_gating(
+                out = chunk_bwd_dk_gating(
                     h_kk,
                     d_kk,
                     k,
@@ -679,10 +687,18 @@ class ChebyshevIteration(torch.autograd.Function):
                     gkk,
                     chunk_size=chunk_size,
                     ridge_ratio=ridge_ratio,
+                    return_dh0_ridge=need_dh0_ridge,
                 )
+                if need_dh0_ridge:
+                    dk, dgk, dh0_ridge = out
+                else:
+                    dk, dgk = out
             else:
                 dk, dgk = chunk_dh_kk_to_dk_gating(
                     k, x_out, h_kk, d_kk, dq, gkk, ctx.chunk_size
                 )
+
+        if dh0_ridge is not None:
+            dh0 = (dh0.float() + dh0_ridge).to(dh0.dtype)
 
         return dk, dq, dgk, None, None, None, dh0, None

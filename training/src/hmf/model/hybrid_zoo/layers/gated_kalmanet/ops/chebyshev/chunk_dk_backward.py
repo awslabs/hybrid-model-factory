@@ -150,6 +150,7 @@ def chunk_bwd_dk_kernel_forloop(
     dk_ptr,
     # outputs:
     dk_final_ptr,
+    h_kk_suffix_sum_final_ptr,
     # constants:
     T,
     H: tl.constexpr,
@@ -158,6 +159,10 @@ def chunk_bwd_dk_kernel_forloop(
 ):
     """
     Accumulates suffix sums and computes final key gradients.
+
+    After the first chunk, h_kk_suffix_sum is the gradient through the adaptive ridge
+    (λ_t = ridge_ratio * ||H_t||_F) with respect to the initial state, in the pre-negated
+    convention of chunk_bwd_dh. It is stored to h_kk_suffix_sum_final ([B, H, D, D]).
 
     Second pass of two-pass backward: processes chunks sequentially in reverse order,
     accumulating h_kk_suffix_sum to compute final gradients from later timesteps.
@@ -226,6 +231,12 @@ def chunk_bwd_dk_kernel_forloop(
         )
 
         tl.store(p_dk_final, dk.to(p_dk_final.dtype.element_ty), boundary_check=(0, 1))
+
+    p_s_final = tl.make_block_ptr(
+        h_kk_suffix_sum_final_ptr + (b_id * H + h_id).to(tl.int64) * D * D,
+        (D, D), (D, 1), (0, 0), (D, D), (1, 0),
+    )
+    tl.store(p_s_final, h_kk_suffix_sum.to(p_s_final.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.autotune(
@@ -379,8 +390,19 @@ def chunk_bwd_dk(
     h_kk_final=None,
     chunk_size: int = 64,
     ridge_ratio: float = 0.02,
-) -> Tensor:
+    return_dh0_ridge: bool = False,
+):
+    """
+    Computes key gradients with adaptive ridge strength (λ = ridge_ratio * ||H_t||_F).
+
+    With return_dh0_ridge (two-pass path only, h_kk_final=None), also returns the gradient
+    through the adaptive ridge with respect to the initial state (h_kk[:, 0]), in
+    chunk_bwd_dh's pre-negated convention, with shape [B, H, D, D] in fp32. chunk_bwd_dh's
+    dh0 covers the solve alone, so with an initial state (sequence parallelism) this must be
+    added to it.
+    """
     B, T, H, D = k.shape
+    assert not (return_dh0_ridge and h_kk_final is not None), "return_dh0_ridge needs the two-pass path"
 
     num_chunks = triton.cdiv(T, chunk_size)
 
@@ -409,6 +431,7 @@ def chunk_bwd_dk(
         )
 
         dk_final = torch.empty_like(k)
+        h_kk_suffix_sum_final = torch.empty(B, H, D, D, dtype=torch.float32, device=k.device)
         chunk_bwd_dk_kernel_forloop[(B, H)](
             # inputs:
             h_kk_suffix_sum_partial,
@@ -416,12 +439,15 @@ def chunk_bwd_dk(
             dk,
             # output:
             dk_final,
+            h_kk_suffix_sum_final,
             # constants:
             T,
             H,
             D,
             chunk_size,
         )
+        if return_dh0_ridge:
+            return dk_final, h_kk_suffix_sum_final
         return dk_final
     else:
         grid = (B, H)
