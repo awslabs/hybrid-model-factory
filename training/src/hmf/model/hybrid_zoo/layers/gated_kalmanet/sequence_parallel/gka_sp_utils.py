@@ -160,7 +160,6 @@ class State_Passing_GKA_P2P(torch.autograd.Function):
                 prev_kk_chunks.append(prev_kk)
                 prev_h_kv_chunks.append(prev_h_kv)
 
-            dist.barrier(group=cp_group)
 
             # Send UPDATED state to next rank
             if cp_rank < cp_size - 1 and rank == cp_rank:
@@ -181,7 +180,6 @@ class State_Passing_GKA_P2P(torch.autograd.Function):
             prev_kk_chunks.append(prev_kk)
             prev_h_kv_chunks.append(prev_h_kv)
 
-        dist.barrier(group=cp_group)
 
         # Backward pass for second half of chunks (3 → 2 → 1 → 0)
         for rank in range(cp_size - 1, -1, -1):
@@ -204,7 +202,6 @@ class State_Passing_GKA_P2P(torch.autograd.Function):
                     prev_kk_chunks.append(prev_kk_)
                     prev_h_kv_chunks.append(prev_h_kv_)
 
-            dist.barrier(group=cp_group)
 
             # Send UPDATED state to previous rank
             if cp_rank > 0 and cp_rank == rank:
@@ -282,7 +279,6 @@ class State_Passing_GKA_P2P(torch.autograd.Function):
                 grad_g_cumsum_last_chunks.append(grad_g_cumsum_last_val)
                 grad_gkk_final_chunks.append(grad_curr_gkk)
 
-            dist.barrier(group=cp_group)
 
             # Send accumulated gradients to next rank
             # CRITICAL: grad_prev_kk has TWO contributions:
@@ -317,7 +313,6 @@ class State_Passing_GKA_P2P(torch.autograd.Function):
             grad_g_cumsum_last_chunks.append(grad_g_cumsum_last_val)
             grad_gkk_final_chunks.append(grad_curr_gkk)
 
-        dist.barrier(group=cp_group)
 
         # Reverse pass for second half chunks (3 → 2 → 1 → 0)
         for rank in range(cp_size - 1, -1, -1):
@@ -347,7 +342,6 @@ class State_Passing_GKA_P2P(torch.autograd.Function):
                     grad_g_cumsum_last_chunks.append(grad_g_cumsum_last_val)
                     grad_gkk_final_chunks.append(grad_curr_gkk)
 
-            dist.barrier(group=cp_group)
 
             if cp_rank > 0 and cp_rank == rank:
                 send_grad_kk = grad_prev_kk[0:bs//2] + grad_prev_kk_val
