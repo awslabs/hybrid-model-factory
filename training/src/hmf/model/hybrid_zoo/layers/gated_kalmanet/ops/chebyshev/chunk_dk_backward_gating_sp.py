@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from fla.ops.common.chunk_h import chunk_fwd_h
+from ....fla_compat import chunk_fwd_h
 from fla.ops.utils import chunk_local_cumsum, chunk_global_cumsum
 from fla.ops.utils.op import exp
 

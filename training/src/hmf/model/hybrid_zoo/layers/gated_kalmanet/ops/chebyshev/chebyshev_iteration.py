@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 
-from fla.ops.common.chunk_h import chunk_bwd_dh, chunk_fwd_h
+from ....fla_compat import chunk_bwd_dh, chunk_fwd_h
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.op import exp
 
