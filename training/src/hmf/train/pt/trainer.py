@@ -35,6 +35,7 @@ from ..trainer_utils import (
     create_custom_optimizer,
     create_custom_scheduler,
 )
+from ...extras import logging
 
 
 if TYPE_CHECKING:
@@ -42,6 +43,8 @@ if TYPE_CHECKING:
 
     from ...hparams import FinetuningArguments, ModelArguments, TrainingArguments
 
+
+logger = logging.get_logger(__name__)
 
 class CustomTrainer(SaveShardMixin, Trainer):
     r"""Inherit Trainer for custom optimizer."""
@@ -193,3 +196,38 @@ class CustomTrainer(SaveShardMixin, Trainer):
             return loss / self.args.gradient_accumulation_steps
 
         return loss
+
+    @override
+    def _save(self, output_dir: Optional[str] = None, state_dict=None) -> None:
+        """Save model checkpoint, performing a full HuggingFace-style save only on the final step.
+
+        When async checkpointing is enabled, intermediate checkpoint saves are handled by
+        DeepSpeed's AsyncTorchCheckpointEngine (writing sharded state dicts to disk in the
+        background). The full HF-format export (config.json, tokenizer, safetensors) is
+        only performed on the final training step to avoid redundant serialization overhead.
+
+        When async checkpointing is not enabled, every save produces a full HF-format
+        checkpoint (the default Trainer behavior).
+
+        Args:
+            output_dir: Directory path where the model artifacts will be written.
+                Falls back to ``self.args.output_dir`` when not provided.
+            state_dict: Optional pre-computed state dictionary to save. If ``None``,
+                the default HF saving logic will gather the state from the model.
+        """
+        # Check if async checkpointing is enabled in the DeepSpeed ZeRO config
+        async_enabled = getattr(self, "deepspeed", None) is not None and \
+            self.deepspeed.config.get("zero_optimization", {}).get("async_ckpt", False)
+
+        if async_enabled:
+            # Only produce an HF-format checkpoint on the final step;
+            # intermediate saves are handled by DeepSpeed's checkpoint engine
+            is_final_step = self.state.global_step >= self.state.max_steps
+            if is_final_step:
+                logger.info_rank0(f"\n[Final Save] Step {self.state.global_step} reached. Saving full HuggingFace-style model...")
+                super()._save(output_dir, state_dict)
+            else:
+                logger.info_rank0("Skipping HF style saving ...")
+        else:
+            # Default behavior: full HF save at every checkpoint
+            super()._save(output_dir, state_dict)
