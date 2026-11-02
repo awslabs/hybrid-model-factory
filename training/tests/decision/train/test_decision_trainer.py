@@ -306,6 +306,7 @@ def test_expected_calibration_error():
 def _workflow_args(**overrides):
     model_args = SimpleNamespace(
         sequence_parallel_size=overrides.pop("sequence_parallel_size", 1),
+        sequence_parallel_mode=overrides.pop("sequence_parallel_mode", "zigzag-ring"),
         disable_gradient_checkpointing=overrides.pop("disable_gradient_checkpointing", False),
     )
     data_args = SimpleNamespace(
@@ -327,12 +328,13 @@ def test_check_arguments_accepts_defaults():
     workflow._check_arguments(*_workflow_args(finetuning_type="full", hybrid_learnable_params="decision_head"))
     workflow._check_arguments(*_workflow_args(decision_label_folder="labels_a", decision_teacher_kl_weight=1.0))
     workflow._check_arguments(*_workflow_args(decision_checkpoint_min_tokens=4096))  # with checkpointing on
+    workflow._check_arguments(*_workflow_args(sequence_parallel_size=2))  # zigzag-ring
 
 
 @pytest.mark.parametrize(
     "overrides, message",
     [
-        ({"sequence_parallel_size": 2}, "Sequence parallelism"),
+        ({"sequence_parallel_size": 2, "sequence_parallel_mode": "ulysses"}, "zigzag-ring only"),
         ({"packing": True}, "Packing"),
         ({"do_predict": True}, "Prediction"),
         ({"hybrid_learnable_params": "decision_head"}, "cannot be combined with LoRA"),
@@ -367,19 +369,23 @@ def test_check_label_set(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "max_steps, epochs, warns",
-    [(0, 2.0, False), (0, 3.0, True), (5, 1.0, False), (6, 1.0, True)],
+    "max_steps, epochs, warns, world_size, sp_size",
+    [
+        (0, 2.0, False, 1, 1), (0, 3.0, True, 1, 1), (5, 1.0, False, 1, 1), (6, 1.0, True, 1, 1),
+        # The 2 ranks of a sequence parallel group share their rows, so the global batch is still 8
+        (5, 1.0, False, 2, 2), (6, 1.0, True, 2, 2),
+    ],
 )
-def test_warns_if_augmentations_reused(monkeypatch, max_steps, epochs, warns):
+def test_warns_if_augmentations_reused(monkeypatch, max_steps, epochs, warns, world_size, sp_size):
     warnings = []
     monkeypatch.setattr(workflow.logger, "warning_rank0", warnings.append)
     trainer = SimpleNamespace(train_dataset={"augmentation": [0, 1] * 20})  # 20 rows, 2 augmentations
     training_args = SimpleNamespace(
-        per_device_train_batch_size=4, gradient_accumulation_steps=2, world_size=1,  # global batch of 8
+        per_device_train_batch_size=4, gradient_accumulation_steps=2, world_size=world_size,  # global batch of 8
         max_steps=max_steps, num_train_epochs=epochs,
     )
 
-    workflow._warn_if_augmentations_reused(trainer, training_args)
+    workflow._warn_if_augmentations_reused(trainer, training_args, sp_size)
 
     # 5 steps of 8 rows = 40 rows = 2 passes over 20 rows; 6 steps = 2.4 passes
     assert bool(warnings) == warns

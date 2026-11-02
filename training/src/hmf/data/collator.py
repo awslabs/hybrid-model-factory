@@ -365,6 +365,11 @@ class KTODataCollatorWithPadding(MultiModalDataCollatorForSeq2Seq):
         return batch
 
 
+# With sequence parallelism, each decision evaluation row is repeated once per rank of the sequence
+# parallel group (see DecisionTrainer), and this column marks the one copy of each row that the metrics count
+SP_COUNTED_COLUMN = "sp_counted"
+
+
 @dataclass
 class DecisionDataCollator:
     r"""
@@ -429,4 +434,10 @@ class DecisionDataCollator:
                     probs[i, : len(feature[probs_key])] = torch.tensor(feature[probs_key], dtype=torch.float32)
             batch[probs_key] = probs
             batch[has_key] = torch.tensor([bool(feature[has_key]) for feature in features], dtype=torch.bool)
+
+        # With sequence parallelism, which evaluation rows the metrics count (see DecisionTrainer)
+        if SP_COUNTED_COLUMN in features[0]:
+            batch[SP_COUNTED_COLUMN] = torch.tensor(
+                [bool(feature[SP_COUNTED_COLUMN]) for feature in features], dtype=torch.bool
+            )
         return batch

@@ -485,7 +485,9 @@ def get_dataset(
                 train_dict["train"], data_args, training_args, stage, template, tokenizer, processor, is_eval=False
             )
 
-            if model_args.sequence_parallel_size > 1:
+            # Decision models split each batch across the sequence parallel ranks themselves (see
+            # DecisionModel), so their data is not split here
+            if model_args.sequence_parallel_size > 1 and stage != "decision":
                 train_dict["train"] = _get_sequence_parallel_dataset(
                     train_dict["train"], data_args, model_args, training_args, tokenizer, is_eval=False
                 )

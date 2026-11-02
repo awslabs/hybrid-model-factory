@@ -11,6 +11,12 @@ Training rows are tokenized decision_num_augmentations times; an augmentation of
 augmented copy of it, with its options in one order and one phrasing of its question.
 DecisionAugmentationSampler trains epoch e on augmentation e (modulo the number of augmentations),
 so every epoch shows every row once, with fresh option orders.
+
+With sequence parallelism, all ranks in a sequence parallel group must get the same batch (see
+DecisionModel). Hugging Face Accelerate, which the Trainer uses to split the data across GPUs,
+hands out consecutive batches to consecutive ranks, and the ranks of a group are consecutive, so
+each batch is repeated once per rank of the group (see repeat_batches). In evaluation, the
+metrics count only one copy of each row.
 """
 
 import random
@@ -18,11 +24,13 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import pyarrow.compute as pc
 import torch
-from torch.utils.data import Sampler
+from torch.utils.data import DataLoader, Sampler, SequentialSampler
 from transformers import Trainer
 from typing_extensions import override
 
+from ...data.collator import SP_COUNTED_COLUMN
 from ...extras import logging
+from ...model.hybrid_zoo.models.decision.modeling_decision import uses_padding_mask
 from ..trainer_utils import SaveShardMixin
 
 
@@ -37,6 +45,143 @@ logger = logging.get_logger(__name__)
 
 # Inputs of DecisionModel.forward; the other collated columns are targets
 MODEL_INPUTS = ("input_ids", "attention_mask", "opt_idx", "answer_idx")
+
+# The attention implementation that sequence parallelism registers, which runs ring attention
+# (see model/model_utils/sequence_parallel.py)
+SP_ATTENTION = "sequence_parallel_attention"
+
+
+def unwrap_decision_model(model: torch.nn.Module) -> torch.nn.Module:
+    """The DecisionModel inside model, without the DDP or DeepSpeed wrapper and without LoRA's."""
+    while hasattr(model, "module"):  # DDP, DeepSpeed
+        model = model.module
+    if hasattr(model, "get_base_model"):  # PEFT
+        model = model.get_base_model()
+    return model
+
+
+# A layer that does not support sequence parallelism, given as its index, its class name, and the reason
+BackboneProblem = Tuple[Optional[int], str, str]
+
+
+def sequence_parallel_backbone_problems(model: torch.nn.Module, inputs: Dict[str, Any]) -> List[BackboneProblem]:
+    """
+    Checks that every layer of the decision model's backbone supports sequence parallelism, that is,
+    mixes tokens across the whole sequence rather than only within its rank's part. A layer that does
+    not, e.g., a Hugging Face Gated DeltaNet or Mamba layer, would silently compute the wrong result.
+
+    HMF's models support it throughout, so they pass without further checks. For other models, one
+    forward pass on inputs records which modules call ring attention, and every layer must have called
+    it without a sliding window, because ring attention ignores the window and attends to the whole
+    prompt. This concerns Hugging Face's attention layers only, as HMF's own sliding-window layers
+    (SWA) have their own sequence parallel version. The check shows that each layer has a sequence
+    mixer that supports sequence parallelism, but not that it has no other one: a layer that ran,
+    say, a Mamba mixer alongside its attention would still pass.
+
+    Every rank of the sequence parallel group must call this at the same time, as the forward pass
+    communicates between them.
+
+    Args:
+        model: The decision model, possibly wrapped (DDP, DeepSpeed, PEFT), with sequence parallelism set up.
+        inputs: A collated batch on the model's device, padded for sequence parallelism.
+
+    Returns:
+        One (layer index, layer class, reason) per unsupported layer, or an empty list if the backbone
+        supports sequence parallelism.
+    """
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterface
+
+    backbone = unwrap_decision_model(model).model
+    # HMF's models are exactly the backbones that skip the padding mask (see uses_padding_mask)
+    is_hmf_backbone = not uses_padding_mask(backbone)
+    if is_hmf_backbone:
+        return []
+    layers = getattr(backbone, "layers", None)
+    if layers is None:
+        return [(None, type(backbone).__name__, "has no `layers` to check")]
+
+    # Record which modules call ring attention, and whether each of them used a sliding window. The
+    # attention modules look the function up by name at every call, so replacing it for the one
+    # forward pass is enough.
+    calls: Dict[torch.nn.Module, bool] = {}
+    ring_attention = ALL_ATTENTION_FUNCTIONS[SP_ATTENTION]
+
+    def recording(module, *args, **kwargs):
+        window = kwargs.get("sliding_window")
+        calls[module] = calls.get(module, False) or (window is not None and window > 0)
+        return ring_attention(module, *args, **kwargs)
+
+    was_training = model.training
+    AttentionInterface.register(SP_ATTENTION, recording)
+    try:
+        model.eval()
+        with torch.no_grad():
+            model(**{name: inputs[name] for name in MODEL_INPUTS})
+    finally:
+        AttentionInterface.register(SP_ATTENTION, ring_attention)
+        model.train(was_training)
+
+    problems = []
+    for index, layer in enumerate(layers):
+        callers = [module for module in layer.modules() if module in calls]
+        if not callers:
+            problems.append((index, sequence_mixer_name(layer), "no sequence parallelism"))
+        elif any(calls[module] for module in callers):
+            names = sorted({type(module).__name__ for module in callers if calls[module]})
+            problems.append((index, "/".join(names), "sliding-window attention"))
+    return problems
+
+
+def sequence_mixer_name(layer: torch.nn.Module) -> str:
+    """
+    The class name of a decoder layer's sequence mixer, for error messages. The sequence mixer is any
+    direct submodule other than norms, MLPs, and MoE blocks, and the layer's own class name is used if
+    there is none. Classes from the transformers library are named as such, e.g., "transformers'
+    Qwen3_5GatedDeltaNet".
+    """
+
+    def name(module: torch.nn.Module) -> str:
+        from_transformers = type(module).__module__.startswith("transformers.")
+        return f"transformers' {type(module).__name__}" if from_transformers else type(module).__name__
+
+    names = [
+        name(child)
+        for child in layer.children()
+        if not any(part in type(child).__name__.lower() for part in ("norm", "mlp", "moe"))
+    ]
+    return "/".join(names) if names else name(layer)
+
+
+def describe_backbone_problems(problems: List[BackboneProblem]) -> List[str]:
+    """
+    One sentence per kind of problem, listing its layers, e.g.,
+    "layers 0, 1, 2 use transformers' Qwen3_5GatedDeltaNet, which has no sequence parallel version".
+    """
+    # The sentence for each reason, for one layer and for several
+    sentences = {
+        "no sequence parallelism": (
+            "{layers} uses {cls}, which has no sequence parallel version",
+            "{layers} use {cls}, which has no sequence parallel version",
+        ),
+        "sliding-window attention": (
+            "{layers} ({cls}) uses sliding-window attention, which ring attention does not support",
+            "{layers} ({cls}) use sliding-window attention, which ring attention does not support",
+        ),
+    }
+    layers: Dict[Tuple[str, str], List[int]] = {}
+    lines = []
+    for index, layer_class, reason in problems:
+        if index is None:
+            lines.append(f"{layer_class} {reason}")
+        else:
+            layers.setdefault((layer_class, reason), []).append(index)
+    for (layer_class, reason), indices in layers.items():
+        one, several = sentences.get(reason, ("{layers} ({cls}) " + reason,) * 2)
+        if len(indices) == 1:
+            lines.append(one.format(layers=f"layer {indices[0]}", cls=layer_class))
+        else:
+            lines.append(several.format(layers=f"layers {', '.join(map(str, indices))}", cls=layer_class))
+    return lines
 
 
 def param_shape(param: torch.nn.Parameter) -> Tuple[int, ...]:
@@ -142,6 +287,55 @@ def decision_loss(
     return loss, parts
 
 
+def repeat_batches(order: List[int], batch_size: int, repeat: int) -> Tuple[List[int], List[bool]]:
+    """
+    Repeats each batch of rows once per rank of a sequence parallel group, so that the ranks of the
+    group get the same batch (see the module docstring). For example, with batch_size 2 and
+    repeat 2, the rows [0, 1, 2, 3] become [0, 1, 0, 1, 2, 3, 2, 3].
+
+    A short last batch is first filled up with rows from the start. Otherwise, as the data loader cuts
+    the rows into batches of batch_size, the copies of a short batch would end up together in one
+    batch, rather than in consecutive batches for consecutive ranks.
+
+    Args:
+        order: The rows, in order.
+        batch_size: The per-device batch size.
+        repeat: The number of times each batch is served. 1 returns order unchanged.
+
+    Returns:
+        The rows and, for each of them, whether it is the first copy of a row of order (False for
+        the other copies and for the rows that complete the last batch).
+    """
+    if repeat == 1 or not order:
+        return order, [True] * len(order)
+    num_fill = -len(order) % batch_size
+    rows = order + [order[i % len(order)] for i in range(num_fill)]
+    counted = [True] * len(order) + [False] * num_fill
+    indices, first = [], []
+    for start in range(0, len(rows), batch_size):
+        for copy in range(repeat):
+            indices += rows[start : start + batch_size]
+            first += [copy == 0 and c for c in counted[start : start + batch_size]]
+    return indices, first
+
+
+def sequence_parallel_eval_dataset(dataset: "Dataset", batch_size: int, sp_size: int) -> "Dataset":
+    """
+    The evaluation dataset with each batch repeated once per rank of the sequence parallel group
+    (see repeat_batches), so that every rank of a group evaluates the same rows. The repeats are
+    built into the dataset itself, rather than into a sampler, because Accelerate uses the dataset's
+    length to drop the padding it adds to the last batches. The SP_COUNTED_COLUMN column marks the
+    one copy of each row that the metrics count.
+
+    Args:
+        dataset: The evaluation dataset.
+        batch_size: The per-device evaluation batch size.
+        sp_size: The size of the sequence parallel group.
+    """
+    indices, counted = repeat_batches(list(range(len(dataset))), batch_size, sp_size)
+    return dataset.select(indices).add_column(SP_COUNTED_COLUMN, counted)
+
+
 class DecisionAugmentationSampler(Sampler[int]):
     """
     Samples the rows of one augmentation per epoch, augmentation epoch % num_augmentations, shuffled
@@ -168,6 +362,8 @@ class DecisionAugmentationSampler(Sampler[int]):
         sort_window: The number of batches whose rows are sorted by length together, when grouping
             by length. Defaults to 50.
         shuffle: Whether to shuffle the rows of each augmentation. Defaults to True.
+        repeat: The number of times each batch is served, which is the sequence parallel size (see
+            repeat_batches). Defaults to 1.
     """
 
     def __init__(
@@ -178,6 +374,7 @@ class DecisionAugmentationSampler(Sampler[int]):
         lengths: Optional[List[int]] = None,
         sort_window: int = 50,
         shuffle: bool = True,
+        repeat: int = 1,
     ):
         self.rows: Dict[int, List[int]] = {}
         for index, augmentation in enumerate(augmentations):
@@ -191,6 +388,7 @@ class DecisionAugmentationSampler(Sampler[int]):
         self.lengths = lengths
         self.sort_window = sort_window
         self.shuffle = shuffle
+        self.repeat = repeat
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -224,10 +422,13 @@ class DecisionAugmentationSampler(Sampler[int]):
         return [i for batch in order for i in batch]
 
     def __iter__(self):
-        return iter(self._order())
+        return iter(repeat_batches(self._order(), self.batch_size, self.repeat)[0])
 
     def __len__(self) -> int:
-        return len(self._epoch_rows())
+        num_rows = len(self._epoch_rows())
+        if self.repeat == 1:
+            return num_rows
+        return -(-num_rows // self.batch_size) * self.batch_size * self.repeat
 
 
 class DecisionTrainer(SaveShardMixin, Trainer):
@@ -266,6 +467,8 @@ class DecisionTrainer(SaveShardMixin, Trainer):
         self._loss_parts: Dict[str, Tuple[torch.Tensor, int]] = {}
         # The layers whose gradient checkpointing is turned on and off per batch (found at the first batch)
         self._checkpointing_layers: Optional[List[torch.nn.Module]] = None
+        # With sequence parallelism, whether the backbone has been checked (at the first batch)
+        self._sp_backbone_checked = False
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
@@ -314,7 +517,65 @@ class DecisionTrainer(SaveShardMixin, Trainer):
             seed=self.args.data_seed if self.args.data_seed is not None else self.args.seed,
             lengths=row_lengths(dataset) if strategy == "group_by_length" and not sequential else None,
             shuffle=not sequential,
+            repeat=self._sequence_parallel_size(),
         )
+
+    @override
+    def get_eval_dataloader(self, eval_dataset: Optional[Union[str, "Dataset"]] = None) -> "DataLoader":
+        """With sequence parallelism, serves each batch once per rank of the sequence parallel group
+        (see sequence_parallel_eval_dataset)."""
+        sp_size = self._sequence_parallel_size()
+        if sp_size == 1:
+            return super().get_eval_dataloader(eval_dataset)
+        if isinstance(eval_dataset, str):
+            eval_dataset = self.eval_dataset[eval_dataset]
+        elif eval_dataset is None:
+            eval_dataset = self.eval_dataset
+        return super().get_eval_dataloader(
+            sequence_parallel_eval_dataset(eval_dataset, self.args.per_device_eval_batch_size, sp_size)
+        )
+
+    @override
+    def _get_eval_sampler(self, eval_dataset: "Dataset") -> Optional["torch.utils.data.Sampler"]:
+        """With sequence parallelism, returns the rows in order, as sequence_parallel_eval_dataset lays them out."""
+        if self._sequence_parallel_size() == 1:
+            return super()._get_eval_sampler(eval_dataset)
+        return SequentialSampler(eval_dataset)
+
+    def _sequence_parallel_size(self) -> int:
+        """The size of the model's sequence parallel group, or 1 without sequence parallelism."""
+        group = getattr(self.model, "sequence_parallel_group", None)
+        return torch.distributed.get_world_size(group) if group is not None else 1
+
+    def _check_sequence_parallel_backbone(self, model, inputs: Dict[str, Any]) -> None:
+        """
+        With sequence parallelism, checks once, at the first training or evaluation batch, that the
+        backbone supports it (see sequence_parallel_backbone_problems). It runs here, rather than when
+        the model is loaded, because under DeepSpeed ZeRO-3, the model can only run inside the engine.
+        """
+        if self._sp_backbone_checked or self._sequence_parallel_size() == 1:
+            return
+        self._sp_backbone_checked = True
+        problems = sequence_parallel_backbone_problems(model, inputs)
+        if problems:
+            name = getattr(unwrap_decision_model(model).config, "_name_or_path", "the model")
+            raise ValueError(
+                f"Sequence parallelism can't be used with {name}, because some of its layers would only see "
+                "their own GPU's part of each prompt:\n  "
+                + "\n  ".join(describe_backbone_problems(problems))
+                + "\nIt works with HMF's models, and with Hugging Face models that use only full attention. "
+                "To use this model:\n"
+                "  1. Convert it to an HMF model with hmf prime-init, keeping its layers as they are\n"
+                '     (hybrid_override_pattern "*" for attention layers, "GDN" for Gated DeltaNet layers).\n'
+                "  2. Convert that model to a decision model with hmf decision-init.\n"
+                "  3. Train the decision model."
+            )
+
+    @override
+    def training_step(self, model, inputs, *args, **kwargs):
+        if not self._sp_backbone_checked and self._sequence_parallel_size() > 1:
+            self._check_sequence_parallel_backbone(model, self._prepare_inputs(inputs))
+        return super().training_step(model, inputs, *args, **kwargs)
 
     @override
     def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
@@ -383,9 +644,12 @@ class DecisionTrainer(SaveShardMixin, Trainer):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Returns, for each row, [prediction, label, kind_id, log p(label), p(prediction), sum of p^2]:
-        a fixed width whatever the number of options, from which the metrics are computed.
+        a fixed width whatever the number of options, from which the metrics are computed. With
+        sequence parallelism, a last column says whether the metrics count the row (see
+        sequence_parallel_eval_dataset).
         """
         inputs = self._prepare_inputs(inputs)
+        self._check_sequence_parallel_backbone(model, inputs)
         with torch.no_grad():
             loss, outputs = self._loss(model, inputs)
         if prediction_loss_only:
@@ -395,15 +659,15 @@ class DecisionTrainer(SaveShardMixin, Trainer):
         probs = log_probs.exp()  # padded options are -inf, so 0
         labels = inputs["label"]
         prediction = probs.argmax(dim=-1)
-        stats = torch.stack(
-            [
-                prediction.float(),
-                labels.float(),
-                inputs["kind_id"].float(),
-                log_probs.gather(1, labels.unsqueeze(-1)).squeeze(-1),
-                probs.max(dim=-1).values,
-                (probs**2).sum(dim=-1),
-            ],
-            dim=-1,
-        )
+        columns = [
+            prediction.float(),
+            labels.float(),
+            inputs["kind_id"].float(),
+            log_probs.gather(1, labels.unsqueeze(-1)).squeeze(-1),
+            probs.max(dim=-1).values,
+            (probs**2).sum(dim=-1),
+        ]
+        if SP_COUNTED_COLUMN in inputs:
+            columns.append(inputs[SP_COUNTED_COLUMN].float())
+        stats = torch.stack(columns, dim=-1)
         return loss.detach(), stats, labels

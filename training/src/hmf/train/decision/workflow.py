@@ -8,8 +8,12 @@ finetuning_type:
     - lora: LoRA adapters on the backbone, and the pointer head.
     - full: all parameters, or with hybrid_learnable_params only those whose names contain one of
       its entries, e.g. `decision_head` to train the head alone on a frozen backbone.
+
+With sequence_parallel_size > 1 (zigzag-ring only), each prompt is split across the ranks of a
+sequence parallel group (see DecisionModel and DecisionTrainer).
 """
 
+import math
 from typing import TYPE_CHECKING, Optional
 
 from ...data import DecisionDataCollator, get_dataset, get_template_and_fix_tokenizer
@@ -17,6 +21,7 @@ from ...extras import logging
 from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
 from ..callbacks import PreserveTokenizerConfigCallback
+from ..sft.workflow import set_sequence_parallel_group_recursive
 from ..trainer_utils import create_modelcard_and_push, freeze_params_hybrid
 from .metric import ComputeDecisionMetrics
 from .trainer import DecisionTrainer
@@ -38,8 +43,11 @@ def _check_arguments(
     finetuning_args: "FinetuningArguments",
 ) -> None:
     """Rejects options the decision workflow does not support."""
-    if model_args.sequence_parallel_size > 1:
-        raise ValueError("Sequence parallelism is not supported for decision models.")
+    if model_args.sequence_parallel_size > 1 and model_args.sequence_parallel_mode != "zigzag-ring":
+        raise ValueError(
+            "Decision models support sequence parallelism with sequence_parallel_mode: zigzag-ring only, got "
+            f"{model_args.sequence_parallel_mode!r}."
+        )
     if data_args.packing:
         raise ValueError("Packing is not supported for decision models.")
     if training_args.do_predict or training_args.predict_with_generate:
@@ -136,14 +144,17 @@ def mark_zero3_leaf_modules(model) -> None:
     logger.info_rank0("DeepSpeed ZeRO-3: the trained head (PEFT's ModulesToSaveWrapper) is gathered as one unit.")
 
 
-def _warn_if_augmentations_reused(trainer: DecisionTrainer, training_args: "Seq2SeqTrainingArguments") -> None:
+def _warn_if_augmentations_reused(
+    trainer: DecisionTrainer, training_args: "Seq2SeqTrainingArguments", sequence_parallel_size: int
+) -> None:
     """Warns if training makes more passes over the rows than there are augmentations of them."""
     augmentations = trainer.train_dataset["augmentation"]
     num_augmentations = len(set(augmentations))
     rows_per_augmentation = len(augmentations) / num_augmentations
 
     global_batch_size = training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps
-    global_batch_size *= training_args.world_size
+    # The ranks of a sequence parallel group train on the same rows
+    global_batch_size *= training_args.world_size // sequence_parallel_size
     if training_args.max_steps > 0:
         passes = training_args.max_steps * global_batch_size / rows_per_augmentation
     else:
@@ -179,13 +190,23 @@ def run_decision(
             f"{getattr(model.config, 'model_type', None)!r}). Convert it with `hmf decision-init` first."
         )
 
+    pad_to_multiple_of = finetuning_args.decision_pad_to_multiple_of
+    sp_size = model_args.sequence_parallel_size
+    if sp_size > 1:
+        if model.sequence_parallel_group is None:
+            raise ValueError("sequence_parallel_size > 1 needs flash-attention, which is not installed.")
+        # The trainer checks, at the first batch, that the backbone supports sequence parallelism (see
+        # DecisionTrainer)
+        set_sequence_parallel_group_recursive(model, model.sequence_parallel_group)
+        # The prompts are split into 2 * sequence_parallel_size chunks (see DecisionModel)
+        pad_to_multiple_of = math.lcm(pad_to_multiple_of or 1, 2 * sp_size)
+        logger.info_rank0(f"Sequence parallelism: size {sp_size}, prompts padded to a multiple of {pad_to_multiple_of}.")
+
     trainer = DecisionTrainer(
         model=model,
         args=training_args,
         finetuning_args=finetuning_args,
-        data_collator=DecisionDataCollator(
-            tokenizer=tokenizer, pad_to_multiple_of=finetuning_args.decision_pad_to_multiple_of
-        ),
+        data_collator=DecisionDataCollator(tokenizer=tokenizer, pad_to_multiple_of=pad_to_multiple_of),
         callbacks=callbacks,
         compute_metrics=ComputeDecisionMetrics(),
         **dataset_module,
@@ -201,7 +222,7 @@ def run_decision(
 
     # Training
     if training_args.do_train:
-        _warn_if_augmentations_reused(trainer, training_args)
+        _warn_if_augmentations_reused(trainer, training_args, model_args.sequence_parallel_size)
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
         trainer.save_model()
         trainer.log_metrics("train", train_result.metrics)

@@ -47,10 +47,16 @@ def _metrics(prediction, label, log_prob_label, p_max, sum_p_sq) -> Dict[str, fl
 
 
 class ComputeDecisionMetrics:
-    """Computes accuracy, NLL, Brier score, and ECE over all rows and per kind."""
+    """
+    Computes accuracy, NLL, Brier score, and ECE over all rows and per kind. With sequence
+    parallelism, each row is evaluated once per rank of the sequence parallel group, and the rows have
+    a seventh column that marks the one copy of each row to count (see DecisionTrainer.prediction_step).
+    """
 
     def __call__(self, eval_preds: "EvalPrediction") -> Dict[str, float]:
         stats = np.asarray(eval_preds.predictions, dtype=np.float64)
+        if stats.shape[1] == 7:
+            stats = stats[stats[:, 6] > 0, :6]
         prediction, label, kind_id, log_prob_label, p_max, sum_p_sq = stats.T
 
         result = _metrics(prediction, label, log_prob_label, p_max, sum_p_sq)

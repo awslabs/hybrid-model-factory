@@ -16,16 +16,26 @@ Prompts are right-padded, so under causal attention, and in recurrent layers tha
 left to right, no real position ever reads a pad, and the padding mask changes nothing the head reads.
 HMF's hybrid backbones are therefore run without it (see uses_padding_mask), as their sequence
 mixers do not all accept one (e.g. GKA refuses a padding mask in eval mode).
+
+With sequence parallelism, every rank of a sequence parallel group is given the same batch. Each
+rank runs the backbone on its zig-zag chunks of the prompts (see zigzag_local), and then gathers the
+backbone's hidden states of the whole prompts. Every rank therefore computes the head and the loss
+on the same hidden states, as without sequence parallelism. tests/decision/model/decision_sp_parity.py
+checks this against the same models without sequence parallelism.
 """
 
+import contextlib
 from dataclasses import dataclass
-from typing import Optional
+from typing import Generator, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, PreTrainedModel
 from transformers.utils import ModelOutput
+
+from hmf.model.model_utils.allgather_sp_helper import ZigZagGatherScatter, get_zigzag_indices
 
 from .configuration_decision import DecisionConfig
 
@@ -49,6 +59,24 @@ def uses_padding_mask(backbone: nn.Module) -> bool:
         backbone: The backbone, or a causal LM.
     """
     return not type(backbone).__module__.startswith(HYBRID_ZOO_PACKAGE + ".")
+
+
+def zigzag_local(tensor: torch.Tensor, sp_rank: int, sp_size: int) -> torch.Tensor:
+    """
+    The zig-zag chunks of tensor that a sequence parallel rank processes, in the layout that
+    ZigZagGatherScatter gathers: the sequence is split into 2 * sp_size chunks, and rank r keeps
+    chunks r and 2 * sp_size - 1 - r.
+
+    Args:
+        tensor: A tensor of shape [batch, seq_len, ...], with seq_len a multiple of 2 * sp_size.
+        sp_rank: The rank within the sequence parallel group.
+        sp_size: The size of the sequence parallel group.
+
+    Returns:
+        The rank's chunks, concatenated, of shape [batch, seq_len // sp_size, ...].
+    """
+    chunks = tensor.chunk(2 * sp_size, dim=1)
+    return torch.cat([chunks[i] for i in get_zigzag_indices(sp_size, 2 * sp_size)[sp_rank]], dim=1)
 
 
 @dataclass
@@ -206,6 +234,8 @@ class DecisionModel(PreTrainedModel):
         # Device placement (e.g. device_map="auto") should not split the backbone's layers
         self._no_split_modules = getattr(self.model, "_no_split_modules", None)
         self.pass_attention_mask = uses_padding_mask(self.model)
+        # Set by the training workflow when sequence parallelism is enabled
+        self.sequence_parallel_group = None
 
         self.post_init()
 
@@ -214,6 +244,27 @@ class DecisionModel(PreTrainedModel):
 
     def set_input_embeddings(self, value: nn.Module) -> None:
         self.model.set_input_embeddings(value)
+
+    @contextlib.contextmanager
+    def _same_head_dropout_in_group(self, device: torch.device) -> Generator[None, None, None]:
+        """
+        Makes every rank of a sequence parallel group use the same dropout masks in the head, by
+        seeding them with a number drawn on the group's first rank. Every rank must compute exactly
+        the same loss, because the backward of ZigZagGatherScatter keeps only each rank's own part of
+        the gradient and relies on the other ranks to supply theirs.
+
+        Args:
+            device: The device of the hidden states.
+        """
+        group = self.sequence_parallel_group
+        if group is None or not self.training or not isinstance(self.decision_head.dropout, nn.Dropout):
+            yield
+            return
+        seed = torch.randint(2**62, (1,), device=device)
+        dist.broadcast(seed, src=dist.get_global_rank(group, 0), group=group)
+        with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+            torch.manual_seed(int(seed.item()))
+            yield
 
     def forward(
         self,
@@ -226,9 +277,11 @@ class DecisionModel(PreTrainedModel):
     ) -> DecisionModelOutput:
         """
         Args:
-            input_ids: Token ids of shape [batch, seq_len], right-padded.
+            input_ids: Token ids of shape [batch, seq_len], right-padded. With sequence
+                parallelism, every rank of the group is given the same whole prompts, and seq_len
+                must be a multiple of 2 * sequence_parallel_size.
             attention_mask: Attention mask of shape [batch, seq_len]. Not passed to HMF's hybrid
-                backbones (see uses_padding_mask).
+                backbones (see uses_padding_mask), nor to any backbone with sequence parallelism.
             opt_idx: Position of the last token of each option's line, of shape
                 [batch, num_options]. Rows with fewer options are padded with -1.
             answer_idx: Position of the answer marker, of shape [batch].
@@ -238,15 +291,38 @@ class DecisionModel(PreTrainedModel):
         Returns:
             A DecisionModelOutput with the option logits and log-probabilities.
         """
+        if not self.pass_attention_mask:
+            attention_mask = None
+
+        group = self.sequence_parallel_group
+        if group is not None:
+            sp_size, sp_rank = dist.get_world_size(group), dist.get_rank(group)
+            seq_len = input_ids.size(1)
+            if seq_len % (2 * sp_size) != 0:
+                raise ValueError(
+                    f"With sequence parallelism, the padded prompt length ({seq_len}) must be a multiple "
+                    f"of 2 * sequence_parallel_size ({2 * sp_size}); see decision_pad_to_multiple_of."
+                )
+            if position_ids is None:
+                position_ids = torch.arange(seq_len, device=input_ids.device).expand(input_ids.size(0), -1)
+            # Each rank runs the backbone on its zig-zag chunks, at their positions in the whole prompts. The
+            # padding mask is left out, which is exact for right-padded prompts (see uses_padding_mask).
+            input_ids = zigzag_local(input_ids, sp_rank, sp_size)
+            position_ids = zigzag_local(position_ids, sp_rank, sp_size)
+            attention_mask = None
+
         outputs = self.model(
             input_ids=input_ids,
-            attention_mask=attention_mask if self.pass_attention_mask else None,
+            attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=False,
             return_dict=True,
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state  # [batch, seq_len, hidden_size]
+        if group is not None:
+            # Every rank gathers the hidden states of the whole prompts, which answer_idx and opt_idx index
+            hidden_states = ZigZagGatherScatter.apply(hidden_states, group, sp_rank, sp_size, 2 * sp_size)
 
         batch_idx = torch.arange(hidden_states.size(0), device=hidden_states.device)
         answer_states = hidden_states[batch_idx, answer_idx]  # [batch, hidden_size]
@@ -256,7 +332,8 @@ class DecisionModel(PreTrainedModel):
         option_pos = opt_idx.clamp_min(0)
         option_states = hidden_states[batch_idx.unsqueeze(-1), option_pos]  # [batch, num_options, hidden_size]
 
-        logits = self.decision_head(answer_states, option_states, option_mask)
+        with self._same_head_dropout_in_group(hidden_states.device):
+            logits = self.decision_head(answer_states, option_states, option_mask)
         log_probs = masked_log_softmax(logits, option_mask)
 
         return DecisionModelOutput(logits=logits, log_probs=log_probs)

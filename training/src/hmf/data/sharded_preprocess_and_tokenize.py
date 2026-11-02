@@ -290,7 +290,9 @@ def tokenize_shard_worker(args: tuple) -> tuple[int, bool, str]:
             is_eval=False,
         )
         
-        if model_args.sequence_parallel_size > 1:
+        # Decision models split each batch across the sequence parallel ranks themselves (see
+        # DecisionModel), so their data is not split here
+        if model_args.sequence_parallel_size > 1 and stage != "decision":
             dataset = _get_sequence_parallel_dataset(
                 dataset=dataset,
                 data_args=data_args,
