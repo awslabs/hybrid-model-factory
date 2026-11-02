@@ -22,6 +22,8 @@ These steps train two models, one after the other:
 
 Both also learn to stay close to the base model's own answers (the "anchor"). [recipes.md](recipes.md) explains these choices.
 
+Once Strands Decider's data is built and linked ([Before You Start](#before-you-start)), [run_pipeline.sh](run_pipeline.sh) runs steps 1 to 7 in order: `bash examples/decision/run_pipeline.sh`.
+
 ### Before You Start
 
 - **GPUs.** The times below are for 8 H200s.
