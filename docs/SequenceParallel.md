@@ -442,5 +442,8 @@ A: Yes. SP can be composed with DeepSpeed ZeRO. See the example configs in `trai
 **Q: Which SP mode should I use, `zigzag-ring` or `ulysses`?** 
 A: `zigzag-ring` is the default and recommended mode. It provides better load balancing for Hybrid models. `ulysses` is available as an alternative for attention layers but is not currently supported for SSM layers.
 
+**Q: Can I use SP with a Hugging Face model that is not an HMF model?**
+A: Yes, for models such as Qwen3 or Llama, whose layers all use full attention without softcapping. SP runs their attention as ring attention. Layers of other kinds, such as the Gated DeltaNet layers of stock Qwen3.5, only see their own GPU's part of each sequence. Ring attention also ignores sliding windows and attention softcapping (as in Gemma 2). Such models would silently train with wrong results, so the SFT, pre-training, and decision trainers check every layer at their first batch, and stop with an error that names the unsupported layers. To train such a model with SP, convert it to an HMF model with `hmf prime-init` first. With `ulysses`, the trainers also stop with this error for HMF's layers other than attention (such as GKA, GDN, Mamba2, and SWA), because these layers support `zigzag-ring` only.
+
 **Q: How does SP interact with the data pipeline?**
 A: The data pipeline splits each sample into zig-zag chunks during preprocessing (via `preprocess_sp_dataset` in `data_utils.py`). Each GPU's dataloader yields only its assigned chunks. This means tokenized datasets must be prepared with the target SP size--you cannot change SP size without re-tokenizing.

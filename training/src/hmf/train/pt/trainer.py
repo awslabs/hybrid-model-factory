@@ -22,8 +22,9 @@ from torch.utils.data import DataLoader, SequentialSampler
 from transformers import Trainer
 from typing_extensions import override
 
-from ..callbacks import SaveProcessorCallback
 from ...extras.packages import is_transformers_version_greater_than
+from ...model.model_utils.sequence_parallel_check import check_sequence_parallel_backbone
+from ..callbacks import SaveProcessorCallback
 from ..fp8_utils import (
     configure_fp8_environment,
     patch_accelerator_for_fp8,
@@ -51,6 +52,7 @@ class CustomTrainer(SaveShardMixin, Trainer):
         finetuning_args: "FinetuningArguments",
         processor: Optional["ProcessorMixin"],
         model_args: Optional["ModelArguments"] = None,
+        sequence_parallel_mode: Optional[str] = None,
         **kwargs,
     ) -> None:
         kwargs["processing_class"] = kwargs.pop("tokenizer")
@@ -68,6 +70,7 @@ class CustomTrainer(SaveShardMixin, Trainer):
             self.model_accepts_loss_kwargs = False
 
         self.finetuning_args = finetuning_args
+        self.sequence_parallel_mode = sequence_parallel_mode
         self._has_dummy_forwarded = False
 
         if processor is not None:
@@ -149,12 +152,17 @@ class CustomTrainer(SaveShardMixin, Trainer):
 
     @override
     def training_step(self, model, inputs, *args, **kwargs):
-        # Sequence_parallel modes other than 'zigzag-ring' may not need dummy forward
+        # With sequence parallelism, the first batch gets an extra forward pass in eval mode, without
+        # gradients. check_sequence_parallel_backbone runs this pass, and uses it to check that the
+        # backbone supports sequence parallelism. Sequence parallel modes other than zigzag-ring may not
+        # need this forward pass, but they still need the backbone checked.
         if not self._has_dummy_forwarded and model.sequence_parallel_group is not None:
-            model.eval()
-            with torch.no_grad():
-                _ = model(**inputs)
-            model.train()
+            check_sequence_parallel_backbone(
+                model,
+                lambda: model(**inputs),
+                mode=self.sequence_parallel_mode or "zigzag-ring",
+                always_run_forward=True,
+            )
             self._has_dummy_forwarded = True
         return super().training_step(model, inputs, *args, **kwargs)
 

@@ -20,10 +20,12 @@ checks compare:
     sgd_steps           parameters after a few SGD steps on different batches
     head_dropout        with head dropout on, every rank of the SP group computes the same loss
     bad_length          a padded length that does not split into 2 * sp_size chunks is rejected
-    backbone_check      the trainer's check that the backbone supports SP passes (also with LoRA)
+    backbone_check      the backbone check (see below) passes (also with LoRA)
 
-In bf16, backbone_rejected also checks that the trainer's check rejects two stock Hugging Face
-backbones and names the right layers. The first is Qwen3.5, whose Gated DeltaNet layers have no SP
+The backbone check is the check that the decision trainer runs at its first batch, to make sure that
+every layer of the backbone supports SP (see check_sequence_parallel_backbone). In bf16,
+backbone_rejected also checks that the backbone check rejects two stock Hugging Face backbones and
+names the right layers. The first is Qwen3.5, whose Gated DeltaNet layers have no SP
 version. The second is Qwen3 with sliding-window attention, which ring attention does not support
 because it ignores the window. HMF's own sliding-window layers are not affected, as they have their
 own SP version (the swa backbone above).
@@ -62,7 +64,8 @@ import hmf.model.hybrid_zoo.models.model_register  # noqa: F401  # Registers hyb
 from hmf.model.hybrid_zoo.models.decision.configuration_decision import DecisionConfig
 from hmf.model.hybrid_zoo.models.decision.modeling_decision import DecisionModel
 from hmf.model.model_utils.sequence_parallel import apply_sequence_parallel
-from hmf.train.decision.trainer import decision_loss, describe_backbone_problems, sequence_parallel_backbone_problems
+from hmf.model.model_utils.sequence_parallel_check import describe_backbone_problems, sequence_parallel_backbone_problems
+from hmf.train.decision.trainer import decision_loss
 from hmf.train.sft.workflow import set_sequence_parallel_group_recursive
 
 
@@ -146,7 +149,7 @@ def _qwen3_sliding():
     )
 
 
-# Stock backbones that the trainer's check must reject, each with its config, the layers the check must name,
+# Stock backbones that the backbone check must reject, each with its config, the layers the check must name,
 # and the reason
 REJECTED: Dict[str, tuple] = {
     "qwen3_5_stock": (_qwen3_5_stock, [0, 1, 2], "no sequence parallelism"),  # Hugging Face's GDN layers
@@ -414,7 +417,8 @@ def run_checks(name: str, ref: dict, seq_len: int, group, sp_size: int, device: 
     def backbone_check():
         messages = []
         for lora in ([False, True] if "lora_grads" in ref else [False]):
-            problems = sequence_parallel_backbone_problems(fresh(lora=lora), batch)
+            model = fresh(lora=lora)
+            problems = sequence_parallel_backbone_problems(model, lambda: model(**{n: batch[n] for n in MODEL_INPUTS}))
             if problems:
                 return False, f"{'with LoRA: ' if lora else ''}{describe_backbone_problems(problems)}"
             messages.append("no problems" + (" (also with LoRA)" if lora else ""))
@@ -434,14 +438,15 @@ def run_checks(name: str, ref: dict, seq_len: int, group, sp_size: int, device: 
 
 
 def rejected_checks(seq_len: int, group, sp_size: int, device: torch.device, args) -> List[tuple]:
-    """The trainer's check must reject each backbone of REJECTED, naming exactly its unsupported layers."""
+    """The backbone check must reject each backbone of REJECTED, naming exactly its unsupported layers."""
     results = []
     for name, (_, expected_layers, reason) in REJECTED.items():
         try:
             model = build_model(name, "sequence_parallel_attention", device)
             broadcast_weights(model)
             set_sequence_parallel_group_recursive(model, group)
-            problems = sequence_parallel_backbone_problems(model, make_batch(seq_len, sp_size, seed=0, device=device))
+            batch = make_batch(seq_len, sp_size, seed=0, device=device)
+            problems = sequence_parallel_backbone_problems(model, lambda: model(**{n: batch[n] for n in MODEL_INPUTS}))
             named = sorted(index for index, _, why in problems if why == reason)
             passed = named == expected_layers and len(problems) == len(expected_layers)
             message = f"named layers {named} (expected {expected_layers}): {describe_backbone_problems(problems)}"

@@ -30,7 +30,7 @@ from typing_extensions import override
 
 from ...data.collator import SP_COUNTED_COLUMN
 from ...extras import logging
-from ...model.hybrid_zoo.models.decision.modeling_decision import uses_padding_mask
+from ...model.model_utils.sequence_parallel_check import check_sequence_parallel_backbone
 from ..trainer_utils import SaveShardMixin
 
 
@@ -46,142 +46,13 @@ logger = logging.get_logger(__name__)
 # Inputs of DecisionModel.forward; the other collated columns are targets
 MODEL_INPUTS = ("input_ids", "attention_mask", "opt_idx", "answer_idx")
 
-# The attention implementation that sequence parallelism registers, which runs ring attention
-# (see model/model_utils/sequence_parallel.py)
-SP_ATTENTION = "sequence_parallel_attention"
-
-
-def unwrap_decision_model(model: torch.nn.Module) -> torch.nn.Module:
-    """The DecisionModel inside model, without the DDP or DeepSpeed wrapper and without LoRA's."""
-    while hasattr(model, "module"):  # DDP, DeepSpeed
-        model = model.module
-    if hasattr(model, "get_base_model"):  # PEFT
-        model = model.get_base_model()
-    return model
-
-
-# A layer that does not support sequence parallelism, given as its index, its class name, and the reason
-BackboneProblem = Tuple[Optional[int], str, str]
-
-
-def sequence_parallel_backbone_problems(model: torch.nn.Module, inputs: Dict[str, Any]) -> List[BackboneProblem]:
-    """
-    Checks that every layer of the decision model's backbone supports sequence parallelism, that is,
-    mixes tokens across the whole sequence rather than only within its rank's part. A layer that does
-    not, e.g., a Hugging Face Gated DeltaNet or Mamba layer, would silently compute the wrong result.
-
-    HMF's models support it throughout, so they pass without further checks. For other models, one
-    forward pass on inputs records which modules call ring attention, and every layer must have called
-    it without a sliding window, because ring attention ignores the window and attends to the whole
-    prompt. This concerns Hugging Face's attention layers only, as HMF's own sliding-window layers
-    (SWA) have their own sequence parallel version. The check shows that each layer has a sequence
-    mixer that supports sequence parallelism, but not that it has no other one: a layer that ran,
-    say, a Mamba mixer alongside its attention would still pass.
-
-    Every rank of the sequence parallel group must call this at the same time, as the forward pass
-    communicates between them.
-
-    Args:
-        model: The decision model, possibly wrapped (DDP, DeepSpeed, PEFT), with sequence parallelism set up.
-        inputs: A collated batch on the model's device, padded for sequence parallelism.
-
-    Returns:
-        One (layer index, layer class, reason) per unsupported layer, or an empty list if the backbone
-        supports sequence parallelism.
-    """
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterface
-
-    backbone = unwrap_decision_model(model).model
-    # HMF's models are exactly the backbones that skip the padding mask (see uses_padding_mask)
-    is_hmf_backbone = not uses_padding_mask(backbone)
-    if is_hmf_backbone:
-        return []
-    layers = getattr(backbone, "layers", None)
-    if layers is None:
-        return [(None, type(backbone).__name__, "has no `layers` to check")]
-
-    # Record which modules call ring attention, and whether each of them used a sliding window. The
-    # attention modules look the function up by name at every call, so replacing it for the one
-    # forward pass is enough.
-    calls: Dict[torch.nn.Module, bool] = {}
-    ring_attention = ALL_ATTENTION_FUNCTIONS[SP_ATTENTION]
-
-    def recording(module, *args, **kwargs):
-        window = kwargs.get("sliding_window")
-        calls[module] = calls.get(module, False) or (window is not None and window > 0)
-        return ring_attention(module, *args, **kwargs)
-
-    was_training = model.training
-    AttentionInterface.register(SP_ATTENTION, recording)
-    try:
-        model.eval()
-        with torch.no_grad():
-            model(**{name: inputs[name] for name in MODEL_INPUTS})
-    finally:
-        AttentionInterface.register(SP_ATTENTION, ring_attention)
-        model.train(was_training)
-
-    problems = []
-    for index, layer in enumerate(layers):
-        callers = [module for module in layer.modules() if module in calls]
-        if not callers:
-            problems.append((index, sequence_mixer_name(layer), "no sequence parallelism"))
-        elif any(calls[module] for module in callers):
-            names = sorted({type(module).__name__ for module in callers if calls[module]})
-            problems.append((index, "/".join(names), "sliding-window attention"))
-    return problems
-
-
-def sequence_mixer_name(layer: torch.nn.Module) -> str:
-    """
-    The class name of a decoder layer's sequence mixer, for error messages. The sequence mixer is any
-    direct submodule other than norms, MLPs, and MoE blocks, and the layer's own class name is used if
-    there is none. Classes from the transformers library are named as such, e.g., "transformers'
-    Qwen3_5GatedDeltaNet".
-    """
-
-    def name(module: torch.nn.Module) -> str:
-        from_transformers = type(module).__module__.startswith("transformers.")
-        return f"transformers' {type(module).__name__}" if from_transformers else type(module).__name__
-
-    names = [
-        name(child)
-        for child in layer.children()
-        if not any(part in type(child).__name__.lower() for part in ("norm", "mlp", "moe"))
-    ]
-    return "/".join(names) if names else name(layer)
-
-
-def describe_backbone_problems(problems: List[BackboneProblem]) -> List[str]:
-    """
-    One sentence per kind of problem, listing its layers, e.g.,
-    "layers 0, 1, 2 use transformers' Qwen3_5GatedDeltaNet, which has no sequence parallel version".
-    """
-    # The sentence for each reason, for one layer and for several
-    sentences = {
-        "no sequence parallelism": (
-            "{layers} uses {cls}, which has no sequence parallel version",
-            "{layers} use {cls}, which has no sequence parallel version",
-        ),
-        "sliding-window attention": (
-            "{layers} ({cls}) uses sliding-window attention, which ring attention does not support",
-            "{layers} ({cls}) use sliding-window attention, which ring attention does not support",
-        ),
-    }
-    layers: Dict[Tuple[str, str], List[int]] = {}
-    lines = []
-    for index, layer_class, reason in problems:
-        if index is None:
-            lines.append(f"{layer_class} {reason}")
-        else:
-            layers.setdefault((layer_class, reason), []).append(index)
-    for (layer_class, reason), indices in layers.items():
-        one, several = sentences.get(reason, ("{layers} ({cls}) " + reason,) * 2)
-        if len(indices) == 1:
-            lines.append(one.format(layers=f"layer {indices[0]}", cls=layer_class))
-        else:
-            lines.append(several.format(layers=f"layers {', '.join(map(str, indices))}", cls=layer_class))
-    return lines
+# The steps that make a model trainable as a decision model with sequence parallelism, for the error message
+DECISION_CONVERSION_STEPS = [
+    "Convert it to an HMF model with hmf prime-init, with a hybrid_override_pattern that keeps its layers\n"
+    "     as they are.",
+    "Convert that model to a decision model with hmf decision-init.",
+    "Train the decision model.",
+]
 
 
 def param_shape(param: torch.nn.Parameter) -> Tuple[int, ...]:
@@ -550,26 +421,18 @@ class DecisionTrainer(SaveShardMixin, Trainer):
     def _check_sequence_parallel_backbone(self, model, inputs: Dict[str, Any]) -> None:
         """
         With sequence parallelism, checks once, at the first training or evaluation batch, that the
-        backbone supports it (see sequence_parallel_backbone_problems). It runs here, rather than when
+        backbone supports it (see check_sequence_parallel_backbone). It runs here, rather than when
         the model is loaded, because under DeepSpeed ZeRO-3, the model can only run inside the engine.
         """
         if self._sp_backbone_checked or self._sequence_parallel_size() == 1:
             return
         self._sp_backbone_checked = True
-        problems = sequence_parallel_backbone_problems(model, inputs)
-        if problems:
-            name = getattr(unwrap_decision_model(model).config, "_name_or_path", "the model")
-            raise ValueError(
-                f"Sequence parallelism can't be used with {name}, because some of its layers would only see "
-                "their own GPU's part of each prompt:\n  "
-                + "\n  ".join(describe_backbone_problems(problems))
-                + "\nIt works with HMF's models, and with Hugging Face models that use only full attention. "
-                "To use this model:\n"
-                "  1. Convert it to an HMF model with hmf prime-init, keeping its layers as they are\n"
-                '     (hybrid_override_pattern "*" for attention layers, "GDN" for Gated DeltaNet layers).\n'
-                "  2. Convert that model to a decision model with hmf decision-init.\n"
-                "  3. Train the decision model."
-            )
+        check_sequence_parallel_backbone(
+            model,
+            lambda: model(**{name: inputs[name] for name in MODEL_INPUTS}),
+            mode="zigzag-ring",  # the only mode decision models support (see workflow._check_arguments)
+            conversion_steps=DECISION_CONVERSION_STEPS,
+        )
 
     @override
     def training_step(self, model, inputs, *args, **kwargs):

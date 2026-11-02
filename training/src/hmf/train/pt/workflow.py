@@ -73,6 +73,7 @@ def run_pt(
         finetuning_args=finetuning_args,
         data_collator=data_collator,
         callbacks=callbacks,
+        sequence_parallel_mode=model_args.sequence_parallel_mode if model_args.sequence_parallel_size > 1 else None,
         **dataset_module,
         **tokenizer_module,
     )
