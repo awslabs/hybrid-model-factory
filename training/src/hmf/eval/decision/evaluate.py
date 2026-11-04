@@ -60,7 +60,7 @@ def evaluate(
         prompt_format: The prompt format of training (decision_prompt_format). Defaults to "strands".
         force_bos: Whether prompts start with the BOS token (decision_force_bos). Defaults to False.
         max_len: The longest prompt, in tokens; longer rows are skipped. Defaults to 4096.
-        device: Where to run the model. Defaults to the first GPU if there is one, else the CPU.
+        device: Where to run the model. Defaults to the first GPU, else MPS (Apple silicon), else the CPU.
         predictor: A DecisionPredictor to use instead of loading the model. Defaults to None.
 
     Returns:

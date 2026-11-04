@@ -12,10 +12,9 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Sequence
 
-import torch
-
 from ...data.decision_teachers import DecisionModelTeacher
 from ...extras import logging
+from ...extras.misc import get_current_device
 from .metrics import apply_temperature
 
 
@@ -52,7 +51,7 @@ class DecisionPredictor:
         model_name_or_path: The decision model.
         adapter_name_or_path: Its LoRA adapter (the training output folder), merged before use.
             Defaults to None.
-        device: Where to run the model. Defaults to the first GPU if there is one, else the CPU.
+        device: Where to run the model. Defaults to the first GPU, else MPS (Apple silicon), else the CPU.
         prompt_format: The prompt format's name (decision_prompt_format in training). Defaults to
             "strands".
         force_bos: Whether prompts start with the BOS token (decision_force_bos in training).
@@ -74,7 +73,7 @@ class DecisionPredictor:
     ):
         self.model_name_or_path = model_name_or_path
         self.adapter_name_or_path = adapter_name_or_path
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or str(get_current_device())
         self.max_len = max_len
         self.model = DecisionModelTeacher(
             model_name_or_path,

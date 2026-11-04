@@ -47,6 +47,7 @@ import torch
 from datasets import Dataset, Features, Sequence as SequenceFeature, Value, concatenate_datasets, load_from_disk
 
 from ..extras import logging
+from ..extras.misc import get_current_device, is_torch_mps_available, torch_gc
 from .data_utils import decision_dataset_files, decision_sources, read_decision_rows
 from .decision_prompt import get_prompt_format
 from .decision_teachers import CausalLMScorer, ScoringQuery, TeacherFile, load_teacher_model, to_augmented_order
@@ -204,7 +205,7 @@ def label_shard(
         config_path: The tokenization config, with the labeling keys.
         shard_index: Which slice to label. Defaults to 0.
         num_shards: The number of slices. Defaults to 1 (all rows).
-        device: Where to run the models. Defaults to the first GPU if there is one, else the CPU.
+        device: Where to run the models. Defaults to the first GPU, else MPS (Apple silicon), else the CPU.
         overrides: key=value overrides of the config. Defaults to none.
 
     Returns:
@@ -212,7 +213,7 @@ def label_shard(
     """
     model_args, data_args, _ = _load_args(config_path, overrides)
     _check_args(data_args)
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or str(get_current_device())
 
     dataset = load_from_disk(data_args.tokenized_path)["train"]
     indices = _shard_indices(dataset, shard_index, num_shards)
@@ -241,8 +242,7 @@ def label_shard(
             ]
         )
         del anchor
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        torch_gc()
 
     # The teacher of each original row of the slice, in original order
     teacher_probs: Dict[Tuple[str, int], Optional[List[float]]] = {}
@@ -320,7 +320,7 @@ def run_decision_label(config_path: str, num_gpus: Optional[int] = None, overrid
 
     Args:
         config_path: The tokenization config, with the labeling keys.
-        num_gpus: The number of GPUs to label on. Defaults to all visible GPUs (or the CPU).
+        num_gpus: The number of GPUs to label on. Defaults to all visible GPUs (or one process on MPS or the CPU).
         overrides: key=value overrides of the config. Defaults to none.
 
     Returns:
@@ -338,7 +338,7 @@ def run_decision_label(config_path: str, num_gpus: Optional[int] = None, overrid
         shutil.rmtree(output_path)
 
     num_gpus = num_gpus if num_gpus is not None else max(1, torch.cuda.device_count())
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() and not is_torch_mps_available():
         logger.warning_rank0(
             "No GPUs visible: labeling on the CPU, which is slow for large models. To use GPUs, check "
             "CUDA_VISIBLE_DEVICES."

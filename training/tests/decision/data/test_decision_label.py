@@ -38,8 +38,10 @@ from hmf.data.decision_prompt import StrandsPromptFormat, encode_decision_prompt
 from hmf.data.decision_teachers import (
     StrandsTeacherPrompt,
     TeacherFile,
+    _default_dtype,
     to_augmented_order,
 )
+from hmf.extras.misc import get_current_device
 from hmf.hparams.parser import _parse_train_args
 from hmf.model import load_tokenizer
 from hmf.priming.decision_init import DecisionInitConfig, init_decision_model
@@ -502,6 +504,34 @@ def test_labeling_on_two_gpus(workspace):
                 assert a == pytest.approx(b, abs=2e-2)
         else:
             assert on_gpus[column] == on_cpu[column], column
+
+
+def test_default_dtype():
+    assert _default_dtype("cuda:0") == torch.bfloat16
+    assert _default_dtype("mps:0") == torch.bfloat16
+    assert _default_dtype("cpu") == torch.float32
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS (Apple silicon)")
+@pytest.mark.parametrize("teacher", ["causal_lm", "decision_model"])
+def test_labeling_on_mps_matches_the_cpu(workspace, decision_teacher, teacher):
+    _tokenize(workspace)
+    teacher_model = workspace["model_dir"] if teacher == "causal_lm" else decision_teacher["model_dir"]
+    config_path = _label_config(
+        workspace, decision_anchor_model=workspace["model_dir"], decision_teacher_model=teacher_model
+    )
+
+    assert str(get_current_device()) == "mps:0"  # the default device on a Mac
+    on_mps = merge_shards(config_path, [label_shard(config_path)])
+    on_cpu = merge_shards(config_path, [label_shard(config_path, device="cpu")])
+
+    assert on_mps.column_names == on_cpu.column_names
+    for column in on_cpu.column_names:
+        if column in ("ref_probs", "teacher_probs"):  # bf16 on MPS
+            for a, b in zip(on_mps[column], on_cpu[column]):
+                assert a == pytest.approx(b, abs=2e-2)
+        else:
+            assert on_mps[column] == on_cpu[column], column
 
 
 def test_nothing_to_label(workspace):

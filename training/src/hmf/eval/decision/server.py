@@ -392,7 +392,7 @@ def serve(
             Defaults to False.
         model_name: The name replies give as their model. Defaults to the adapter's folder name, else
             the model's.
-        device: Where to run the model. Defaults to the first GPU if there is one, else the CPU.
+        device: Where to run the model. Defaults to the first GPU, else MPS (Apple silicon), else the CPU.
     """
     if not is_loopback(host):
         raise ValueError(

@@ -94,7 +94,7 @@ Each run is a `results.jsonl` from JevBench, or a CSV with the columns `run`, `t
 | `--prompt_format` | `strands` | the prompt format the model was trained with (`decision_prompt_format`) |
 | `--force_bos` | off | start prompts with the BOS token, if the model was trained with `decision_force_bos: true` |
 | `--model_name` | the adapter's folder name, else the model's | the name the replies give as their model |
-| `--device` | the first GPU, else the CPU | where to run the model |
+| `--device` | the first GPU, else MPS (Apple silicon), else the CPU | where to run the model |
 
 **The protocol.** A request holds a state and one or more named questions; the reply holds one answer per question:
 

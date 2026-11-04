@@ -88,7 +88,7 @@ def _pad(sequences: Sequence[Sequence[int]], seq_len: int, pad_token_id: int) ->
 
 
 def _default_dtype(device: str) -> torch.dtype:
-    return torch.bfloat16 if device.startswith("cuda") else torch.float32
+    return torch.bfloat16 if device.startswith(("cuda", "mps")) else torch.float32
 
 
 @dataclass(frozen=True)
@@ -121,7 +121,7 @@ class CausalLMScorer:
     Args:
         model_name_or_path: The causal LM, with its LM head.
         device: Where to run the model.
-        dtype: The model's dtype. Defaults to bfloat16 on GPU and float32 on CPU.
+        dtype: The model's dtype. Defaults to bfloat16 on GPU or MPS and float32 on CPU.
     """
 
     def __init__(
@@ -416,7 +416,7 @@ class DecisionModelTeacher:
         force_bos: Whether to start prompts with the BOS token (see decision_force_bos). Defaults to
             False.
         max_len: Prompts longer than this many tokens get no teacher. Defaults to None (no limit).
-        dtype: The model's dtype. Defaults to bfloat16 on GPU and float32 on CPU.
+        dtype: The model's dtype. Defaults to bfloat16 on GPU or MPS and float32 on CPU.
     """
 
     def __init__(

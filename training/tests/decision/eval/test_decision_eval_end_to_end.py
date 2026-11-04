@@ -1,7 +1,7 @@
 """
 Tests for calibrating and evaluating a trained decision model end to end (hmf/eval/decision/), with a
-tiny decision model and a LoRA adapter, on the CPU: where the calibration is saved, that the
-predictor applies it, and the evaluation report. The model and the data are conftest.py's.
+tiny decision model and a LoRA adapter, on the CPU (and on MPS where there is one): where the calibration
+is saved, that the predictor applies it, and the evaluation report. The model and the data are conftest.py's.
 """
 
 import json
@@ -9,6 +9,7 @@ import math
 import os
 
 import pytest
+import torch
 
 from hmf.eval.decision.calibrate import calibrate
 from hmf.eval.decision.evaluate import evaluate
@@ -95,6 +96,17 @@ def test_calibration_and_evaluation_use_different_halves(trained):
                       predictor=_predictor(trained))
     assert calibration["split"] == "calib" and report["split"] == "test"
     assert calibration["num_rows"] + report["num_rows"] == 91
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS (Apple silicon)")
+def test_predictor_on_mps_matches_the_cpu(trained):
+    on_mps = DecisionPredictor(trained["model_dir"], trained["adapter_dir"], calibration=None)
+    on_cpu = _predictor(trained, calibration=None)
+    rows = [trained["row"](i) for i in range(8)]
+
+    assert on_mps.device == "mps:0"  # the default device on a Mac
+    for a, b in zip(on_mps.probabilities(rows), on_cpu.probabilities(rows)):
+        assert a == pytest.approx(b, abs=2e-2)  # bf16 on MPS
 
 
 def test_predictor_warns_about_a_calibration_without_a_method(trained, monkeypatch, tmp_path):
