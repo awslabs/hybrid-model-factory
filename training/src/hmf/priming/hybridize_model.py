@@ -18,20 +18,13 @@ import hmf.model.hybrid_zoo.models.model_register  # Registers hybrid models and
 import argparse
 import json
 import os
-from typing import Tuple, Optional
+from typing import Optional
 
 import yaml
 from .hybridize_llama import construct_hybrid_llama
 from .hybridize_ministral3 import construct_hybrid_ministral3
 from .hybridize_qwen import construct_hybrid_qwen
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    PreTrainedModel,
-    PreTrainedTokenizer,
-    PretrainedConfig,
-)
+from transformers import AutoConfig, PretrainedConfig
 
 import torch
 
@@ -44,17 +37,9 @@ from ..model.hybrid_zoo.layers.hybrid_dataclasses import (
     HybridConfig,
 )
 
-from .utils import copy_auxiliary_files, dequantize_fp8_model
+from .model_loading import DTYPE_MAP, load_pretrained_model
+from .utils import copy_auxiliary_files
 
-# Mapping from string dtype names to torch dtypes
-DTYPE_MAP = {
-    "bf16": torch.bfloat16,
-    "bfloat16": torch.bfloat16,
-    "fp16": torch.float16,
-    "float16": torch.float16,
-    "fp32": torch.float32,
-    "float32": torch.float32,
-}
 
 from hmf.model.hybrid_zoo.models.utils import LAYER_TYPE_PATTERNS
 
@@ -168,49 +153,6 @@ def verify_hybrid_config(config: HybridConfig):
 
     if config.output_dir is None:
         raise ValueError("Please provide an output directory for the hybridized model.")
-
-
-def load_pretrained_model(
-    model_name_or_path: str,
-    dtype: torch.dtype = torch.bfloat16,
-) -> Tuple[PreTrainedModel, PreTrainedTokenizer, PretrainedConfig]:
-    """
-    Loads a pre-trained Hugging Face Transformer model along with its config and tokenizer.
-
-    Arguments:
-        model_name_or_path: Path or name of the pre-trained transformer model.
-        dtype: The torch dtype to load the model in. Defaults to bfloat16.
-            This is important for FP8 models - specifying a dtype forces dequantization
-            of FP8 weights to the target precision.
-
-    Returns:
-        model: The loaded Hugging Face model.
-        tokenizer: The tokenizer associated with the model.
-        config: The configuration of the model.
-    """
-    config = AutoConfig.from_pretrained(model_name_or_path)
-
-    # Check if source model uses quantization (e.g., FP8)
-    has_quantization = hasattr(config, "quantization_config") and config.quantization_config is not None
-    if has_quantization:
-        quant_method = getattr(config.quantization_config, "quant_method", "unknown")
-        logger.info(f"Detected quantized model (quant_method={quant_method})")
-        logger.info(f"Will dequantize weights to {dtype}")
-
-    # Load model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path, dtype=dtype, trust_remote_code=True
-    )
-    
-    # Explicitly dequantize FP8 weights if present
-    if has_quantization:
-        model = dequantize_fp8_model(model, dtype)
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name_or_path, trust_remote_code=True
-    )
-
-    return model, tokenizer, config
 
 
 def hybridize_model(hybrid_config: HybridConfig) -> None:

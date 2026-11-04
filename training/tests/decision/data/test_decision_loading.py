@@ -265,7 +265,7 @@ def test_stratified_split():
 
     train, validation = stratified_split(dataset, 0.2, stratify_by="_task", seed=0)
 
-    assert sorted(train["i"] + validation["i"]) == list(range(len(tasks)))
+    assert sorted(list(train["i"]) + list(validation["i"])) == list(range(len(tasks)))
     assert dict(Counter(validation["_task"])) == {"a": 2, "b": 1}  # c has a single row, which goes to train
     again = stratified_split(dataset, 0.2, stratify_by="_task", seed=0)
     assert (train["i"], validation["i"]) == (again[0]["i"], again[1]["i"])

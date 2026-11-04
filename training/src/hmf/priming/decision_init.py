@@ -30,7 +30,7 @@ from hmf.model.hybrid_zoo.models.decision.configuration_decision import Decision
 from hmf.model.hybrid_zoo.models.decision.modeling_decision import DecisionModel
 
 from .hybridize_logger import get_logger
-from .hybridize_model import DTYPE_MAP, load_pretrained_model
+from .model_loading import DTYPE_MAP, load_pretrained_model
 from .utils import copy_auxiliary_files
 
 

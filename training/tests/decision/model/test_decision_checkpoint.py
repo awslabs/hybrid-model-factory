@@ -24,7 +24,7 @@ from transformers import AutoModel, AutoTokenizer
 import hmf.model.hybrid_zoo.models.model_register  # noqa: F401  # Registers hybrid and decision models
 from hmf.model.hybrid_zoo.models.decision.configuration_decision import DecisionConfig
 from hmf.model.hybrid_zoo.models.decision.modeling_decision import MASK_VALUE, DecisionModel
-from hmf.priming.hybridize_model import load_pretrained_model
+from hmf.priming.model_loading import load_pretrained_model
 
 
 DECISION_MODEL = os.getenv("HMF_DECISION_MODEL")
