@@ -469,6 +469,17 @@ class HybridizationArguments:
 class DecisionArguments:
     r"""Arguments pertaining to training decision models (stage `decision`)."""
 
+    decision_backend: Literal["torch", "mlx"] = field(
+        default="torch",
+        metadata={
+            "help": (
+                "The framework that trains the decision model. torch trains it with PyTorch and the Hugging Face "
+                "Trainer, on GPUs or the CPU. mlx trains it with MLX on Apple silicon, for Qwen3 and Qwen3.5 "
+                "backbones, with LoRA or full fine-tuning on a single device (see train/decision/mlx/). Both save "
+                "the same checkpoints."
+            )
+        },
+    )
     decision_head_lr: Optional[float] = field(
         default=None,
         metadata={

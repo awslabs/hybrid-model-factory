@@ -22,7 +22,7 @@ from mlx.utils import tree_flatten
 from .gated_delta import install_training_kernels
 
 
-__all__ = ["DTYPES", "Backbone", "load_backbone", "to_hf_layout"]
+__all__ = ["DTYPES", "Backbone", "load_backbone", "set_gradient_checkpointing", "to_hf_layout"]
 
 DTYPES = {"bfloat16": mx.bfloat16, "float16": mx.float16, "float32": mx.float32}
 # The mlx-lm module that builds each supported text model type
@@ -236,3 +236,43 @@ def to_hf_layout(weights: Dict[str, mx.array], text_model_type: str) -> Dict[str
             value = (value.astype(mx.float32) - 1.0).astype(value.dtype)
         out[key] = value
     return out
+
+
+def _patch_layer_class(cls: type) -> None:
+    """
+    Wraps the __call__ of a decoder layer class so that a layer whose _hmf_checkpoint flag is set recomputes its
+    forward pass in the backward pass (mx.checkpoint) in training mode, rather than keeping its activations. The flag
+    is per layer, so models whose layers do not have it, and layers in evaluation mode, run as before. A class that
+    is already wrapped is left as it is.
+    """
+    if getattr(cls.__call__, "_hmf_checkpointed", False):
+        return
+    call = cls.__call__
+
+    def __call__(self, *args, **kwargs):
+        if not (self.training and getattr(self, "_hmf_checkpoint", False)):
+            return call(self, *args, **kwargs)
+
+        def forward(params, *args, **kwargs):
+            self.update(params)
+            return call(self, *args, **kwargs)
+
+        return mx.checkpoint(forward)(self.trainable_parameters(), *args, **kwargs)
+
+    __call__._hmf_checkpointed = True
+    cls.__call__ = __call__
+
+
+def set_gradient_checkpointing(decoder: nn.Module, on: bool) -> None:
+    """
+    Turns gradient checkpointing on or off for every layer of an mlx-lm decoder. A checkpointed layer keeps only its
+    input for the backward pass and recomputes the rest, which saves memory at the cost of running its forward pass
+    twice. The setting can change from one batch to the next (see decision_checkpoint_min_tokens).
+
+    Args:
+        decoder: mlx-lm's decoder, whose layers are in decoder.layers.
+        on: Whether to checkpoint the layers.
+    """
+    for layer in decoder.layers:
+        _patch_layer_class(type(layer))
+        layer._hmf_checkpoint = on

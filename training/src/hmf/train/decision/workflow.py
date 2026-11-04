@@ -11,6 +11,9 @@ finetuning_type:
 
 With sequence_parallel_size > 1 (zigzag-ring only), each prompt is split across the ranks of a
 sequence parallel group (see DecisionModel and DecisionTrainer).
+
+With decision_backend mlx, the same data is trained with MLX on Apple silicon instead (see
+mlx/train.py), which saves the same checkpoints.
 """
 
 import math
@@ -193,6 +196,12 @@ def run_decision(
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="decision", **tokenizer_module)
     _check_label_set(dataset_module.get("train_dataset"), data_args, finetuning_args)
+    if finetuning_args.decision_backend == "mlx":  # the same data, trained with MLX on Apple silicon
+        from .mlx.train import run_decision_mlx
+
+        run_decision_mlx(dataset_module, tokenizer, model_args, data_args, training_args, finetuning_args)
+        return
+
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
     mark_zero3_leaf_modules(model)  # before the Trainer starts DeepSpeed
     if getattr(model.config, "model_type", None) != "hmf_decision":

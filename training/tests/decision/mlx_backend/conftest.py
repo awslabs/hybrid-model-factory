@@ -44,7 +44,9 @@ def tiny_source(source: str) -> "transformers.PreTrainedModel":
 
 
 def _save_tiny_tokenizer(path) -> None:
-    vocab = {"[UNK]": 0, "[PAD]": PAD_TOKEN_ID, **{f"tok{i}": i + 2 for i in range(30)}}
+    words = ["state", "question", "options", "answer", "true", "false", "refund", "ignore", "escalate", "words"]
+    words += [f"tok{i}" for i in range(30)]
+    vocab = {"[UNK]": 0, "[PAD]": PAD_TOKEN_ID, **{word: i + 2 for i, word in enumerate(words)}}
     tokenizer = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
     PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="[UNK]", pad_token="[PAD]").save_pretrained(path)
