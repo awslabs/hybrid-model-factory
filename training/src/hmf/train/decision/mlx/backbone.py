@@ -22,13 +22,21 @@ from mlx.utils import tree_flatten
 from .gated_delta import install_training_kernels
 
 
-__all__ = ["DTYPES", "Backbone", "load_backbone"]
+__all__ = ["DTYPES", "Backbone", "load_backbone", "to_hf_layout"]
 
 DTYPES = {"bfloat16": mx.bfloat16, "float16": mx.float16, "float32": mx.float32}
 # The mlx-lm module that builds each supported text model type
 MLX_MODULES = {"qwen3": "qwen3", "qwen3_5_text": "qwen3_5"}
 DECISION_MODEL_TYPE = "hmf_decision"
 HEAD_PREFIX = "decision_head."
+# The norms whose weights mlx-lm's Qwen3.5 sanitize shifts by 1 (its norm_keys), which to_hf_layout shifts back
+QWEN3_5_SHIFTED_NORMS = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    "model.norm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+)
 
 
 @dataclass
@@ -201,3 +209,30 @@ def load_backbone(model_path: str, dtype: str = "bfloat16", config: Optional[Dic
     decoder.freeze()
     mx.eval(decoder.parameters(), head_weights)
     return Backbone(decoder=decoder, head_weights=head_weights, config=config)
+
+
+def to_hf_layout(weights: Dict[str, mx.array], text_model_type: str) -> Dict[str, mx.array]:
+    """
+    Undoes what mlx-lm's sanitize does to a backbone's weights, so that they are in the layout transformers loads.
+    Qwen3.5's sanitize moves the axis of the convolution weights and adds 1 to the weights of the norms, which
+    compute with 1 + w, so the inverse moves the axis back and subtracts the 1, in float32. Qwen3's sanitize leaves
+    the backbone's weights as they are.
+
+    Args:
+        weights: The backbone's weights in mlx-lm's layout, by their names in the checkpoint (e.g.
+            "model.layers.0.linear_attn.conv1d.weight").
+        text_model_type: The model_type of the decision model's text_config.
+
+    Returns:
+        The weights in transformers' layout, with the same names.
+    """
+    if text_model_type != "qwen3_5_text":
+        return dict(weights)
+    out = {}
+    for key, value in weights.items():
+        if "conv1d.weight" in key and value.ndim == 3 and value.shape[-1] == 1:
+            value = value.moveaxis(2, 1)
+        elif value.ndim == 1 and any(key.endswith(suffix) for suffix in QWEN3_5_SHIFTED_NORMS):
+            value = (value.astype(mx.float32) - 1.0).astype(value.dtype)
+        out[key] = value
+    return out
