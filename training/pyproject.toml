@@ -81,6 +81,13 @@ dependencies = [
     "sse-starlette",
 ]
 
+[project.optional-dependencies]
+# Training decision models on Apple silicon with MLX (decision_backend: mlx)
+mac = [
+    "mlx>=0.32.0,<0.33.0; sys_platform == 'darwin'",
+    "mlx-lm>=0.31.3,<0.32.0; sys_platform == 'darwin'",
+]
+
 [project.scripts]
 hybridfactory = "hmf.cli:main"
 hmf = "hmf.cli:main"
