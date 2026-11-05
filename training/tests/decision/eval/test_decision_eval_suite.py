@@ -95,7 +95,7 @@ def test_only_calibration(tmp_path, trained):
     saved = Path(trained["adapter_dir"]) / CALIBRATION_FILE
     assert json.loads((reports / "calibration.json").read_text()) == json.loads(saved.read_text())
     assert results["calibration"]["num_rows"] == 91
-    assert "Calibration on 91 rows" in (reports / "summary.md").read_text()
+    assert "Calibration (nll) on 91 rows" in (reports / "summary.md").read_text()  # nll, the default method
 
 
 # JevBench

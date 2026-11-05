@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from hmf.eval.decision.calibrate import (
+    CALIBRATION_METHODS,
     GRID_SIZE,
     ece_at,
     fit_temperature_ece,
@@ -77,3 +78,24 @@ def test_rows_with_different_numbers_of_options():
     labels = [random.randrange(len(lp)) for lp in log_probs]
     temperature = fit_temperature_nll(log_probs, labels)
     assert 0.25 <= temperature <= 6.0
+
+
+@pytest.mark.parametrize("true_temperature", [0.6, 2.0])
+def test_methods_on_yes_no_questions(true_temperature):
+    # On yes/no answers whose right temperature is known, the NLL fit (the default) and the ECE fit on the top
+    # probability recover it, while the Strands Decider fit, which makes the confidence 2p - 1 match accuracy,
+    # returns about half of it, which leaves the probabilities over-confident
+    kinds, labels, log_probs = _synthetic(4000, true_temperature, kind="noul", num_options=2)
+    fitted = {method: fit_temperatures(kinds, labels, log_probs, method=method)[1]["noul"]
+              for method in CALIBRATION_METHODS}
+
+    assert fit_temperatures(kinds, labels, log_probs)[1]["noul"] == fitted["nll"]  # the default
+    assert fitted["nll"] == pytest.approx(true_temperature, rel=0.1)
+    assert fitted["ece_top_probability"] == pytest.approx(true_temperature, rel=0.25)
+    assert fitted["strands_decider"] < 0.75 * true_temperature
+
+
+def test_unknown_method_is_refused():
+    kinds, labels, log_probs = _synthetic(300, 1.0)
+    with pytest.raises(ValueError, match="Unknown calibration method"):
+        fit_temperatures(kinds, labels, log_probs, method="strands")

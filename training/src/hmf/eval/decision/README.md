@@ -2,7 +2,7 @@
 
 This package evaluates decision models trained with `stage: decision`. It calibrates a model, and then measures its accuracy and calibration on a set of benchmarks.
 
-- **The calibration, the split of held-out data, the definition of confidence, and the metrics are defined as in [Strands Decider](https://github.com/strands-labs/strands-decider)'s evaluation,** so that results can be compared with the numbers it publishes.
+- **The split of held-out data, the definition of confidence, and the metrics are defined as in [Strands Decider](https://github.com/strands-labs/strands-decider)'s evaluation,** and so is the calibration with `--method strands_decider`, so that results can be compared with the numbers it publishes. By default, the calibration instead fits the probabilities themselves ([How It Measures](#how-it-measures)).
 - **The benchmarks listed below are built by Strands Decider,** from public datasets and from its own generated data. Any data file in the decision format can be evaluated in the same way.
 - **JevBench is an external benchmark,** which HMF runs against a server for the model.
 
@@ -22,7 +22,7 @@ Strands Decider builds the files with its `training/recipe.sh build fetch multis
 
 The commands take a trained model as two folders, which are the decision model (from `hmf decision-init`) and, for a model trained with LoRA, its adapter (the training `output_dir`, the folder that holds `adapter_config.json`). A model trained with `finetuning_type: full`, or merged with `hmf export`, has no adapter, so only its folder is passed.
 
-**1. Calibrate** on the calibration half of the held-out tasks. This writes `decision_calibration.json` into the adapter's folder.
+**1. Calibrate** on the calibration half of the held-out tasks. This writes `decision_calibration.json` into the adapter's folder. To compare the results with Strands Decider's own, add `--method strands_decider`.
 
 ```bash
 hmf decision-eval calibrate path/to/decision-model --adapter_name_or_path path/to/lora \
@@ -128,8 +128,12 @@ To evaluate on your own data, copy the file and change its sections.
 **Calibration.** A decision model's raw probabilities are usually over- or under-confident. Calibration divides its scores for the options (its logits) by one temperature per question kind (`noul`, `choice`, `score`), fitted on the calibration half of the held-out tasks.
 - **How the temperatures are fitted:**
   - an overall temperature, minimizing the negative log-likelihood (NLL)
-  - then one per kind with at least 200 rows, minimizing the expected calibration error (ECE) over 60 temperatures from 0.25 to 6, evenly spaced in log scale
+  - then one per kind with at least 200 rows, by `--method`:
+    - `nll` (the default) minimizes the NLL, as temperature scaling usually does, so that the probabilities match how often the answers are right
+    - `ece_top_probability` minimizes the expected calibration error (ECE) of the top probability, over 60 temperatures from 0.25 to 6, evenly spaced in log scale
+    - `strands_decider` minimizes the ECE of the confidence (below) over the same temperatures, as Strands Decider does, so that the confidence a server reports matches accuracy. The confidence rescales the top probability for chance, so this calibrates the confidence rather than the probabilities, which differ most for `noul` questions. Use it to compare with Strands Decider's numbers, and `nll` where the probabilities themselves are used
   - a kind with fewer rows uses the overall temperature
+- **The method is saved with the temperatures.** A calibration saved before the method was recorded was fitted the `strands_decider` way, and the predictor notes this when it loads one.
 - **What a temperature changes.** A temperature above 1 makes the model less confident, and one below 1 makes it more confident. It never changes which option is most probable, so accuracy is unchanged.
 - **Where it is saved.** The temperatures are saved in `decision_calibration.json` in the adapter's folder (the training `output_dir`). Several adapters can be trained on one decision model, so the decision model's folder is never written to. A model without an adapter (trained with `finetuning_type: full`, or merged with `hmf export`) gets the file in its own folder.
 
@@ -152,7 +156,7 @@ To evaluate on your own data, copy the file and change its sections.
 | metric | meaning |
 | --- | --- |
 | `accuracy` | fraction of answers whose most probable option is the label |
-| `ece` | expected calibration error of the confidence. The answers are grouped into 10 bins by confidence (0 to 0.1, …, 0.9 to 1), and ECE is the mean, weighted by the number of answers in each bin, of the gap between the bin's accuracy and its mean confidence |
+| `ece` | expected calibration error of the confidence. The answers are grouped into 10 bins by confidence (0 to 0.1, …, 0.9 to 1), and ECE is the mean, weighted by the number of answers in each bin, of the gap between the bin's accuracy and its mean confidence. It is the quantity the `strands_decider` calibration minimizes, so after an `nll` calibration it is higher, while `ece_top_probability` is low |
 | `ece_top_probability` | the same with the top probability as the confidence, as the training logs report it |
 | `nll` | mean negative log-probability of the label |
 | `brier` | mean of Σ_k (p_k − y_k)² |

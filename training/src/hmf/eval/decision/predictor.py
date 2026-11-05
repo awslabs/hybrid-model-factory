@@ -92,6 +92,13 @@ class DecisionPredictor:
                 f"Calibration {calibration}: temperature {self.calibration['temperature']:.4f}, by kind "
                 f"{self.calibration['temperature_by_kind']}."
             )
+            if "method" not in self.calibration:
+                # Saved before calibrate recorded its method, when every kind was fitted as Strands Decider does
+                logger.warning_rank0(
+                    f"Calibration {calibration} was fitted as Strands Decider fits it (strands_decider), which "
+                    "calibrates the confidence rather than the probabilities. To answer with calibrated "
+                    "probabilities, fit it again with hmf decision-eval calibrate (method nll, the default)."
+                )
 
     def temperature(self, kind: str) -> float:
         """The calibrated temperature of a kind, which is its own, else the overall one, else 1 (uncalibrated)."""

@@ -11,7 +11,7 @@ Values on the command line (key=value, e.g. jevbench.max_len=3072) override the 
     adapter_name_or_path: its LoRA adapter (the training output_dir), if any
     output_dir: where the reports go (required)
     max_len, prompt_format, force_bos, ordinal_smoothing, seed, dataset_dir: as for calibrate and evaluate
-    calibration: {dataset or data, split, limit}: fitted first, and used by everything after
+    calibration: {dataset or data, split, limit, method}: fitted first, and used by everything after
     benchmarks: [{name, dataset or data, split, limit}, ...]: each evaluated in turn
     jevbench: {dir, commit, max_len, port, compare: [{name, results, run}, ...]}: JevBench on a server the
         run starts and stops
@@ -185,7 +185,8 @@ def _summary_table(results: Dict[str, Any]) -> str:
     if calibration:
         by_kind = ", ".join(f"{k} {v:.3f}" for k, v in calibration["temperature_by_kind"].items())
         lines += [
-            f"Calibration on {calibration['num_rows']:,} rows: overall temperature {calibration['temperature']:.3f}; "
+            f"Calibration ({calibration.get('method', 'strands_decider')}) on {calibration['num_rows']:,} rows: "
+            f"overall temperature {calibration['temperature']:.3f}; "
             f"by kind {by_kind or 'none'}; ECE {calibration['before']['ece']:.3f} before, "
             f"{calibration['after']['ece']:.3f} after.",
             "",
@@ -257,7 +258,8 @@ def run_suite(path: str, *overrides: str) -> Dict[str, Any]:
         section = suite["calibration"]
         results["calibration"] = calibrate(
             model, calibration_data, adapter, split=section.get("split", "calib"), limit=section.get("limit", 4000),
-            seed=seed, ordinal_smoothing=suite.get("ordinal_smoothing", 0.1), predictor=predictor,
+            seed=seed, ordinal_smoothing=suite.get("ordinal_smoothing", 0.1), method=section.get("method", "nll"),
+            predictor=predictor,
         )
         shutil.copy(saved, os.path.join(output_dir, "calibration.json"))
     # From here on, the model answers at its calibration, either the one just fitted or the one it had

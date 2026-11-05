@@ -102,13 +102,13 @@ M=path/to/decision-model           # step 1
 A=path/to/model-2-adapter          # step 5's output_dir
 D=data/strands-decider
 
-hmf decision-eval calibrate $M --adapter_name_or_path $A --data $D/holdout_v5_norule.jsonl
+hmf decision-eval calibrate $M --adapter_name_or_path $A --data $D/holdout_v5_norule.jsonl --method strands_decider
 hmf decision-eval evaluate $M --adapter_name_or_path $A --data $D/holdout_v5_norule.jsonl --limit 6000
 hmf decision-eval evaluate $M --adapter_name_or_path $A --data $D/multistep_v14_eval.jsonl --split all --limit 0
 hmf decision-eval evaluate $M --adapter_name_or_path $A --data $D/adequacy_hs2_eval.jsonl --split all --limit 0
 ```
 
-The first evaluation uses tasks the model never trained on. Calibration and evaluation use different halves of that file, so the model is never scored on the rows it was calibrated on. [The evaluation guide](../../src/hmf/eval/decision/README.md) explains every number in the reports.
+The first evaluation uses tasks the model never trained on. Calibration and evaluation use different halves of that file, so the model is never scored on the rows it was calibrated on. `--method strands_decider` fits the temperatures as Strands Decider does, so that the numbers compare with its own; without it, the temperatures are fitted by NLL, which gives calibrated probabilities ([the evaluation guide](../../src/hmf/eval/decision/README.md#how-it-measures)). [The evaluation guide](../../src/hmf/eval/decision/README.md) explains every number in the reports.
 
 ### 7. Run JevBench
 

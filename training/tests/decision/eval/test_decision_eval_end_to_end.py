@@ -34,6 +34,7 @@ def test_calibration_is_saved_in_the_adapters_folder(trained):
     assert set(saved["temperature_by_kind"]) == {"noul", "choice", "score"}  # 30 rows each, at least 20
     assert all(0.25 <= t <= 6.0 for t in [saved["temperature"], *saved["temperature_by_kind"].values()])
     assert saved["num_rows"] == 91 and saved["num_skipped"] == 0
+    assert saved["method"] == "nll"  # the default, saved with the temperatures
     # Temperatures never change the answers
     assert saved["before"]["accuracy"] == saved["after"]["accuracy"] == saved["after_overall_temperature"]["accuracy"]
 
@@ -94,3 +95,21 @@ def test_calibration_and_evaluation_use_different_halves(trained):
                       predictor=_predictor(trained))
     assert calibration["split"] == "calib" and report["split"] == "test"
     assert calibration["num_rows"] + report["num_rows"] == 91
+
+
+def test_predictor_warns_about_a_calibration_without_a_method(trained, monkeypatch, tmp_path):
+    # A calibration saved before calibrate recorded its method was fitted the Strands Decider way
+    from hmf.eval.decision import predictor as predictor_module
+
+    warnings = []
+    monkeypatch.setattr(predictor_module.logger, "warning_rank0", warnings.append)
+    old = tmp_path / "old_calibration.json"
+    old.write_text(json.dumps({"temperature": 1.0, "temperature_by_kind": {}}))
+    _predictor(trained, calibration=str(old))
+    assert len(warnings) == 1 and "strands_decider" in warnings[0]
+
+    warnings.clear()
+    new = tmp_path / "new_calibration.json"
+    new.write_text(json.dumps({"method": "nll", "temperature": 1.0, "temperature_by_kind": {}}))
+    _predictor(trained, calibration=str(new))
+    assert warnings == []

@@ -23,6 +23,7 @@ calibration:
   dataset: strands_holdout_v5_norule   # a name in data/dataset_info.json, or `data: path/to/file.jsonl`
   split: calib                         # the half of the file to fit on (calib, test, or all)
   limit: 4000                          # the most rows to use; 0 for all
+  method: strands_decider              # fitted as Strands Decider fits it, so that the results compare with its own
 
 ### Benchmarks, each evaluated in turn ###
 benchmarks:

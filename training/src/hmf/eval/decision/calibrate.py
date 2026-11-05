@@ -4,15 +4,23 @@ model's logits before the softmax, fitted on held-out rows. A temperature above 
 less confident, and one below 1 more confident. It never changes which option is most probable, so
 accuracy is unchanged, but it changes how far the confidence of the answers can be trusted.
 
-The temperatures are fitted in the same way as in Strands Decider (the calibrate command of its
-training/evaluate.py), so that they can be compared with the ones it reports. The fit has three
-steps.
+The fit has three steps.
 
     1. The rows: the calibration half of a data file (see data.py), at most limit of them.
     2. An overall temperature, minimizing the NLL (golden-section search over [0.25, 6]).
-    3. A temperature for each kind with at least MIN_ROWS_PER_KIND rows, minimizing the ECE of the
-       confidence (see metrics.py). The ECE is a step function of the temperature, so the minimum is
-       searched over a grid of GRID_SIZE values, evenly spaced in log scale over [0.25, 6].
+    3. A temperature for each kind with at least MIN_ROWS_PER_KIND rows, by one of three methods:
+       - nll (the default): minimizing the NLL of the labels, as temperature scaling usually does, so
+         that the probabilities match how often the answers are right.
+       - ece_top_probability: minimizing the ECE of the top probability, which also calibrates the
+         probabilities, but depends on how the answers are grouped into bins.
+       - strands_decider: minimizing the ECE of the confidence (see metrics.py), as Strands Decider
+         does (the calibrate command of its training/evaluate.py), so that the confidence a server
+         reports matches accuracy, and the temperatures can be compared with the ones it reports. The
+         confidence is the top probability rescaled for chance, (N p - 1) / (N - 1), which is 2p - 1
+         for a yes/no question, so this calibrates the confidence rather than the probabilities, which
+         differ most when there are few options.
+       The two ECE methods search a grid of GRID_SIZE temperatures, evenly spaced in log scale over
+       [0.25, 6], as the ECE is a step function of the temperature.
 
 The temperatures are saved in decision_calibration.json in the adapter's folder (see
 predictor.py), with the metrics before and after.
@@ -43,6 +51,8 @@ LOW, HIGH = 0.25, 6.0
 NLL_ITERATIONS = 60
 GRID_SIZE = 60
 MIN_ROWS_PER_KIND = 200
+# How a kind's temperature is fitted (see the module's docstring)
+CALIBRATION_METHODS = ("nll", "ece_top_probability", "strands_decider")
 
 
 def _padded(log_probs: Sequence[Sequence[float]]) -> torch.Tensor:
@@ -104,16 +114,32 @@ def fit_temperature_ece(
     return min(temperature_grid(), key=lambda t: ece_at(kinds, labels, log_probs, t, ordinal_smoothing))
 
 
+def ece_top_probability_at(labels: Sequence[int], log_probs: Sequence[Sequence[float]], temperature: float) -> float:
+    """The ECE of the rows' top probability at a temperature."""
+    probs = torch.softmax(_padded(log_probs) / temperature, dim=-1)
+    top, answer = probs.max(dim=-1)
+    correct = (answer == torch.tensor(list(labels))).double()
+    return expected_calibration_error(top.numpy(), correct.numpy(), NUM_ECE_BINS)
+
+
+def fit_temperature_ece_top_probability(labels: Sequence[int], log_probs: Sequence[Sequence[float]]) -> float:
+    """The temperature of the grid minimizing the ECE of the top probability (the first one, if several do)."""
+    return min(temperature_grid(), key=lambda t: ece_top_probability_at(labels, log_probs, t))
+
+
 def fit_temperatures(
     kinds: Sequence[str], labels: Sequence[int], log_probs: Sequence[Sequence[float]],
-    ordinal_smoothing: float = DEFAULT_ORDINAL_SMOOTHING, min_rows: int = MIN_ROWS_PER_KIND,
+    ordinal_smoothing: float = DEFAULT_ORDINAL_SMOOTHING, min_rows: int = MIN_ROWS_PER_KIND, method: str = "nll",
 ) -> Tuple[float, Dict[str, float]]:
     """
-    The overall temperature (by NLL), and one per kind with at least min_rows rows (by ECE).
+    The overall temperature (by NLL), and one per kind with at least min_rows rows, by method (one of
+    CALIBRATION_METHODS, see the module's docstring).
 
     Returns:
         The overall temperature, and the temperature of each kind that has enough rows.
     """
+    if method not in CALIBRATION_METHODS:
+        raise ValueError(f"Unknown calibration method {method!r}; use one of {', '.join(CALIBRATION_METHODS)}.")
     overall = fit_temperature_nll(log_probs, labels)
     by_kind = {}
     for kind in sorted(set(kinds)):
@@ -121,9 +147,14 @@ def fit_temperatures(
         if len(rows) < min_rows:
             logger.info_rank0(f"{kind}: {len(rows)} rows, fewer than {min_rows}: it uses the overall temperature.")
             continue
-        by_kind[kind] = fit_temperature_ece(
-            [kinds[i] for i in rows], [labels[i] for i in rows], [log_probs[i] for i in rows], ordinal_smoothing
-        )
+        kind_labels, kind_log_probs = [labels[i] for i in rows], [log_probs[i] for i in rows]
+        if method == "nll":
+            by_kind[kind] = fit_temperature_nll(kind_log_probs, kind_labels)
+        elif method == "ece_top_probability":
+            by_kind[kind] = fit_temperature_ece_top_probability(kind_labels, kind_log_probs)
+        else:
+            kind_kinds = [kinds[i] for i in rows]
+            by_kind[kind] = fit_temperature_ece(kind_kinds, kind_labels, kind_log_probs, ordinal_smoothing)
     return overall, by_kind
 
 
@@ -137,6 +168,7 @@ def calibrate(
     output: Optional[str] = None,
     ordinal_smoothing: float = DEFAULT_ORDINAL_SMOOTHING,
     min_rows_per_kind: int = MIN_ROWS_PER_KIND,
+    method: str = "nll",
     prompt_format: str = "strands",
     force_bos: bool = False,
     max_len: Optional[int] = 4096,
@@ -160,6 +192,9 @@ def calibrate(
             of score confidence. Defaults to 0.1.
         min_rows_per_kind: The fewest rows a kind needs for a temperature of its own; kinds with fewer
             use the overall temperature. Defaults to 200.
+        method: How each kind's temperature is fitted, "nll", "ece_top_probability", or
+            "strands_decider" (see the module's docstring). Defaults to "nll"; "strands_decider"
+            reproduces Strands Decider's temperatures.
         prompt_format: The prompt format of training (decision_prompt_format). Defaults to "strands".
         force_bos: Whether prompts start with the BOS token (decision_force_bos). Defaults to False.
         max_len: The longest prompt, in tokens; longer rows are skipped. Defaults to 4096.
@@ -169,6 +204,8 @@ def calibrate(
     Returns:
         The calibration, with the temperatures and the metrics before and after.
     """
+    if method not in CALIBRATION_METHODS:
+        raise ValueError(f"Unknown calibration method {method!r}; use one of {', '.join(CALIBRATION_METHODS)}.")
     rows = sample_rows(partition_rows(read_rows(data), split, seed), limit, seed)
     predictor = predictor or DecisionPredictor(
         model_name_or_path, adapter_name_or_path, device=device, prompt_format=prompt_format, force_bos=force_bos,
@@ -183,13 +220,14 @@ def calibrate(
     labels = [int(row["label"]) for row, _ in kept]
     kept_log_probs = [lp for _, lp in kept]
 
-    overall, by_kind = fit_temperatures(kinds, labels, kept_log_probs, ordinal_smoothing, min_rows_per_kind)
+    overall, by_kind = fit_temperatures(kinds, labels, kept_log_probs, ordinal_smoothing, min_rows_per_kind, method)
 
     def overall_metrics(temperature, default=1.0) -> Dict[str, float]:
         preds = predictions(kinds, tasks, labels, kept_log_probs, temperature, ordinal_smoothing, default)
         return summarize(preds, by_task=False)["overall"]
 
     calibration = {
+        "method": method,
         "temperature": overall,
         "temperature_by_kind": by_kind,
         "ordinal_smoothing": ordinal_smoothing,
@@ -211,10 +249,12 @@ def calibrate(
     with open(output, "w", encoding="utf-8") as f:
         json.dump(calibration, f, indent=2)
 
-    print(f"overall temperature {overall:.4f}; by kind " + ", ".join(f"{k}={v:.4f}" for k, v in by_kind.items()))
+    print(f"method {method}; overall temperature {overall:.4f}; by kind "
+          + ", ".join(f"{k}={v:.4f}" for k, v in by_kind.items()))
     for name in ("before", "after_overall_temperature", "after"):
         m = calibration[name]
-        print(f"  {name:<26} n={m['n']:,} accuracy={m['accuracy']:.3f} ece={m['ece']:.3f} nll={m['nll']:.3f}")
+        print(f"  {name:<26} n={m['n']:,} accuracy={m['accuracy']:.3f} ece={m['ece']:.3f} "
+              f"ece_top_probability={m['ece_top_probability']:.3f} nll={m['nll']:.3f}")
     print(f"Saved to {output}")
     return calibration
 
