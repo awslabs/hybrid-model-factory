@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import pyarrow.compute as pc
 import torch
+from accelerate.utils import DistributedType
 from torch.utils.data import DataLoader, Sampler, SequentialSampler
 from transformers import Trainer
 from typing_extensions import override
@@ -436,9 +437,31 @@ class DecisionTrainer(SaveShardMixin, Trainer):
 
     @override
     def training_step(self, model, inputs, *args, **kwargs):
+        """
+        The Trainer's training step, with the loss divided by the number of gradient accumulation steps once.
+        The Trainer divides the loss by the steps of the current group itself (as model_accepts_loss_kwargs is
+        False), which also averages a short last group correctly, and then Accelerate's backward divides it
+        again by gradient_accumulation_steps, unless the run uses DeepSpeed. So without DeepSpeed, the loss is
+        multiplied back just before Accelerate's backward, which leaves the loss the step returns (and logs) as
+        it is.
+        """
         if not self._sp_backbone_checked and self._sequence_parallel_size() > 1:
             self._check_sequence_parallel_backbone(model, self._prepare_inputs(inputs))
-        return super().training_step(model, inputs, *args, **kwargs)
+        accelerator = self.accelerator
+        steps = accelerator.gradient_accumulation_steps
+        if steps == 1 or accelerator.distributed_type == DistributedType.DEEPSPEED:
+            return super().training_step(model, inputs, *args, **kwargs)
+
+        patched = "backward" in vars(accelerator)
+        backward = accelerator.backward
+        accelerator.backward = lambda loss, **backward_kwargs: backward(loss * steps, **backward_kwargs)
+        try:
+            return super().training_step(model, inputs, *args, **kwargs)
+        finally:
+            if patched:
+                accelerator.backward = backward
+            else:
+                del accelerator.backward
 
     @override
     def log(self, logs: Dict[str, float], *args, **kwargs) -> None:

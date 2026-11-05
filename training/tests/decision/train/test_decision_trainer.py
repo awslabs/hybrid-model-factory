@@ -458,3 +458,82 @@ def test_run_decision_end_to_end(monkeypatch, tmp_path, decision_model_dir, deci
     assert {"eval_loss", "eval_accuracy", "eval_nll", "eval_brier", "eval_ece"} <= set(eval_results)
     assert any(key.startswith(("eval_noul_", "eval_choice_", "eval_score_")) for key in eval_results)
     assert all(math.isfinite(value) for key, value in eval_results.items() if key.startswith("eval_"))
+
+
+def _train_with_accumulation(tmp_path, model_dir, lora_target, batch_size, accumulation):
+    """Trains a tiny decision model for an epoch over 28 rows in order, and returns its adapter and logged norms."""
+    from safetensors.torch import load_file
+
+    data_dir = tmp_path / f"data_{batch_size}_{accumulation}"
+    data_dir.mkdir()
+    rows = [  # 3 steps of 8 rows, then one of 4, all of weight 1
+        {
+            "kind": "choice",
+            "state": f"state {' '.join(['words'] * (1 + i % 7))} {i}",
+            "instructions": f"question {i}?",
+            "options": [["refund", "return it"], ["ignore", None], ["escalate", "to a human"]],
+            "label": i % 3,
+            "task": "a",
+        }
+        for i in range(28)
+    ]
+    (data_dir / "toy.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    (data_dir / "dataset_info.json").write_text(
+        json.dumps({"toy_decision": {"file_name": "toy.jsonl", "formatting": "decision"}})
+    )
+    output_dir = tmp_path / f"output_{batch_size}_{accumulation}"
+    run_exp(
+        {
+            "model_name_or_path": model_dir,
+            "stage": "decision",
+            "do_train": True,
+            "finetuning_type": "lora",
+            "lora_target": lora_target,
+            "lora_rank": 4,
+            "lora_dropout": 0.0,
+            "dataset": "toy_decision",
+            "dataset_dir": str(data_dir),
+            "cutoff_len": 512,
+            "decision_num_augmentations": 1,
+            "num_train_epochs": 1,
+            "per_device_train_batch_size": batch_size,
+            "gradient_accumulation_steps": accumulation,
+            "learning_rate": 1e-3,
+            "decision_head_lr": 1e-2,
+            "max_grad_norm": 1.0,
+            "train_sampling_strategy": "sequential",
+            "save_strategy": "no",
+            "logging_steps": 1,
+            "output_dir": str(output_dir),
+            "overwrite_output_dir": True,
+            "overwrite_cache": True,
+            "report_to": "none",
+            "use_cpu": True,
+            "seed": 0,
+        }
+    )
+    with open(output_dir / "trainer_state.json") as f:
+        norms = [entry["grad_norm"] for entry in json.load(f)["log_history"] if "grad_norm" in entry]
+    return load_file(str(output_dir / "adapter_model.safetensors")), norms
+
+
+def test_gradient_accumulation_matches_a_larger_batch(tmp_path, decision_model_dir, lora_targets, device_and_dtype):
+    # Without DeepSpeed, Accelerate's backward divides the loss by gradient_accumulation_steps after the Trainer
+    # has, so DecisionTrainer.training_step undoes the second division. Then 4 rows accumulated twice train as 8
+    # rows at once, including the last step of the epoch, which has a single batch of 4 (the Trainer divides it
+    # by 1, as its group is short).
+    if device_and_dtype[0] != "cpu":
+        pytest.skip("compared in float32 on the CPU")
+    model_dir, target = decision_model_dir("qwen3"), lora_targets["qwen3"]
+    accumulated, accumulated_norms = _train_with_accumulation(tmp_path, model_dir, target, 4, 2)
+    batched, batched_norms = _train_with_accumulation(tmp_path, model_dir, target, 8, 1)
+
+    assert len(accumulated_norms) == len(batched_norms) == 4
+    assert accumulated_norms == pytest.approx(batched_norms, rel=1e-4)
+    assert accumulated.keys() == batched.keys()
+    for name in accumulated:
+        # The k bias of the head shifts every option's logit equally, so its true gradient is 0, and Adam turns
+        # rounding noise in it into steps of different signs from run to run
+        if "decision_head" in name and "k.bias" in name:
+            continue
+        torch.testing.assert_close(accumulated[name], batched[name], atol=1e-5, rtol=1e-4, msg=name)

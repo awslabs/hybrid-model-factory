@@ -201,8 +201,7 @@ def load_model(
 ) -> "PreTrainedModel":
     r"""Load pretrained model."""
     # Monkey patch to enable sequence parallelism (SP)
-    if is_flash_attn_2_available():
-        sequence_parallel_group = apply_sequence_parallel(model_args)
+    sequence_parallel_group = apply_sequence_parallel(model_args) if is_flash_attn_2_available() else None
 
     # Force DeepSpeed to use MiCS_Init whenever 'deepspeed.zero.Init' is called
     if model_args.use_deepspeed_mics:
