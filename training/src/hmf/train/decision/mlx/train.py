@@ -60,6 +60,10 @@ __all__ = ["SCHEDULERS", "check_mlx_arguments", "lr_factor", "run_decision_mlx"]
 
 SCHEDULERS = ("linear", "cosine", "constant", "constant_with_warmup")
 OPTIMIZERS = ("adamw_torch", "adamw_torch_fused", "adamw_hf")
+# MLX keeps freed buffers in a cache for reuse, which by default may grow to the whole memory limit. The batches'
+# shapes change from step to step, so without a smaller limit the cache keeps growing (to 22 GB for the 0.6B model,
+# whose arrays never exceed 6 GB) and can exhaust the Mac's memory.
+CACHE_LIMIT_GB = 2.0
 TRAINER_STATE = "trainer_state.json"
 TRAINABLE_WEIGHTS = "mlx_trainable.safetensors"
 OPTIMIZER_STATE = "mlx_optimizer.safetensors"
@@ -160,8 +164,13 @@ def _interval(value: float, max_steps: int) -> int:
 
 
 def _peak_memory_gb() -> float:
-    get_peak_memory = getattr(mx, "get_peak_memory", None) or mx.metal.get_peak_memory
-    return get_peak_memory() / 2**30
+    """The peak memory of MLX's arrays since the start, which leaves out its cache of freed buffers."""
+    return mx.get_peak_memory() / 2**30
+
+
+def _cache_memory_gb() -> float:
+    """The memory held by MLX's cache of freed buffers (see CACHE_LIMIT_GB)."""
+    return mx.get_cache_memory() / 2**30
 
 
 def _batch_to_mlx(batch: Dict[str, Any]) -> Dict[str, mx.array]:
@@ -251,6 +260,7 @@ class MLXDecisionTrainer:
         self.checkpointing = not model_args.disable_gradient_checkpointing
         self.log_history: List[Dict[str, Any]] = []
         self.global_step = 0
+        mx.set_cache_limit(int(CACHE_LIMIT_GB * 2**30))
         self.tokenizer_config = (
             PreserveTokenizerConfigCallback(model_args.model_name_or_path)
             if model_args.preserve_tokenizer_config
@@ -530,6 +540,7 @@ class MLXDecisionTrainer:
                         "step": self.global_step,
                         "padded_tokens_per_second": round(log_tokens / elapsed, 1),
                         "peak_memory_gb": round(_peak_memory_gb(), 3),
+                        "cache_memory_gb": round(_cache_memory_gb(), 3),
                     }
                     self.log_history.append(entry)
                     logger.info_rank0(str(entry))
