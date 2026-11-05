@@ -19,6 +19,7 @@ each batch is repeated once per rank of the group (see repeat_batches). In evalu
 metrics count only one copy of each row.
 """
 
+import os
 import random
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -46,6 +47,9 @@ logger = logging.get_logger(__name__)
 
 # Inputs of DecisionModel.forward; the other collated columns are targets
 MODEL_INPUTS = ("input_ids", "attention_mask", "opt_idx", "answer_idx")
+
+# The optimizer's state, saved in a run's output_dir (decision_save_optimizer) for a later run to resume from
+OPTIMIZER_STATE_FILE = "decision_optimizer.pt"
 
 # The steps that make a model trainable as a decision model with sequence parallelism, for the error message
 DECISION_CONVERSION_STEPS = [
@@ -349,9 +353,11 @@ class DecisionTrainer(SaveShardMixin, Trainer):
 
         head_lr = self.finetuning_args.decision_head_lr or self.args.learning_rate
         head_decay, head_no_decay, others = [], [], []
+        names = {}
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
+            names[id(param)] = name
             if "decision_head" in name:
                 (head_decay if len(param_shape(param)) > 1 else head_no_decay).append(param)
             else:
@@ -371,7 +377,50 @@ class DecisionTrainer(SaveShardMixin, Trainer):
 
         optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args, self.model)
         self.optimizer = optimizer_cls(groups, **optimizer_kwargs)
+        # The parameters of each group, by name, in the optimizer's order, which its saved state is indexed by
+        self._optimizer_param_names = [[names[id(param)] for param in group["params"]] for group in groups]
+        resume_from = getattr(self.finetuning_args, "decision_resume_optimizer", None)
+        if resume_from:
+            DecisionTrainer._load_optimizer_state(self, resume_from)
         return self.optimizer
+
+    def save_optimizer_state(self, output_dir: str) -> None:
+        """
+        Saves the optimizer's state (see decision_save_optimizer), with the names of the parameters it belongs to,
+        so that a later run can start from it (decision_resume_optimizer). Without DeepSpeed, every process holds
+        the same state, so the main process saves it.
+        """
+        if not self.is_world_process_zero():
+            return
+        state = {"state": self.optimizer.state_dict()["state"], "param_names": self._optimizer_param_names}
+        torch.save(state, os.path.join(output_dir, OPTIMIZER_STATE_FILE))
+        logger.info_rank0(f"Saved the optimizer's state to {os.path.join(output_dir, OPTIMIZER_STATE_FILE)}.")
+
+    def _load_optimizer_state(self, folder: str) -> None:
+        """
+        Loads an earlier run's optimizer state (see decision_resume_optimizer) into this run's optimizer. Only the
+        state of each parameter is loaded, while the learning rates and other settings of each group stay this
+        run's, and the earlier run must have trained the same parameters, in the same order.
+        """
+        path = os.path.join(folder, OPTIMIZER_STATE_FILE)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"decision_resume_optimizer: {path} does not exist (the earlier run needs decision_save_optimizer)."
+            )
+        saved = torch.load(path, map_location="cpu", weights_only=True)
+        if saved["param_names"] != self._optimizer_param_names:
+            mismatch = next(
+                (f"group {g}: {old[:3]} ... ({len(old)} parameters) against {new[:3]} ... ({len(new)})"
+                 for g, (old, new) in enumerate(zip(saved["param_names"], self._optimizer_param_names)) if old != new),
+                f"{len(saved['param_names'])} groups against {len(self._optimizer_param_names)}",
+            )
+            raise ValueError(
+                f"decision_resume_optimizer: the optimizer state in {path} belongs to other parameters than this "
+                f"run trains ({mismatch}). Continue the same adapter (adapter_name_or_path) with the same settings."
+            )
+        current = self.optimizer.state_dict()
+        self.optimizer.load_state_dict({"state": saved["state"], "param_groups": current["param_groups"]})
+        logger.info_rank0(f"Resumed the optimizer's state of {len(saved['state'])} parameters from {path}.")
 
     @override
     def _get_train_sampler(self, *args, **kwargs) -> Optional["torch.utils.data.Sampler"]:

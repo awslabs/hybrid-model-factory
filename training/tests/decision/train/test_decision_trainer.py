@@ -312,11 +312,16 @@ def _workflow_args(**overrides):
     data_args = SimpleNamespace(
         packing=overrides.pop("packing", None), decision_label_folder=overrides.pop("decision_label_folder", None)
     )
-    training_args = SimpleNamespace(do_predict=overrides.pop("do_predict", False), predict_with_generate=False)
+    training_args = SimpleNamespace(
+        do_predict=overrides.pop("do_predict", False), predict_with_generate=False,
+        deepspeed=overrides.pop("deepspeed", None),
+        resume_from_checkpoint=overrides.pop("resume_from_checkpoint", None),
+    )
     finetuning_args = SimpleNamespace(
         hybrid_learnable_params=None, finetuning_type="lora", use_galore=False, use_apollo=False, use_badam=False,
         use_adam_mini=False, use_muon=False, loraplus_lr_ratio=None, decision_anchor_kl_weight=0.0,
-        decision_teacher_kl_weight=0.0, decision_checkpoint_min_tokens=0,
+        decision_teacher_kl_weight=0.0, decision_checkpoint_min_tokens=0, decision_save_optimizer=False,
+        decision_resume_optimizer=None,
     )
     for name, value in overrides.items():
         setattr(finetuning_args, name, value)
@@ -329,6 +334,7 @@ def test_check_arguments_accepts_defaults():
     workflow._check_arguments(*_workflow_args(decision_label_folder="labels_a", decision_teacher_kl_weight=1.0))
     workflow._check_arguments(*_workflow_args(decision_checkpoint_min_tokens=4096))  # with checkpointing on
     workflow._check_arguments(*_workflow_args(sequence_parallel_size=2))  # zigzag-ring
+    workflow._check_arguments(*_workflow_args(decision_save_optimizer=True, decision_resume_optimizer="earlier"))
 
 
 @pytest.mark.parametrize(
@@ -344,6 +350,9 @@ def test_check_arguments_accepts_defaults():
         ({"decision_label_folder": "labels_a", "decision_teacher_kl_weight": -1.0}, "must be at least 0"),
         ({"decision_checkpoint_min_tokens": -1}, "decision_checkpoint_min_tokens must be at least 0"),
         ({"decision_checkpoint_min_tokens": 4096, "disable_gradient_checkpointing": True}, "Remove one of them"),
+        ({"decision_save_optimizer": True, "deepspeed": "ds.json"}, "do not support DeepSpeed"),
+        ({"decision_resume_optimizer": "earlier", "deepspeed": "ds.json"}, "do not support DeepSpeed"),
+        ({"decision_resume_optimizer": "earlier", "resume_from_checkpoint": "ckpt"}, "use one of them"),
     ],
 )
 def test_check_arguments_rejects(overrides, message):
@@ -537,3 +546,148 @@ def test_gradient_accumulation_matches_a_larger_batch(tmp_path, decision_model_d
         if "decision_head" in name and "k.bias" in name:
             continue
         torch.testing.assert_close(accumulated[name], batched[name], atol=1e-5, rtol=1e-4, msg=name)
+
+
+# Resuming the optimizer's state
+
+
+def _choice_rows(start: int, stop: int) -> list:
+    """Choice rows numbered start to stop - 1, all of weight 1, the same whichever run they are in."""
+    return [
+        {
+            "kind": "choice",
+            "state": f"state {' '.join(['words'] * (1 + i % 7))} {i}",
+            "instructions": f"question {i}?",
+            "options": [["refund", "return it"], ["ignore", None], ["escalate", "to a human"]],
+            "label": i % 3,
+            "task": "a",
+        }
+        for i in range(start, stop)
+    ]
+
+
+def _train_on(tmp_path, name, model_dir, lora_target, rows, **overrides):
+    """
+    Trains a tiny decision model for an epoch over rows in order, on the CPU, with the options in a fixed order and
+    a constant learning rate without warmup, and returns its output_dir. With options shuffled, a row's order would
+    depend on its position in its own data file, so the same row would be shown differently in a split run.
+    """
+    data_dir = tmp_path / f"data_{name}"
+    data_dir.mkdir()
+    (data_dir / "toy.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    (data_dir / "dataset_info.json").write_text(
+        json.dumps({"toy_decision": {"file_name": "toy.jsonl", "formatting": "decision"}})
+    )
+    output_dir = tmp_path / f"output_{name}"
+    args = {
+        "model_name_or_path": model_dir,
+        "stage": "decision",
+        "do_train": True,
+        "finetuning_type": "lora",
+        "lora_target": lora_target,
+        "lora_rank": 4,
+        "lora_dropout": 0.0,
+        "dataset": "toy_decision",
+        "dataset_dir": str(data_dir),
+        "cutoff_len": 512,
+        "decision_num_augmentations": 1,
+        "decision_shuffle_options": False,
+        "num_train_epochs": 1,
+        "per_device_train_batch_size": 4,
+        "learning_rate": 1e-3,
+        "decision_head_lr": 1e-2,
+        "lr_scheduler_type": "constant",
+        "warmup_ratio": 0.0,
+        "train_sampling_strategy": "sequential",
+        "save_strategy": "no",
+        "logging_steps": 1,
+        "output_dir": str(output_dir),
+        "overwrite_output_dir": True,
+        "overwrite_cache": True,
+        "report_to": "none",
+        "use_cpu": True,
+        "seed": 0,
+    }
+    args.update(overrides)
+    run_exp(args)
+    return output_dir
+
+
+def _adapter_and_logs(output_dir):
+    from safetensors.torch import load_file
+
+    with open(output_dir / "trainer_state.json") as f:
+        logs = [entry for entry in json.load(f)["log_history"] if "grad_norm" in entry]
+    return load_file(str(output_dir / "adapter_model.safetensors")), logs
+
+
+def _assert_adapters_close(a, b):
+    assert a.keys() == b.keys()
+    for name in a:
+        # The k bias of the head has a true gradient of 0, so Adam turns rounding noise in it into steps of
+        # different signs from run to run (see test_gradient_accumulation_matches_a_larger_batch)
+        if "decision_head" in name and "k.bias" in name:
+            continue
+        torch.testing.assert_close(a[name], b[name], atol=1e-5, rtol=1e-4, msg=name)
+
+
+def test_resumed_optimizer_continues_training_as_one_run(tmp_path, decision_model_dir, lora_targets, device_and_dtype):
+    # Training on 16 rows at once, or on the first 8 and then the last 8, continuing the same adapter from the
+    # saved optimizer state, gives the same adapter and the same logged gradient norms. Without the optimizer
+    # state, the second run starts Adam over, and the adapter ends up elsewhere.
+    if device_and_dtype[0] != "cpu":
+        pytest.skip("compared in float32 on the CPU")
+    model_dir, target = decision_model_dir("qwen3"), lora_targets["qwen3"]
+    whole = _train_on(tmp_path, "whole", model_dir, target, _choice_rows(0, 16))
+    first = _train_on(tmp_path, "first", model_dir, target, _choice_rows(0, 8), decision_save_optimizer=True)
+    resumed = _train_on(tmp_path, "resumed", model_dir, target, _choice_rows(8, 16),
+                        adapter_name_or_path=str(first), decision_resume_optimizer=str(first),
+                        decision_save_optimizer=True)
+    restarted = _train_on(tmp_path, "restarted", model_dir, target, _choice_rows(8, 16),
+                          adapter_name_or_path=str(first))
+
+    # The state is saved only when asked for
+    assert (first / "decision_optimizer.pt").is_file() and (resumed / "decision_optimizer.pt").is_file()
+    assert not (whole / "decision_optimizer.pt").exists() and not (restarted / "decision_optimizer.pt").exists()
+
+    whole_adapter, whole_logs = _adapter_and_logs(whole)
+    resumed_adapter, resumed_logs = _adapter_and_logs(resumed)
+    _, first_logs = _adapter_and_logs(first)
+    _assert_adapters_close(resumed_adapter, whole_adapter)
+    assert len(whole_logs) == 4 and len(first_logs) == len(resumed_logs) == 2
+    assert [e["grad_norm"] for e in first_logs + resumed_logs] == pytest.approx(
+        [e["grad_norm"] for e in whole_logs], rel=1e-4
+    )
+
+    # Restarted with a fresh optimizer, the second half trains the adapter differently
+    restarted_adapter, _ = _adapter_and_logs(restarted)
+    lora = [name for name in whole_adapter if "lora_" in name]
+    assert max((restarted_adapter[n] - whole_adapter[n]).abs().max().item() for n in lora) > 1e-4
+
+
+def test_resumed_optimizer_takes_the_learning_rate_of_the_new_run(tmp_path, decision_model_dir, lora_targets,
+                                                                  device_and_dtype):
+    # Only each parameter's state is resumed, so a run with another learning rate trains at its own
+    if device_and_dtype[0] != "cpu":
+        pytest.skip("trained on the CPU")
+    model_dir, target = decision_model_dir("qwen3"), lora_targets["qwen3"]
+    first = _train_on(tmp_path, "first", model_dir, target, _choice_rows(0, 8), decision_save_optimizer=True)
+    resumed = _train_on(tmp_path, "resumed", model_dir, target, _choice_rows(8, 16), learning_rate=5e-4,
+                        decision_head_lr=5e-3, adapter_name_or_path=str(first), decision_resume_optimizer=str(first))
+    _, logs = _adapter_and_logs(resumed)
+    assert {entry["learning_rate"] for entry in logs} == {5e-4}
+    assert {entry["head_learning_rate"] for entry in logs} == {5e-3}
+
+
+def test_resumed_optimizer_needs_the_same_parameters(tmp_path, decision_model_dir, lora_targets, device_and_dtype):
+    # A state saved for other parameters (here, LoRA on fewer layers) is refused, and so is a folder without one
+    if device_and_dtype[0] != "cpu":
+        pytest.skip("trained on the CPU")
+    model_dir = decision_model_dir("qwen3")
+    fewer = _train_on(tmp_path, "fewer", model_dir, "q_proj,v_proj", _choice_rows(0, 8), decision_save_optimizer=True)
+    with pytest.raises(ValueError, match="belongs to other parameters"):
+        _train_on(tmp_path, "mismatch", model_dir, lora_targets["qwen3"], _choice_rows(8, 16),
+                  decision_resume_optimizer=str(fewer))
+    with pytest.raises(FileNotFoundError, match="decision_save_optimizer"):
+        _train_on(tmp_path, "missing", model_dir, lora_targets["qwen3"], _choice_rows(8, 16),
+                  decision_resume_optimizer=str(tmp_path))

@@ -520,6 +520,29 @@ class DecisionArguments:
             )
         },
     )
+    decision_save_optimizer: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to save the optimizer's state with the final model, as decision_optimizer.pt in output_dir, "
+                "so that a later run that continues the same adapter can start from it (decision_resume_optimizer)."
+            )
+        },
+    )
+    decision_resume_optimizer: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "A folder with the decision_optimizer.pt of an earlier run (decision_save_optimizer), whose optimizer "
+                "state (the running averages and step count of each parameter) this run starts from, instead of a "
+                "fresh optimizer. The run must train the same parameters, in the same order, as when it continues "
+                "the same adapter (adapter_name_or_path), and its learning rates and other optimizer settings come "
+                "from its own config. Unlike resume_from_checkpoint, nothing else is restored, so the run trains on "
+                "its own data from its first row, and with a constant learning rate and no warmup, it continues the "
+                "earlier run as if the two were one."
+            )
+        },
+    )
 
 
 @dataclass

@@ -70,6 +70,17 @@ def _check_arguments(
     if enabled:
         raise ValueError(f"{', '.join(enabled)} is not supported for decision models.")
 
+    keeps_optimizer = finetuning_args.decision_save_optimizer or finetuning_args.decision_resume_optimizer
+    if keeps_optimizer and training_args.deepspeed:
+        raise ValueError(
+            "decision_save_optimizer and decision_resume_optimizer do not support DeepSpeed, which splits the "
+            "optimizer's state across GPUs."
+        )
+    if finetuning_args.decision_resume_optimizer and training_args.resume_from_checkpoint:
+        raise ValueError(
+            "decision_resume_optimizer and resume_from_checkpoint both restore the optimizer's state; use one of them."
+        )
+
     if finetuning_args.decision_checkpoint_min_tokens < 0:
         raise ValueError("decision_checkpoint_min_tokens must be at least 0.")
     if finetuning_args.decision_checkpoint_min_tokens > 0 and model_args.disable_gradient_checkpointing:
@@ -225,6 +236,8 @@ def run_decision(
         _warn_if_augmentations_reused(trainer, training_args, model_args.sequence_parallel_size)
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
         trainer.save_model()
+        if finetuning_args.decision_save_optimizer:
+            trainer.save_optimizer_state(training_args.output_dir)
         trainer.log_metrics("train", train_result.metrics)
         trainer.save_metrics("train", train_result.metrics)
         trainer.save_state()

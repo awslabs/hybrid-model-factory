@@ -343,6 +343,8 @@ The list below explains how these settings differ from Part 1's.
 
 For the first or second way to start training, add `adapter_name_or_path` (and `create_new_adapter: true` for the second) to the training config, and `decision_teacher_adapter` to the tokenization config.
 
+When the first way continues an adapter on new data, the new run starts with a fresh optimizer by default, which resets Adam's running averages. To continue the earlier run's training as if the two were one, save its optimizer state with `decision_save_optimizer: true`, and start the new run from it with `decision_resume_optimizer: path/to/earlier-run` (the earlier run's `output_dir`), together with a constant learning rate and no warmup (`lr_scheduler_type: constant`). Only the state of each parameter is restored, so the new run trains on its own data from its first row, at the learning rates of its own config. Both settings need the same trained parameters in both runs, and do not support DeepSpeed.
+
 ### Choosing the Checkpoint, Calibrating, and Evaluating
 
 Score every checkpoint on the dev set at temperature 1, and keep the one with the best results:
