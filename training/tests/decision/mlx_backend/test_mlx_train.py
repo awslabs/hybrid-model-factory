@@ -24,8 +24,8 @@ from safetensors import safe_open
 from transformers import AutoModel, get_scheduler
 
 from hmf.eval.decision.predictor import DecisionPredictor
-from hmf.train.decision.mlx.backbone import set_gradient_checkpointing
-from hmf.train.decision.mlx.lora import attach_lora, lora_targets, set_trainable
+from hmf.train.decision.mlx.backbone import KeyedDropout, set_gradient_checkpointing
+from hmf.train.decision.mlx.lora import attach_lora, lora_layers, lora_targets, set_trainable
 from hmf.train.decision.mlx.loss import decision_loss
 from hmf.train.decision.mlx.model import load_decision_model
 from hmf.train.decision.mlx.train import SCHEDULERS, lr_factor
@@ -117,9 +117,12 @@ def test_learning_rate_schedule_matches_transformers(scheduler):
 
 @pytest.mark.parametrize("source", ["qwen3", "qwen3_5"])
 def test_gradient_checkpointing_gives_the_same_gradients(decision_model_dir, batch, source):
+    # With LoRA dropout, which mx.checkpoint's rerun of a layer would draw again without the layer call's key
     model = load_decision_model(decision_model_dir(source), dtype="float32")
-    attach_lora(model, lora_targets(model, ["all"]), rank=4, alpha=8)
+    attach_lora(model, lora_targets(model, ["all"]), rank=4, alpha=8, dropout=0.3)
     set_trainable(model, "lora")
+    for _, layer in lora_layers(model):  # adapters that change the answers, so that their dropout matters
+        layer.lora_b = 0.1 * mx.random.normal(layer.lora_b.shape)
     model.train()
     inputs = {name: mx.array(batch[name].numpy()) for name in ("input_ids", "opt_idx", "answer_idx")}
     label_dist = (mx.array(batch["opt_idx"].numpy()) >= 0).astype(mx.float32)
@@ -128,12 +131,45 @@ def test_gradient_checkpointing_gives_the_same_gradients(decision_model_dir, bat
     def loss_fn(model):
         return decision_loss(model(**inputs)[1], targets)[0]
 
-    grads = {}
-    for on in (False, True):
-        set_gradient_checkpointing(model.model, on)
-        grads[on] = dict(tree_flatten(nn.value_and_grad(model, loss_fn)(model)[1]))
-    for path, grad in grads[False].items():
-        np.testing.assert_allclose(np.array(grads[True][path]), np.array(grad), atol=1e-6, err_msg=path)
+    def gradients(checkpointing: bool, seed: int) -> dict:
+        set_gradient_checkpointing(model.model, checkpointing)
+        mx.random.seed(seed)
+        loss, grads = nn.value_and_grad(model, loss_fn)(model)
+        return {"loss": loss, **dict(tree_flatten(grads))}
+
+    plain, checkpointed, other_masks = gradients(False, 0), gradients(True, 0), gradients(False, 1)
+    for path, grad in plain.items():
+        np.testing.assert_allclose(np.array(checkpointed[path]), np.array(grad), atol=1e-6, err_msg=path)
+    assert float(other_masks["loss"]) != pytest.approx(float(plain["loss"]), abs=1e-6)  # dropout is active
+
+
+def test_keyed_dropout_uses_the_forward_masks_in_the_rerun():
+    dropout = KeyedDropout(0.5)
+    weights, inputs = mx.ones((64,)), mx.ones((64,))
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weights = weights
+            self.dropout = dropout
+
+        def __call__(self, x):
+            return self.dropout(x) * self.weights
+
+    class Decoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [Layer()]
+
+    decoder = Decoder()
+    decoder.train()
+    set_gradient_checkpointing(decoder, True)
+    for seed in range(10):
+        mx.random.seed(seed)
+        # With weights of 1, the gradient of the sum of each output with respect to the weights is the output itself
+        out, grad = nn.value_and_grad(decoder, lambda m: m.layers[0](inputs).sum())(decoder)
+        mx.random.seed(seed)
+        np.testing.assert_array_equal(np.array(grad["layers"][0]["weights"]), np.array(decoder.layers[0](inputs)))
 
 
 def _starting_adapter(model_dir: str, adapter_dir) -> None:

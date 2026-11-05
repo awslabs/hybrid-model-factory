@@ -8,6 +8,7 @@ are returned separately (see model.py). Only Qwen3 and Qwen3.5 backbones are sup
 layers mlx-lm does not have, are refused.
 """
 
+import contextvars
 import glob
 import json
 import os
@@ -22,7 +23,7 @@ from mlx.utils import tree_flatten
 from .gated_delta import install_training_kernels
 
 
-__all__ = ["DTYPES", "Backbone", "load_backbone", "set_gradient_checkpointing", "to_hf_layout"]
+__all__ = ["DTYPES", "Backbone", "KeyedDropout", "load_backbone", "set_gradient_checkpointing", "to_hf_layout"]
 
 DTYPES = {"bfloat16": mx.bfloat16, "float16": mx.float16, "float32": mx.float32}
 # The mlx-lm module that builds each supported text model type
@@ -238,26 +239,74 @@ def to_hf_layout(weights: Dict[str, mx.array], text_model_type: str) -> Dict[str
     return out
 
 
+# While a checkpointed layer runs, the random key from which its KeyedDropout layers draw their masks (in a list, so
+# that each draw can replace it with the next key)
+_DROPOUT_KEYS = contextvars.ContextVar("hmf_mlx_dropout_keys", default=None)
+
+
+class KeyedDropout(nn.Module):
+    """
+    Dropout like MLX's nn.Dropout, except that inside a checkpointed layer it draws its masks from the layer call's
+    random key. mx.checkpoint runs a layer's forward pass again in the backward pass, and nn.Dropout would draw new
+    masks there, so the gradients would not be those of the forward pass. With the key, which is an input of the
+    checkpointed call, the rerun draws the same masks. Outside a checkpointed layer, the masks come from MLX's global
+    random state, as nn.Dropout's do.
+
+    Args:
+        p: The probability of zeroing an element.
+    """
+
+    def __init__(self, p: float = 0.5):
+        super().__init__()
+        if not 0 <= p < 1:
+            raise ValueError(f"The dropout probability must be in [0, 1), not {p}.")
+        self._p_1 = 1 - p
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if not self.training or self._p_1 == 1:
+            return x
+        keys, key = _DROPOUT_KEYS.get(), None
+        if keys is not None:
+            keys[0], key = mx.random.split(keys[0])
+        mask = mx.random.bernoulli(self._p_1, x.shape, key=key)
+        return (mask * x) * (1 / self._p_1)
+
+
 def _patch_layer_class(cls: type) -> None:
     """
     Wraps the __call__ of a decoder layer class so that a layer whose _hmf_checkpoint flag is set recomputes its
     forward pass in the backward pass (mx.checkpoint) in training mode, rather than keeping its activations. The flag
-    is per layer, so models whose layers do not have it, and layers in evaluation mode, run as before. A class that
-    is already wrapped is left as it is.
+    is per layer, so models whose layers do not have it, and layers in evaluation mode, run as before. In training
+    mode, each call of a layer that has the flag draws a random key from MLX's global random state, from which the
+    KeyedDropout layers inside draw their masks. A checkpointed call passes the key to the checkpointed function, so
+    the forward pass and its rerun draw the same masks, and the masks do not depend on whether the layer is
+    checkpointed. A class that is already wrapped is left as it is.
     """
     if getattr(cls.__call__, "_hmf_checkpointed", False):
         return
     call = cls.__call__
 
     def __call__(self, *args, **kwargs):
-        if not (self.training and getattr(self, "_hmf_checkpoint", False)):
+        checkpoint = getattr(self, "_hmf_checkpoint", None)
+        if not self.training or checkpoint is None:  # evaluation, or a layer set_gradient_checkpointing never set
             return call(self, *args, **kwargs)
 
-        def forward(params, *args, **kwargs):
+        def forward(key, *args, **kwargs):
+            token = _DROPOUT_KEYS.set([mx.stop_gradient(key)])  # the key gets no gradient
+            try:
+                return call(self, *args, **kwargs)
+            finally:
+                _DROPOUT_KEYS.reset(token)
+
+        key = mx.random.randint(0, 2**31 - 1, (2,)).astype(mx.uint32)  # a random key, as mx.random.key makes
+        if not checkpoint:
+            return forward(key, *args, **kwargs)
+
+        def checkpointed(params, key, *args, **kwargs):
             self.update(params)
-            return call(self, *args, **kwargs)
+            return forward(key, *args, **kwargs)
 
-        return mx.checkpoint(forward)(self.trainable_parameters(), *args, **kwargs)
+        return mx.checkpoint(checkpointed)(self.trainable_parameters(), key, *args, **kwargs)
 
     __call__._hmf_checkpointed = True
     cls.__call__ = __call__

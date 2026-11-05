@@ -18,6 +18,7 @@ import mlx.core as mx
 from mlx import nn
 from mlx.utils import tree_flatten, tree_unflatten
 
+from .backbone import KeyedDropout
 from .model import DecisionModelMLX
 
 
@@ -95,6 +96,7 @@ def attach_lora(
     for path, module in model.model.named_modules():
         if path.rsplit(".", 1)[-1] in wanted and isinstance(module, nn.Linear):
             layer = LoRALinear.from_base(module, r=rank, dropout=dropout, scale=scale)
+            layer.dropout = KeyedDropout(dropout)  # the same masks in checkpointed layers' reruns
             layer.lora_a = layer.lora_a.astype(mx.float32)
             layer.lora_b = layer.lora_b.astype(mx.float32)
             swaps.append((path, layer))
