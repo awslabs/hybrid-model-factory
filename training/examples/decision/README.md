@@ -372,7 +372,7 @@ hmf decision-eval evaluate  $M --adapter_name_or_path $C --data path/to/my-data/
 
 The steps of Part 1 also run on a Mac with Apple silicon, for decision models whose backbone is Qwen3 or Qwen3.5. Training runs in [MLX](https://github.com/ml-explore/mlx), Apple's machine learning framework, through HMF's MLX backend (`decision_backend: mlx` in the training config), and labeling, calibration, evaluation, and serving run in PyTorch on MPS, Apple silicon's GPU backend, which HMF uses by default when there is no CUDA GPU. Both write and read the same files as on GPUs, so a model trained on a Mac can be evaluated or served on a GPU machine, and vice versa. [src/hmf/train/decision/mlx/README.md](../../src/hmf/train/decision/mlx/README.md) explains how the MLX backend works and how it differs from the PyTorch trainer.
 
-A Mac suits fine-tuning a decision model that is already trained (Part 2) best, which takes about an hour with Strands Decider v19 (SD-v19), Strands Decider's published 2B model (see [Fine-tuning Strands Decider's Model](#fine-tuning-strands-deciders-model)). Training a model from a language model with the full recipe of Part 1 also works, but takes a day or more (see [Time and Memory](#time-and-memory)).
+A Mac suits fine-tuning a decision model that is already trained (Part 2) best, which takes about 45 minutes with Strands Decider v19 (SD-v19), as [Fine-tuning Strands Decider's Model](#fine-tuning-strands-deciders-model) shows. Training a model from a language model with the full recipe of Part 1 also works, but takes a day or more (see [Time and Memory](#time-and-memory)).
 
 HMF's own hybrid layers (GKA, B'MOJO, and Mamba2) and its hybrid models need CUDA, so they cannot be trained or run on a Mac.
 
