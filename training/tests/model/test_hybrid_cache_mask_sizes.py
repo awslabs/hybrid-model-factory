@@ -13,6 +13,10 @@ import importlib.util
 import pytest
 import torch
 
+
+# The Qwen3.5 HMF model imports HMF's hybrid layers, which need flash-attn (e.g. not on a Mac)
+pytest.importorskip("flash_attn", reason="HMF's hybrid layers need flash-attn")
+
 from hmf.model.hybrid_zoo.models.cache import HybridCache
 from hmf.model.hybrid_zoo.models.qwen3_5_hmf.configuration_qwen3_5_hmf import Qwen3_5HMFTextConfig
 from hmf.model.hybrid_zoo.models.qwen3_5_hmf.modeling_qwen3_5_hmf import Qwen3_5HMFForCausalLM
