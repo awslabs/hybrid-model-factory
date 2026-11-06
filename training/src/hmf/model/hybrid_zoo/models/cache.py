@@ -305,6 +305,28 @@ class HybridCache(Cache):
         # This includes: GDN, GKA, Mamba2, and B'MOJO
         return self.seqlen_offset
 
+    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> Tuple[int, int]:
+        """
+        Returns the key length and offset that the attention masks of transformers' create_causal_mask
+        cover, which are the tokens already in the attention cache plus the new ones, starting at 0.
+
+        The base Cache reads these sizes from self.layers, which HybridCache leaves empty, so without this
+        override the masks would cover only the new tokens. The padding of the cached tokens would then go
+        unmasked during decoding, and a step of several tokens after a prefill would fall back to SDPA's
+        top-left causal mask. Every attention layer caches the same number of tokens, so the first attention
+        entry gives the cached length. layer_idx is not used, because the layer that create_causal_mask asks
+        about may be a GDN or other non-attention layer.
+        """
+        return self._cached_attention_length() + cache_position.shape[0], 0
+
+    def _cached_attention_length(self) -> int:
+        """Returns the number of tokens in the attention key and value cache, 0 before the first update."""
+        for entry in self._attention_memory_dict.values():
+            keys = entry.get("keys") if isinstance(entry, dict) else None
+            if isinstance(keys, torch.Tensor):
+                return keys.shape[-2]
+        return 0
+
     def get_max_length(self) -> int:
         """Get maximum allowed sequence length"""
         return self.config.max_position_embeddings
