@@ -1,0 +1,59 @@
+# Fine-tune Strands Decider v19 (SD-v19, strands-decider-2B-hobson-v19 on the Hugging Face Hub, built on Qwen3.5-2B) on
+# a Mac (MLX), with a new LoRA adapter on the merged model, on rows of massive_intent, a task SD-v19 never trained on.
+# This is an illustrative example of Part 2 of examples/decision/README.md, which finetune_mac.sh runs end to end, and
+# not a recipe for a better general model.
+# 1. python scripts/strands_to_hmf_decision.py --checkpoint StrandsAgents/strands-decider-2B-hobson-v19 \
+#        --output_dir models/strands-v19-merged --merge
+# 2. hmf preprocess examples/decision/tokenization/strands_v19_finetune/massive_intent.yaml --shard_size 20000 --parallel_jobs 8
+# 3. hmf train examples/decision/train/strands_v19_finetune/lora_massive_intent_mac.yaml
+# Needs HMF's mac extra (pip install -e ".[mac]"), which installs MLX and mlx-lm.
+### Model ###
+model_name_or_path: ./models/strands-v19-merged
+
+### Decision training ###
+stage: decision
+do_train: true
+finetuning_type: lora
+decision_backend: mlx                # MLX on Apple silicon (see train/decision/mlx/)
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+# Attention and MLP projections, plus Gated DeltaNet's, as in SD-v19's own training
+lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj
+# The pointer head, already trained, trains in full alongside the adapter
+
+### Dataset ###
+dataset_dir: ./data/decision/massive_intent
+dataset: massive_intent_train
+tokenized_path: ./data/tokenized/decision/strands_v19_finetune/massive_intent
+cutoff_len: 4096
+train_sampling_strategy: group_by_length   # Batch prompts of similar length together (less padding)
+decision_pad_to_multiple_of: null    # MLX gains nothing from fixed batch lengths (no padding is 26% faster than 256)
+
+### Training ###
+num_train_epochs: 2.0                # One epoch per augmentation (decision_num_augmentations when tokenizing)
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 2       # 8 rows per step, so that a few thousand rows give a few hundred steps
+learning_rate: 1.0e-4                # LoRA adapters
+decision_head_lr: 1.0e-4             # The head is already trained, so it needs no larger step than the adapter
+weight_decay: 0.01                   # Applies to the head's matrices only
+lr_scheduler_type: constant_with_warmup
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+adam_beta2: 0.95
+seed: 0
+
+### Precision & Performance ###
+bf16: true                           # The pointer head always computes in float32
+# Gradient checkpointing only for batches of more than 1,024 padded tokens (rows times length). The 2B then peaked at
+# 16 GB on the v19 data, while a limit of 2,048 went over 20 GB.
+decision_checkpoint_min_tokens: 1024
+
+### Output & Logging ###
+output_dir: ./models/strands-v19-merged/LoRA-massive-intent-mac
+eval_strategy: "no"                  # No validation split; the test rows are evaluated after training
+save_strategy: epoch                 # One checkpoint per epoch
+logging_steps: 10
+plot_loss: true
+overwrite_output_dir: false
+report_to: none

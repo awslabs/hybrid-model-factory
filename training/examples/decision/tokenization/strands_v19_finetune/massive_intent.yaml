@@ -1,0 +1,28 @@
+# Tokenize rows of massive_intent, a task that Strands Decider v19 (SD-v19, strands-decider-2B-hobson-v19 on the
+# Hugging Face Hub) never trained on, to fine-tune SD-v19 on them
+# (an illustrative example of Part 2 of examples/decision/README.md, which finetune_mac.sh runs on a Mac)
+# hmf preprocess examples/decision/tokenization/strands_v19_finetune/massive_intent.yaml --shard_size 20000 --parallel_jobs 8
+# The settings that must match SD-v19's are the ones scripts/strands_to_hmf_decision.py prints when it converts it
+# (decision_prompt_format, cutoff_len, decision_force_bos, and decision_ordinal_smoothing).
+model_name_or_path: ./models/strands-v19-merged   # SD-v19, converted and merged; only its tokenizer is loaded
+stage: decision
+dataset_dir: ./data/decision/massive_intent       # written by finetune_mac.sh, with train.jsonl, calib.jsonl, and test.jsonl
+dataset: massive_intent_train
+tokenized_path: ./data/tokenized/decision/strands_v19_finetune/massive_intent
+cutoff_len: 4096                     # Longer prompts are dropped
+val_size: 0.0                        # The calibration and test rows are separate files
+seed: 0                              # Augmentations
+mix_strategy: concat
+preprocessing_num_workers: 8
+preprocessing_batch_size: 1000
+packing: false
+streaming: false
+
+### Decision prompts ###
+decision_prompt_format: strands
+decision_num_augmentations: 2        # One augmented copy of each row (option order, phrasing) per training epoch
+decision_shuffle_options: true       # noul and choice options
+decision_reverse_score_prob: 0.5     # score rubrics are reversed instead of shuffled
+decision_vary_instructions: true     # Sample among each row's phrasings of the question
+decision_ordinal_smoothing: 0.1      # score targets put this much mass on neighboring levels
+decision_force_bos: false            # Prepend BOS if the tokenizer does not add it

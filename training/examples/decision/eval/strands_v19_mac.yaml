@@ -1,0 +1,32 @@
+# The evaluation suite of strands_v19.yaml without JevBench, for a Mac, where the model runs with PyTorch on MPS.
+# It fits the calibration on the held-out tasks and then evaluates each benchmark. To run JevBench too, use
+# strands_v19.yaml, which also needs a JevBench checkout.
+#
+#   hmf decision-eval run examples/decision/eval/strands_v19_mac.yaml \
+#       model_name_or_path=path/to/decision-model adapter_name_or_path=path/to/lora output_dir=reports/my-model
+#
+# The data files are built by Strands Decider (see examples/decision/README.md, "Before You Start").
+### The model ###
+model_name_or_path: null     # the decision model (from hmf decision-init)
+adapter_name_or_path: null   # its LoRA adapter (the training output_dir); null for a merged or fully trained model
+output_dir: null             # where the reports go
+max_len: 4096                # the most tokens a prompt may have. Benchmark rows that are longer are left out of the
+                             # scores (the reports count them).
+prompt_format: strands       # as in training (decision_prompt_format)
+force_bos: false             # as in training (decision_force_bos)
+
+### Calibration, fitted first, saved in the adapter's folder, and used by everything below ###
+calibration:
+  dataset: strands_holdout_v5_norule   # a name in data/dataset_info.json, or `data: path/to/file.jsonl`
+  split: calib                         # the half of the file to fit on (calib, test, or all)
+  limit: 4000                          # the most rows to use; 0 for all
+  method: strands_decider              # fitted as Strands Decider fits it, so that the results compare with its own
+
+### Benchmarks, each evaluated in turn ###
+benchmarks:
+  - {name: heldout, dataset: strands_holdout_v5_norule, split: test, limit: 6000}    # tasks never trained on
+  - {name: multistep, dataset: strands_multistep_v14_eval, split: all, limit: 0}     # ContractNLI, MuSiQue, BoardgameQA, HotpotQA
+  - {name: generated_v16, dataset: strands_generated_v16_eval, split: all, limit: 0}
+  - {name: generated_v18, dataset: strands_generated_v18_eval, split: all, limit: 0}
+  - {name: helpsteer2, dataset: strands_adequacy_hs2_eval, split: all, limit: 0}     # does a response answer the request
+  - {name: adequacy_gen, dataset: strands_adequacy_gen_eval, split: all, limit: 0}
