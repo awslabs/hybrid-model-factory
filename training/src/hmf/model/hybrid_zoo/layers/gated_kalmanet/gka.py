@@ -59,6 +59,7 @@ from fla.ops.simple_gla import chunk_simple_gla
 
 from ..sp_p2p_utils import reorder_for_ssm_p2p
 from ..low_rank_linear import LinearLowRank
+from ..mask_utils import padding_mask_for_new_tokens
 from .ops.chebyshev.chunk_dk_backward_gating_sp import compute_kk_final_with_gating
 from .sequence_parallel.gka_sp_utils import (
     state_passing_gka_p2p,
@@ -376,8 +377,9 @@ class GatedKalmaNet(nn.Module):
                 - attention_weights: None (not computed for GKA)
                 - past_key_values: Updated cache (same as input if provided, else None)
         """
-        # During inference, if attention_mask is not None, throw an error
-        if attention_mask is not None and not self.training:
+        # The kernels cannot skip padding, so inference fails if any new token is padding. A mask without padding
+        # among the new tokens, such as the 4D mask SDPA builds for a step after a prefill, is ignored.
+        if not self.training and padding_mask_for_new_tokens(attention_mask, hidden_states.shape[1]) is not None:
             raise NotImplementedError(
                 "GKA kernels currently do not support varlen inputs."
             )
@@ -628,6 +630,14 @@ class GatedKalmaNet(nn.Module):
                     # h_kk: [B_sp, H, D, D]
                     # h_kv: [B_sp, H, D, D]
         else:
+            # The decoding kernel computes one token per call (it reads only the first token and leaves the rest of
+            # its output uninitialized), so a step of several tokens on top of a cached state cannot be served.
+            if q_len > 1:
+                raise NotImplementedError(
+                    f"GKA decodes one token at a time from a cache, but got {q_len} new tokens on top of a "
+                    "cached state. Process the tokens one by one, or run them with the earlier context in a "
+                    "single forward without a cache."
+                )
             with torch.cuda.device(q.device):
                 o, h_kk, h_kv = torch_decoding_one_step(
                     q=q.squeeze(0),

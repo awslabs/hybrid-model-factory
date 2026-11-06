@@ -47,6 +47,7 @@ from fla.ops.gated_delta_rule import (
 )
 
 from ..low_rank_linear import LinearLowRank
+from ..mask_utils import padding_mask_for_new_tokens
 from hmf.model.model_utils.allgather_sp_helper import (
     ZigZagGatherScatter,
     ZigZagScatter,
@@ -344,6 +345,10 @@ class GatedDeltaNet(nn.Module):
                 - None: Placeholder for consistency with attention layers
                 - past_key_values: Updated cache (same as input if provided, else None)
         """
+        # Under SDPA and eager, models pass the 4D attention mask, so keep only which new tokens are padding.
+        # A 2D mask (flash attention) is used as it is.
+        if attention_mask is not None and attention_mask.dim() == 4:
+            attention_mask = padding_mask_for_new_tokens(attention_mask, hidden_states.shape[1])
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (
                 "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
