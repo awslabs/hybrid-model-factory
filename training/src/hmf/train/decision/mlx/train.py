@@ -3,19 +3,19 @@ Trains decision models with MLX on Apple silicon (decision_backend: mlx), from t
 sets as the PyTorch DecisionTrainer, and saves the same checkpoints, so that labeling, evaluation, and serving (which
 run in PyTorch) use them unchanged.
 
-The data path is the PyTorch one up to the batches. The datasets come from get_dataset with the label set joined, the
-rows are ordered by DecisionAugmentationSampler (one augmentation per epoch), and DecisionDataCollator pads them, so
-that the two backends see the same batches. The rest follows what the Hugging Face Trainer does for DecisionTrainer.
+It reads the same batches as the PyTorch trainer, since get_dataset loads the datasets with the label set joined,
+DecisionAugmentationSampler orders the rows (one augmentation per epoch), and DecisionDataCollator pads them. From
+there, it does what the Hugging Face Trainer does for DecisionTrainer.
 
-    - The optimizer is AdamW with PyTorch's bias correction, in DecisionTrainer's three groups, which are the head's
+    - Optimizes with AdamW, with PyTorch's bias correction, in DecisionTrainer's three groups, which are the head's
       matrices at decision_head_lr with weight_decay, the head's other parameters at the same rate without weight
       decay, and the other trainable parameters at learning_rate without weight decay.
-    - The learning rate follows lr_scheduler_type (linear, cosine, constant, or constant_with_warmup) with the
-      Trainer's warmup, and gradients are clipped to max_grad_norm by their global norm.
-    - Each optimizer step averages the gradients of gradient_accumulation_steps batches of
-      per_device_train_batch_size rows. The last step of an epoch averages over the batches that are left.
-    - Training logs, evaluations, checkpoints, resuming, and the files of the output folder (trainer_state.json,
-      train_results.json, eval_results.json, and all_results.json) follow the Trainer's.
+    - Follows lr_scheduler_type (linear, cosine, constant, or constant_with_warmup) with the Trainer's warmup, and
+      clips the gradients to max_grad_norm by their global norm.
+    - Averages each optimizer step's gradients over gradient_accumulation_steps batches of
+      per_device_train_batch_size rows, and the last step of an epoch over the batches that are left.
+    - Logs, evaluates, saves checkpoints, resumes, and writes the files of the output folder (trainer_state.json,
+      train_results.json, eval_results.json, and all_results.json) as the Trainer does.
 
 Training runs in one process on one device. The backbone runs in bfloat16 with bf16, in float16 with fp16, and in
 float32 otherwise, and the trainable parameters are kept in float32.
@@ -72,7 +72,7 @@ MODEL_INPUTS = ("input_ids", "opt_idx", "answer_idx")
 
 
 def _value(option) -> str:
-    """The value of an option that may be an enum (e.g. transformers' IntervalStrategy)."""
+    """The value of an option that may be an enum (e.g., transformers' IntervalStrategy)."""
     return getattr(option, "value", option)
 
 

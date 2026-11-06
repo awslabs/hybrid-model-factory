@@ -9,7 +9,7 @@ This module provides functionality for:
 import importlib
 
 
-# Imported when first used, so that importing one priming module (e.g. decision_init on a Mac)
+# Imported when first used, so that importing one priming module (e.g., decision_init on a Mac)
 # does not import the hybrid priming code and its CUDA-only kernels
 _EXPORTS = {
     "hybridize_model": ".hybridize_model",

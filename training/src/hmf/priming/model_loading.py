@@ -44,7 +44,7 @@ def load_pretrained_model(
     Arguments:
         model_name_or_path: Path or name of the pre-trained transformer model.
         dtype: The torch dtype to load the model in. Defaults to bfloat16.
-            This is important for FP8 models - specifying a dtype forces dequantization
+            This is important for FP8 models--specifying a dtype forces dequantization
             of FP8 weights to the target precision.
 
     Returns:

@@ -1,14 +1,16 @@
 """
 Saves and loads the checkpoints of decision models trained in MLX, in the formats HMF's PyTorch code reads, so that
-labeling, evaluation, and serving (which run in PyTorch) use them unchanged.
+labeling, evaluation, and serving (which run in PyTorch) use them unchanged. A training run saves one of two formats,
+depending on its finetuning_type, which are the same as the PyTorch DecisionTrainer saves for that type.
 
-    - LoRA: a PEFT adapter, with adapter_config.json, written by PEFT's own LoraConfig, and adapter_model.safetensors.
-      The keys are PEFT's, base_model.model.<path>.lora_A.weight and .lora_B.weight for each adapted layer and
-      base_model.model.decision_head.<name> for the pointer head, which PEFT saves with the adapter
-      (modules_to_save). mlx-lm holds A as [in_features, rank] and B as [rank, out_features], while PEFT holds the
-      transposes, A as [rank, in_features] and B as [out_features, rank].
-    - Full fine-tuning: a decision model (an hmf_decision checkpoint), with config.json and model.safetensors, which
-      holds the backbone's weights under `model.`, in transformers' layout, and the head's under `decision_head.`.
+    - With LoRA, it saves a PEFT adapter, with adapter_config.json, written by PEFT's own LoraConfig, and
+      adapter_model.safetensors, whose keys are PEFT's, base_model.model.<path>.lora_A.weight and .lora_B.weight for
+      each adapted layer and base_model.model.decision_head.<name> for the pointer head, which PEFT saves with the
+      adapter (modules_to_save). mlx-lm holds A as [in_features, rank] and B as [rank, out_features], while PEFT
+      holds the transposes, A as [rank, in_features] and B as [out_features, rank].
+    - With full fine-tuning, it saves a decision model (an hmf_decision checkpoint), with config.json and
+      model.safetensors, which holds the backbone's weights under `model.`, in transformers' layout, and the head's
+      under `decision_head.`.
 
 load_adapter reads PEFT adapters, whether saved by MLX or by PyTorch.
 """
@@ -145,8 +147,9 @@ def save_full_model(
     """
     Saves a fully fine-tuned decision model as a decision model (an hmf_decision checkpoint). The trained parameters
     are saved from the model, the backbone's in dtype and the head's in float32. The frozen parameters are copied
-    from the source checkpoint unchanged, because the model holds some of them only in a rounded form (in bfloat16,
-    Qwen3.5's norms hold 1 + w, from which w cannot be recovered exactly).
+    from the source checkpoint unchanged, because the model holds some of them only in a rounded form. For example,
+    the weight w of a Qwen3.5 norm, which scales its input by 1 + w, is stored in the checkpoint as w, but mlx-lm
+    holds the sum 1 + w, from which w cannot be recovered exactly in bfloat16.
 
     Args:
         model: The decision model, without LoRA adapters (merge them first, see lora.merge_lora).

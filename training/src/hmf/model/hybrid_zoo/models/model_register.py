@@ -7,7 +7,7 @@ and similar methods.
 Registration happens automatically when this module is imported. Models are registered
 only once to avoid duplicate registration warnings.
 
-Without the CUDA-only libraries that the hybrid layers use (e.g. on a Mac), a model family whose
+Without the CUDA-only libraries that the hybrid layers use (e.g., on a Mac), a model family whose
 layers need them is registered with stand-in classes, which raise a clear error when such a model
 is loaded. Every other model, decision models on transformers backbones included, still loads.
 """
@@ -107,18 +107,22 @@ def _unavailable_model(name: str, reason: str) -> type:
     return type(
         name,
         (),
-        {"from_pretrained": classmethod(unavailable), "_from_config": classmethod(unavailable), "__init__": unavailable},
+        {
+            "from_pretrained": classmethod(unavailable),
+            "_from_config": classmethod(unavailable),
+            "__init__": unavailable,
+        },
     )
 
 
 def _import_models(module: str, names: List[str], config_class: Type[PretrainedConfig]) -> List[type]:
     """
     The model classes names from module (relative to this package). If module cannot be imported
-    because a CUDA-only library is missing (e.g. on a Mac), stand-ins that raise a clear error when
+    because a CUDA-only library is missing (e.g., on a Mac), stand-ins that raise a clear error when
     used are returned instead, so that every other model still registers and loads.
 
     Args:
-        module: The modeling module, relative to this package (e.g. ".hybrid_qwen3.modeling_hybrid_qwen3").
+        module: The modeling module, relative to this package (e.g., ".hybrid_qwen3.modeling_hybrid_qwen3").
         names: The names of the model classes to import from it.
         config_class: The configuration class of the models.
 
@@ -154,7 +158,12 @@ def register_hybrid_models():
         HybridQwen2Config,
         _import_models(
             ".hybrid_qwen2.modeling_hybrid_qwen2",
-            ["HybridQwen2ForCausalLM", "HybridQwen2ForSequenceClassification", "HybridQwen2ForTokenClassification", "HybridQwen2Model"],
+            [
+                "HybridQwen2ForCausalLM",
+                "HybridQwen2ForSequenceClassification",
+                "HybridQwen2ForTokenClassification",
+                "HybridQwen2Model",
+            ],
             HybridQwen2Config,
         ),
     )
@@ -165,7 +174,12 @@ def register_hybrid_models():
         HybridQwen3Config,
         _import_models(
             ".hybrid_qwen3.modeling_hybrid_qwen3",
-            ["HybridQwen3ForCausalLM", "HybridQwen3ForSequenceClassification", "HybridQwen3ForTokenClassification", "HybridQwen3Model"],
+            [
+                "HybridQwen3ForCausalLM",
+                "HybridQwen3ForSequenceClassification",
+                "HybridQwen3ForTokenClassification",
+                "HybridQwen3Model",
+            ],
             HybridQwen3Config,
         ),
     )
@@ -176,7 +190,12 @@ def register_hybrid_models():
         HybridQwen3MoeConfig,
         _import_models(
             ".hybrid_qwen3_moe.modeling_hybrid_qwen3_moe",
-            ["HybridQwen3MoeForCausalLM", "HybridQwen3MoeForSequenceClassification", "HybridQwen3MoeForTokenClassification", "HybridQwen3MoeModel"],
+            [
+                "HybridQwen3MoeForCausalLM",
+                "HybridQwen3MoeForSequenceClassification",
+                "HybridQwen3MoeForTokenClassification",
+                "HybridQwen3MoeModel",
+            ],
             HybridQwen3MoeConfig,
         ),
     )
@@ -187,7 +206,13 @@ def register_hybrid_models():
         HybridLlamaConfig,
         _import_models(
             ".hybrid_llama.modeling_hybrid_llama",
-            ["HybridLlamaForCausalLM", "HybridLlamaForQuestionAnswering", "HybridLlamaForSequenceClassification", "HybridLlamaForTokenClassification", "HybridLlamaModel"],
+            [
+                "HybridLlamaForCausalLM",
+                "HybridLlamaForQuestionAnswering",
+                "HybridLlamaForSequenceClassification",
+                "HybridLlamaForTokenClassification",
+                "HybridLlamaModel",
+            ],
             HybridLlamaConfig,
         ),
     )
@@ -198,7 +223,13 @@ def register_hybrid_models():
         HybridMinistral3Config,
         _import_models(
             ".hybrid_ministral3.modeling_hybrid_ministral3",
-            ["HybridMinistral3ForCausalLM", "HybridMinistral3ForQuestionAnswering", "HybridMinistral3ForSequenceClassification", "HybridMinistral3ForTokenClassification", "HybridMinistral3Model"],
+            [
+                "HybridMinistral3ForCausalLM",
+                "HybridMinistral3ForQuestionAnswering",
+                "HybridMinistral3ForSequenceClassification",
+                "HybridMinistral3ForTokenClassification",
+                "HybridMinistral3Model",
+            ],
             HybridMinistral3Config,
         ),
     )
@@ -215,7 +246,12 @@ def register_hybrid_models():
         Qwen3_5MoeHMFTextModel,
     ) = _import_models(
         ".qwen3_5_moe_hmf.modeling_qwen3_5_moe_hmf",
-        ["Qwen3_5MoeHMFForCausalLM", "Qwen3_5MoeHMFForConditionalGeneration", "Qwen3_5MoeHMFModel", "Qwen3_5MoeHMFTextModel"],
+        [
+            "Qwen3_5MoeHMFForCausalLM",
+            "Qwen3_5MoeHMFForConditionalGeneration",
+            "Qwen3_5MoeHMFModel",
+            "Qwen3_5MoeHMFTextModel",
+        ],
         Qwen3_5MoeHMFConfig,
     )
     AutoConfig.register(Qwen3_5MoeHMFTextConfig.model_type, Qwen3_5MoeHMFTextConfig)

@@ -316,7 +316,7 @@ def install_training_kernels(model: nn.Module) -> int:
     passed here. Calling it again on the same model changes nothing.
 
     Args:
-        model: An mlx-lm model, e.g. a Qwen3.5 text model.
+        model: An mlx-lm model, e.g., a Qwen3.5 text model.
 
     Returns:
         The number of layers that now train with the chunked rule.

@@ -48,7 +48,7 @@ class Backbone:
     Args:
         decoder: mlx-lm's decoder, which maps token ids of shape [batch, seq_len] to the final normalized hidden
             states of shape [batch, seq_len, hidden_size].
-        head_weights: The pointer head's weights, by name within the head (e.g. "q.weight"), in float32.
+        head_weights: The pointer head's weights, by name within the head (e.g., "q.weight"), in float32.
         config: The decision model's configuration (config.json).
     """
 
@@ -98,10 +98,10 @@ def _rope_settings(text_config: Dict[str, Any]) -> Dict[str, Any]:
 def _exact_norm_shift(module: Any) -> Iterator[None]:
     """
     Upcasts the 1-D weights to float32 before the sanitize methods of an mlx-lm module run, for as long as the
-    context lasts. Qwen3.5's norms store w and compute with 1 + w, which mlx-lm's sanitize adds to the stored
-    tensor. In bfloat16, that sum would be rounded (about 2e-3 relative error per norm), while transformers computes
-    it in float32, so the 1-D weights (norms, biases, and gates, never matrices) are upcast first and rounded once
-    afterwards, when the backbone is cast to its dtype.
+    context lasts. A Qwen3.5 norm scales its input by 1 + w, where w is the weight that the checkpoint stores, and
+    mlx-lm's sanitize replaces w by the sum 1 + w. In bfloat16, that sum would be rounded (about 2e-3 relative error
+    per norm), while transformers computes it in float32, so the 1-D weights (norms, biases, and gates, never
+    matrices) are upcast first and rounded once afterwards, when the backbone is cast to its dtype.
     """
     classes = [cls for cls in vars(module).values() if isinstance(cls, type) and "sanitize" in vars(cls)]
     originals = {cls: cls.sanitize for cls in classes}
@@ -138,9 +138,9 @@ def _load_weights(model_path: str) -> Dict[str, mx.array]:
 def load_backbone(model_path: str, dtype: str = "bfloat16", config: Optional[Dict[str, Any]] = None) -> Backbone:
     """
     Loads a decision model's backbone into mlx-lm's text model. The backbone is cast to dtype, except for the
-    weights that mlx-lm keeps in float32 (e.g. Qwen3.5's A_log), and its Gated DeltaNet layers, if any, use the
+    weights that mlx-lm keeps in float32 (e.g., Qwen3.5's A_log), and its Gated DeltaNet layers, if any, use the
     chunked rule of gated_delta.py in training mode. The decoder's parameters are frozen, so that training updates
-    only what is unfrozen afterwards (e.g. LoRA adapters).
+    only what is unfrozen afterwards (e.g., LoRA adapters).
 
     Args:
         model_path: The folder of a decision model (an hmf_decision checkpoint).
@@ -215,12 +215,12 @@ def load_backbone(model_path: str, dtype: str = "bfloat16", config: Optional[Dic
 def to_hf_layout(weights: Dict[str, mx.array], text_model_type: str) -> Dict[str, mx.array]:
     """
     Undoes what mlx-lm's sanitize does to a backbone's weights, so that they are in the layout transformers loads.
-    Qwen3.5's sanitize moves the axis of the convolution weights and adds 1 to the weights of the norms, which
-    compute with 1 + w, so the inverse moves the axis back and subtracts the 1, in float32. Qwen3's sanitize leaves
-    the backbone's weights as they are.
+    Qwen3.5's sanitize moves the axis of the convolution weights and adds 1 to each norm's weight w (a Qwen3.5 norm
+    scales its input by 1 + w), so the inverse moves the axis back and subtracts the 1, in float32. Qwen3's sanitize
+    leaves the backbone's weights as they are.
 
     Args:
-        weights: The backbone's weights in mlx-lm's layout, by their names in the checkpoint (e.g.
+        weights: The backbone's weights in mlx-lm's layout, by their names in the checkpoint (e.g.,
             "model.layers.0.linear_attn.conv1d.weight").
         text_model_type: The model_type of the decision model's text_config.
 

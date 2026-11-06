@@ -2,13 +2,13 @@
 LoRA adapters and trainable parameters for decision models in MLX, which mirror what HMF sets up for PyTorch training
 (model/adapter.py). With LoRA, the backbone's linear layers get adapters, and the pointer head is trained in full and
 saved with the adapters (PEFT's modules_to_save). With full fine-tuning, every parameter is trained, or with
-hybrid_learnable_params only those whose names contain one of its comma-separated parts (e.g. decision_head, to
+hybrid_learnable_params only those whose names contain one of its comma-separated parts (e.g., decision_head, to
 train the head alone).
 
-The adapters are mlx-lm's LoRALinear layers, which hold A as [in_features, rank] and B as [rank, out_features] (PEFT
-holds the transposes, see checkpoint.py) and add scale * (x A) B to the base layer's output. A starts uniform in
-plus or minus 1 / sqrt(in_features), which is PEFT's default distribution, and B starts at 0, so a new adapter
-leaves the model's answers unchanged. The scale is alpha / rank, or alpha / sqrt(rank) with rsLoRA, as in PEFT.
+LoRA uses mlx-lm's LoRALinear layers, which hold A as [in_features, rank] and B as [rank, out_features] (PEFT holds
+the transposes, see checkpoint.py) and add scale * (x A) B to the base layer's output. A starts uniform in plus or
+minus 1 / sqrt(in_features), which is PEFT's default distribution, and B starts at 0, so a new adapter leaves the
+model's answers unchanged. Their output is scaled by alpha / rank, or alpha / sqrt(rank) with rsLoRA, as in PEFT.
 """
 
 import math
@@ -54,7 +54,7 @@ def lora_targets(model: DecisionModelMLX, lora_target: Sequence[str]) -> List[st
         lora_target: The lora_target argument, as a list of layer names.
 
     Returns:
-        The sorted names of the layers to adapt (the last part of each layer's path, e.g. q_proj).
+        The sorted names of the layers to adapt (the last part of each layer's path, e.g., q_proj).
     """
     if list(lora_target) != ["all"]:
         return sorted(set(lora_target))
@@ -81,7 +81,7 @@ def attach_lora(
 
     Args:
         model: The decision model.
-        targets: The names of the layers to adapt (the last part of each layer's path, e.g. q_proj).
+        targets: The names of the layers to adapt (the last part of each layer's path, e.g., q_proj).
         rank: The rank of the adapters.
         alpha: The scaling numerator of the adapters.
         dropout: Dropout on the adapters' input, in training mode. Defaults to 0.
