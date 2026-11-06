@@ -275,6 +275,8 @@ HMF converts a language model, Transformer or Hybrid, into a decision model by r
 
 [training/examples/decision/README.md](training/examples/decision/README.md) walks through both, with example configs for Qwen3.5-2B-Base and GKA-primed-HQwen3-8B-Instruct.
 
+HMF supports training decision models on a Mac with Apple silicon, using MLX, on the [`hmf-mac`](https://github.com/awslabs/hybrid-model-factory/tree/hmf-mac) branch. It includes two scripts for a Mac, one that fine-tunes an off-the-shelf decision model in under an hour (tested on an M3 Pro with 36 GB), and one that trains a new decision model from Qwen3-0.6B-Base through the whole decision pipeline, from building the data to evaluating the model.
+
 ---
 
 ## Supported Architectures
