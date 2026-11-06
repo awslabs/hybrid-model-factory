@@ -98,6 +98,9 @@ def check_mlx_arguments(
         problems.append("DoRA (use_dora)")
     if finetuning_args.pissa_init:
         problems.append("PiSSA (pissa_init)")
+    if finetuning_args.decision_save_optimizer or finetuning_args.decision_resume_optimizer:
+        # PyTorch's optimizer state (decision_optimizer.pt); an MLX run keeps its own in its checkpoints
+        problems.append("decision_save_optimizer and decision_resume_optimizer (use resume_from_checkpoint)")
     if finetuning_args.finetuning_type == "full" and model_args.adapter_name_or_path:
         problems.append("adapter_name_or_path with full fine-tuning (merge the adapters into the model first)")
     if _value(training_args.optim) not in OPTIMIZERS:

@@ -191,13 +191,12 @@ NULL_DIRECTION = "decision_head.k.bias"
 
 @pytest.mark.parametrize("source", ["qwen3", "qwen3_5"])
 def test_training_matches_pytorch(decision_model_dir, dataset_dir, tmp_path, source):
-    # Without gradient accumulation, since with it the Trainer divides the loss by the accumulation steps twice (once
-    # itself and once in Accelerate's backward), while the MLX backend averages the gradients
+    # With gradient accumulation, whose short last step of an epoch both backends average over its own batches
     model_dir = decision_model_dir(source)
     _starting_adapter(model_dir, tmp_path / "start")
     common = dict(
-        adapter_name_or_path=str(tmp_path / "start"), max_steps=9, warmup_steps=2, lr_scheduler_type="cosine",
-        weight_decay=0.1, max_grad_norm=1.0, train_sampling_strategy="group_by_length",
+        adapter_name_or_path=str(tmp_path / "start"), max_steps=9, gradient_accumulation_steps=2, warmup_steps=2,
+        lr_scheduler_type="cosine", weight_decay=0.1, max_grad_norm=1.0, train_sampling_strategy="group_by_length",
     )
 
     run_exp(_config(model_dir, dataset_dir, tmp_path / "torch", backend="torch", use_cpu=True, **common))
@@ -327,6 +326,7 @@ def test_training_the_head_alone(decision_model_dir, dataset_dir, tmp_path):
         ({"lr_scheduler_type": "polynomial"}, "lr_scheduler_type polynomial"),
         ({"optim": "sgd"}, "optim sgd"),
         ({"use_dora": True}, "DoRA"),
+        ({"decision_save_optimizer": True}, "decision_save_optimizer"),
     ],
 )
 def test_unsupported_options_are_refused(decision_model_dir, dataset_dir, tmp_path, overrides, message):
