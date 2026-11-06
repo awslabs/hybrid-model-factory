@@ -2,10 +2,11 @@
 
 A **decision model** reads a situation, a question about it, and a list of possible answers (the options), and returns how likely each option is to be the right one. HMF builds it from a language model, by removing the part that writes text and adding a small part that scores the options (the "head"). Training then teaches the model to answer well and to give probabilities you can trust.
 
-This guide has two parts:
+This guide has three parts:
 
 - [Part 1: Converting an LLM to a Decision Model](#part-1-converting-an-llm-to-a-decision-model) turns a language model into a decision model and trains it from the start.
 - [Part 2: Fine-tuning an Existing Decision Model](#part-2-fine-tuning-an-existing-decision-model) adapts a decision model that is already trained to your own questions, which takes much less data and time.
+- [Part 3: Training on a Mac](#part-3-training-on-a-mac) fine-tunes Strands Decider v19 (SD-v19) and runs the steps of Part 1 on a Mac with Apple silicon, and lists the times and memory they take there.
 
 Run every command from the `training/` folder. The steps use example configs, which you copy and change to point at your own paths (the paths to change are marked in each file).
 
@@ -198,7 +199,7 @@ The same steps on a larger hybrid model score higher (see [Example: GKA-primed-H
 
 The steps stay the same for other models and other data, with the changes listed below.
 
-- **Another base model.** Convert it in step 1 (`base_model_name_or_path`), and point every later config at the new model folder. If its tokenizer differs from Qwen3.5's (for example any Qwen3 or Llama model), redo steps 2 and 4, because the data must be tokenized for it. Set the anchor (`decision_anchor_model`) to the new base model.
+- **Another base model.** Convert it in step 1 (`base_model_name_or_path`), and point every later config at the new model folder. If its tokenizer differs from Qwen3.5's, redo steps 2 and 4, because the data must be tokenized for it. Set the anchor (`decision_anchor_model`) to the new base model.
 - **HMF's hybrid models** (with GKA, Gated DeltaNet, or Mamba layers) work as they are. Set `lora_target: all`, so that the adapters also cover their layers.
 - **Larger models** need more GPU memory. The first two settings below reduce the memory that training uses, and the script after them shows where training time goes.
   - `decision_checkpoint_min_tokens: 4096` saves memory on long batches only, at little cost in speed (it recomputes some values instead of storing them).
@@ -366,6 +367,131 @@ hmf decision-eval evaluate  $M --adapter_name_or_path $C --data path/to/my-data/
 ```
 
 `--split all --limit 0` uses every row of each file, since these files are already separate sets. The fine-tuned model is then asked questions as in [step 8](#8-ask-the-model-questions). To compare with the starting model, run the same commands without `--adapter_name_or_path`. Calibrating it replaces the calibration it came with.
+
+## Part 3: Training on a Mac
+
+The steps of Part 1 also run on a Mac with Apple silicon, for decision models whose backbone is Qwen3 or Qwen3.5. Training runs in [MLX](https://github.com/ml-explore/mlx), Apple's machine learning framework, through HMF's MLX backend (`decision_backend: mlx` in the training config), and labeling, calibration, evaluation, and serving run in PyTorch on MPS, Apple silicon's GPU backend, which HMF uses by default when there is no CUDA GPU. Both write and read the same files as on GPUs, so a model trained on a Mac can be evaluated or served on a GPU machine, and vice versa. [src/hmf/train/decision/mlx/README.md](../../src/hmf/train/decision/mlx/README.md) explains how the MLX backend works and how it differs from the PyTorch trainer.
+
+A Mac suits fine-tuning a decision model that is already trained (Part 2) best, which takes about an hour with Strands Decider v19 (SD-v19), Strands Decider's published 2B model (see [Fine-tuning Strands Decider's Model](#fine-tuning-strands-deciders-model)). Training a model from a language model with the full recipe of Part 1 also works, but takes a day or more (see [Time and Memory](#time-and-memory)).
+
+HMF's own hybrid layers (GKA, B'MOJO, and Mamba2) and its hybrid models need CUDA, so they cannot be trained or run on a Mac.
+
+### Setting Up a Mac
+
+The Mac needs Apple silicon, macOS 14 or newer, and Python 3.11 or newer. HMF installs without Docker, with its `mac` extra, which adds MLX and [mlx-lm](https://github.com/ml-explore/mlx-lm):
+
+```bash
+git clone https://github.com/awslabs/hybrid-model-factory.git
+cd hybrid-model-factory/training
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[mac]"
+```
+
+### Fine-tuning Strands Decider's Model
+
+[finetune_mac.sh](finetune_mac.sh) runs the steps of Part 2 on a Mac, from downloading SD-v19 ([strands-decider-2B-hobson-v19](https://huggingface.co/StrandsAgents/strands-decider-2B-hobson-v19) on the Hugging Face Hub, built on Qwen3.5-2B) to measuring it before and after fine-tuning:
+
+```bash
+MAX_SAMPLES=64 bash examples/decision/finetune_mac.sh   # 64 rows for each set, to try it out in a few minutes
+bash examples/decision/finetune_mac.sh                  # about 45 minutes on an M3 Pro, after downloading SD-v19
+```
+
+This is an illustrative run, which shows how fine-tuning works on a Mac and how long it takes. It fine-tunes SD-v19 on rows of massive_intent, which asks for the intent of a request to a voice assistant among up to 24 options, and which is one of the tasks that Strands Decider held out of SD-v19's training. The script splits the task's rows into 3,000 training rows, 500 calibration rows, and 1,000 test rows that do not overlap, and measures SD-v19 on the test rows before and after fine-tuning, so the comparison shows what fine-tuning on a task's own rows does for that task. The script does not check the fine-tuned model on other kinds of questions, and [Training](#training) in Part 2 explains how to keep its results on them.
+
+It runs these steps, in order:
+
+1. Clones Strands Decider (or uses the clone in `STRANDS_DIR`), builds its held-out tasks with `training/recipe.sh build`, checks them against Strands Decider's recorded checksums, and links its `data/` folder to `data/strands-decider`.
+2. Downloads SD-v19 and converts it to an HMF decision model, with its adapter merged into its weights (`scripts/strands_to_hmf_decision.py --merge`, as in [Example: Starting From Strands Decider's v19](#example-starting-from-strands-deciders-v19)).
+3. Splits massive_intent's rows into the three sets, and registers them in `data/decision/massive_intent/dataset_info.json`.
+4. Evaluates SD-v19 on the test rows, with the calibration it was published with.
+5. Tokenizes the training rows ([tokenization/strands_v19_finetune/massive_intent.yaml](tokenization/strands_v19_finetune/massive_intent.yaml)).
+6. Fine-tunes a new LoRA adapter on the merged model with MLX, for 2 epochs of 8 rows per step, with SD-v19's settings from step 2 and the learning rates of Part 2 ([train/strands_v19_finetune/lora_massive_intent_mac.yaml](train/strands_v19_finetune/lora_massive_intent_mac.yaml)).
+7. Calibrates the fine-tuned model on the calibration rows with `--method strands_decider`, as Strands Decider calibrated SD-v19, so that the two compare.
+8. Evaluates the fine-tuned model on the test rows, and prints both evaluations side by side.
+
+The training rows are short, about 140 tokens each, so the 2 epochs train on about a million tokens, which took 34 minutes on an M3 Pro, with a peak of 11.5 GB, and the whole script took about 45 minutes. One run gave the results below on the 1,000 test rows.
+
+| | accuracy | NLL | Brier | ECE |
+| --- | --- | --- | --- | --- |
+| SD-v19, as converted | 0.891 | 0.426 | 0.163 | 0.032 |
+| SD-v19 fine-tuned on 3,000 rows of massive_intent | 0.952 | 0.189 | 0.075 | 0.020 |
+
+By the end of training, the model fitted its training rows almost exactly (a loss near 0) and was over-confident on new rows, so step 7 fitted a temperature of 2.8, which lowered the calibration rows' ECE from 0.042 to 0.016 without changing the answers the model picks.
+
+### Running the Whole Pipeline
+
+[run_pipeline_mac.sh](run_pipeline_mac.sh) runs every step of Part 1 with Qwen3-0.6B-Base, from building the data to evaluating model 2, in HMF's environment:
+
+```bash
+MAX_SAMPLES=32 bash examples/decision/run_pipeline_mac.sh   # the first 32 rows of each dataset, to try it out
+bash examples/decision/run_pipeline_mac.sh                  # the full recipe
+```
+
+It runs these steps, in order:
+
+1. Clones Strands Decider at the version whose data this recipe uses (or uses the clone in `STRANDS_DIR`), builds its data with `training/recipe.sh build fetch multistep generated adequacy`, checks the multi-step rows and the teacher's answers against Strands Decider's recorded checksums, and links its `data/` folder to `data/strands-decider`.
+2. Converts Qwen3.5-4B's answers to the multi-step rows, which Strands Decider ships in `data/synthetic/teacher_multistep_v14.jsonl`, to HMF's teacher file format, with `scripts/strands_teacher_to_hmf.py`. Model 1 learns from these answers, as in step 2 of Part 1, without running the 4B model on the Mac.
+3. Converts Qwen3-0.6B-Base into a decision model (step 1 of Part 1).
+4. Tokenizes model 1's data and labels it with the anchor, on MPS, and with the 4B's answers (step 2).
+5. Trains model 1 with MLX (step 3).
+6. Tokenizes model 2's data and labels it with the anchor and model 1's answers, on MPS (step 4).
+7. Trains model 2 with MLX (step 5).
+8. Calibrates and evaluates model 2 on MPS, on the benchmarks of step 6 ([eval/strands_v19_mac.yaml](eval/strands_v19_mac.yaml), without JevBench).
+
+With `MAX_SAMPLES`, each step uses the first `MAX_SAMPLES` rows of each dataset, without validation splits, and writes to folders whose names end in `-smoke`, so the whole pipeline runs in about 15 minutes once the data is built. That run only checks that every step works, since a model trained on so few rows answers little better than chance. The first run takes longer, because building Strands Decider's data downloads its public datasets. Each step is skipped when its output exists, so after a failure, running the script again continues where it stopped.
+
+MuSiQue, one of the multi-step datasets, downloads from Google Drive, which refuses downloads of a file for a while after too many of them, and then returns a page that says "Quota exceeded" instead of the file. The checksum check stops the build when that happens, and the next run of the script removes the page and downloads the file again, which works once the quota resets. A browser signed in to Google can usually download the file before that, saved as `strands-decider/data/raw/musique_data_v1.0.zip`.
+
+### Configs for Qwen3-0.6B-Base
+
+| step | config |
+| --- | --- |
+| 1. Convert the base model | [init/qwen3_0_6b/pointer.yaml](init/qwen3_0_6b/pointer.yaml) |
+| 2. Prepare model 1's data | [tokenization/qwen3_0_6b/strands_v14.yaml](tokenization/qwen3_0_6b/strands_v14.yaml) |
+| 3. Train model 1 | [train/qwen3_0_6b/lora_v14_mac.yaml](train/qwen3_0_6b/lora_v14_mac.yaml) |
+| 4. Prepare model 2's data | [tokenization/qwen3_0_6b/strands_v19_replay.yaml](tokenization/qwen3_0_6b/strands_v19_replay.yaml) |
+| 5. Train model 2 | [train/qwen3_0_6b/lora_v19_mac.yaml](train/qwen3_0_6b/lora_v19_mac.yaml) |
+| 6. Calibrate and evaluate | [eval/strands_v19_mac.yaml](eval/strands_v19_mac.yaml) |
+
+These configs follow the v19 recipe of Part 1, with the changes below for Qwen3-0.6B and for a Mac.
+
+- **The anchor is Qwen3-0.6B-Base,** since the anchor reads the student's tokenized prompts and must share its tokenizer. The teacher of model 1, Qwen3.5-4B's shipped answers, has no such constraint, because its answers are over each row's options rather than over tokens.
+- **`decision_backend: mlx`** selects the MLX backend, which trains on the Mac's GPU.
+- **`per_device_train_batch_size: 4` and `gradient_accumulation_steps: 8`** give 32 rows per optimizer step, as the GPU recipe's 4 rows on each of 8 GPUs, and the 8 batches of each step are the same rows that the 8 GPUs train on.
+- **`decision_pad_to_multiple_of: null`** pads each batch to its longest prompt only. The GPU configs pad to a multiple of 256 tokens for the GPU kernels of Gated DeltaNet, but on the Mac, training without that padding gives the same model and is 26% faster on this data.
+- **`decision_checkpoint_min_tokens: 4096`** recomputes the activations of the batches of more than 4,096 padded tokens (rows times length) in the backward pass rather than storing them. Without gradient checkpointing, the epoch's longest batch, 4 rows of about 3,000 tokens, needs more than 24 GB, and with it for every batch, training is 13% slower.
+
+### Time and Memory
+
+These numbers were measured on an M3 Pro with 36 GB, with the backbone in bfloat16. The time of a run follows from its number of tokens and the time per token of each stage (in the tables further below), which is how the times of the full fine-tuning run and of the full recipe were estimated.
+
+| run | tokens | time |
+| --- | --- | --- |
+| [finetune_mac.sh](finetune_mac.sh): fine-tuning SD-v19 (2B) on 3,000 rows of massive_intent for 2 epochs | about 0.8 million | about 45 minutes, of which 34 train |
+| [run_pipeline_mac.sh](run_pipeline_mac.sh) with `MAX_SAMPLES=32`, a check of every step | | about 15 minutes |
+| the full v19 recipe of Part 1 with the 0.6B, labeling and training models 1 and 2 | about 34 million for model 1, and 43 million for model 2 | about a day and a half |
+
+The tables below give the time per token of each stage, from 10 training steps of 32 rows of model 2's data, or a few hundred rows for labeling and inference. Their last two columns give the time of each of the two training runs of the v19 recipe on all of its data, model 1 on the v14 mix and model 2 on the v19 mix.
+
+| model | training settings | per token | peak memory | model 1 (v14 mix) | model 2 (v19 mix) |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3-0.6B-Base | as in the configs above | 1.13 ms | 13 GB | about 11 hours | about 14 hours |
+| Qwen3.5-2B-Base | as above, with `decision_checkpoint_min_tokens: 1024` | 3.4 ms | 16 GB | about 32 hours | about 41 hours |
+
+Peak memory counts the training process's whole footprint, which on a Mac includes the GPU's memory.
+
+| model | anchor | teacher (a decision model and its adapter) | evaluation and serving | one request to `hmf decision-serve` |
+| --- | --- | --- | --- | --- |
+| Qwen3-0.6B-Base | 0.46 ms per token | 0.54 ms per token | 0.42 ms per token | about 0.7 seconds |
+| Qwen3.5-2B-Base | 1.34 ms per token | 1.00 ms per token | 1.00 ms per token | about 1.6 seconds |
+
+Labeling a stage of the full recipe thus takes a few hours with the 0.6B, and up to about 16 hours with the 2B, and with training, the full recipe takes about a day and a half with the 0.6B and four to five days with the 2B. On an M3 Pro, the GPU's bfloat16 compute (about 6 TFLOPS) limits training, which already uses about 40% of it, so a Mac with a larger GPU (e.g., an M3 Max or an M2 Ultra) trains proportionally faster, and fewer tokens (a lower `cutoff_len`, or part of the data) or a smaller model shorten every step. Rows shorter than the v19 mix's also cost less per token, which is why fine-tuning on massive_intent's rows, of about 140 tokens, ran at 2.65 ms per token with the 2B.
+
+### Other Models
+
+- **Qwen3.5-2B-Base** trains on a Mac with the configs of Part 1, after the same changes as above, except `decision_checkpoint_min_tokens: 1024`, since the 2B's batches of up to 4,096 tokens need more than 20 GB without checkpointing. Its tokenizer is Qwen3.5's, so the anchor is Qwen3.5-2B-Base.
+- **Other Qwen3 and Qwen3.5 models** train with the same settings. A larger model needs more memory, which a lower `decision_checkpoint_min_tokens` (or 0, which checkpoints every batch) reduces.
 
 ## More Details
 

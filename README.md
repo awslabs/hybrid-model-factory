@@ -8,6 +8,8 @@
 [![Models on HuggingFace](https://img.shields.io/badge/🤗_Model_Zoo-HuggingFace-yellow.svg)](https://huggingface.co/collections/amazon/primed-hybrid-models-collection)
 [![Contributions Welcome](https://img.shields.io/badge/Contributions-Welcome-brightgreen.svg)](CONTRIBUTING.md)
 
+> **About this branch.** This branch adds support for training and running [decision models](#decision-models) on a Mac with Apple silicon, which the main branch does not have, since its training needs CUDA GPUs. It trains decision models whose backbone is Qwen3 or Qwen3.5 with [MLX](https://github.com/ml-explore/mlx) (`decision_backend: mlx`), runs their labeling, calibration, evaluation, and serving in PyTorch on MPS, and includes two scripts, one that fine-tunes Strands Decider v19, Strands Decider's published 2B model, in about an hour, and one that runs the whole decision pipeline with Qwen3-0.6B-Base, from building the data to evaluating the model. Everything else, including HMF's hybrid models, priming, and vLLM serving, works as on the main branch and still needs CUDA GPUs. [Part 3 of the decision model guide](training/examples/decision/README.md#part-3-training-on-a-mac) explains how to set up a Mac and run the pipeline, and lists the times and memory it takes, and [the MLX backend's README](training/src/hmf/train/decision/mlx/README.md) explains how training in MLX differs from training in PyTorch.
+
 An open-source toolkit for training, priming, and serving next-generation **Hybrid architectures** — models that combine Attention with State Space Models (SSMs).
 
 Hybrid architectures include both Transformers and vanilla SSMs as special cases and modulate how each layer manages memory — some layers can retain precise recent context (Attention), while others maintain a compressed, fading summary of the unbounded past (SSMs). This makes Hybrids particularly well-suited for agentic workflows and long-running AI agents where context accumulates over long horizons but full-fidelity recall of every token at every model layer is prohibitively expensive and unnecessary.
@@ -178,6 +180,8 @@ hmf train examples/decision/train/qwen3_5_2b/lora_v14.yaml
 
 [training/examples/decision/README.md](training/examples/decision/README.md) explains each step, and how to fine-tune an existing decision model on your own data.
 
+On a Mac with Apple silicon, decision models train without Docker, with MLX. After `pip install -e ".[mac]"` in `training/`, `bash examples/decision/finetune_mac.sh` fine-tunes Strands Decider v19, and `bash examples/decision/run_pipeline_mac.sh` runs the whole pipeline with Qwen3-0.6B-Base, as [Part 3 of the guide](training/examples/decision/README.md#part-3-training-on-a-mac) describes.
+
 ---
 
 ## Priming Pipeline Overview
@@ -273,7 +277,7 @@ A decision model reads a situation, a question about it, and a list of possible 
 
 HMF converts a language model, Transformer or Hybrid, into a decision model by replacing its language model head with a small head that scores the options. It then trains the model with LoRA, optionally learning from the base model's and a teacher model's answers, and calibrates and evaluates it. An existing decision model, including one published by [Strands Decider](https://github.com/strands-labs/strands-decider), can also be converted and fine-tuned on your own questions.
 
-[training/examples/decision/README.md](training/examples/decision/README.md) walks through both, with example configs for Qwen3.5-2B-Base and GKA-primed-HQwen3-8B-Instruct.
+[training/examples/decision/README.md](training/examples/decision/README.md) walks through both, with example configs for Qwen3.5-2B-Base and GKA-primed-HQwen3-8B-Instruct, and through training Qwen3 and Qwen3.5 decision models on a Mac with Apple silicon, with example configs for Qwen3-0.6B-Base.
 
 ---
 
@@ -455,6 +459,7 @@ Sustained decode throughput (tokens/s) and mean TTFT on 8× H200 GPUs (TP=8), me
 | Inference (32B, TP=1) | 1× H200 | |
 | Inference (32B, TP=8) | 8× H200 | |
 | Inference (32B, TP=8) | 8× A100 40GB | TP=8 required (32B does not fit at TP=1) |
+| Decision models: training, labeling, and evaluation (0.6B and 2B, LoRA) | Apple M3 Pro 36GB | Training in MLX, the rest in PyTorch on MPS |
 
 Lower-cost setups (LoRA, quantization) are expected to work but are not yet validated. Contributions welcome.
 
