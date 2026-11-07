@@ -67,6 +67,10 @@ def register_model_family(
     
     for model_class in model_classes:
         class_name = model_class.__name__
+        # A family's PreTrainedModel base class also ends with "Model", but it has no forward of its own, and
+        # registering it after the family's Model would make AutoModel build it instead
+        if class_name.endswith("PreTrainedModel"):
+            continue
         for suffix, auto_class in AUTO_MODEL_REGISTRY.items():
             if class_name.endswith(suffix):
                 auto_class.register(config_class, model_class)
@@ -216,7 +220,6 @@ def register_hybrid_models():
         Qwen3NextHMFForCausalLM,
         Qwen3NextHMFForQuestionAnswering,
         Qwen3NextHMFModel,
-        Qwen3NextHMFPreTrainedModel,
         Qwen3NextHMFForSequenceClassification,
         Qwen3NextHMFForTokenClassification,
     )
@@ -225,7 +228,6 @@ def register_hybrid_models():
         [Qwen3NextHMFForCausalLM,
         Qwen3NextHMFForQuestionAnswering,
         Qwen3NextHMFModel,
-        Qwen3NextHMFPreTrainedModel,
         Qwen3NextHMFForSequenceClassification,
         Qwen3NextHMFForTokenClassification],
     )

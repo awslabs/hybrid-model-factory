@@ -401,7 +401,9 @@ class BMOJOAttention(nn.Module):
         # Allocate cache buffers on first use
         if self.layer_idx not in past_key_values.key_value_memory_dict:
             inf_max_seq_length = past_key_values.max_sequence_length
-            inf_max_batch_size = past_key_values.max_batch_size
+            # The cache's batch size comes from config.batch_size, 1 by default, so a larger batch gets buffers of
+            # its own size, as Mamba2's cache does
+            inf_max_batch_size = max(past_key_values.max_batch_size, key_in_ctx.size(1))
 
             inference_key_memory = {
                 "in-context": self._allocate_memory(
