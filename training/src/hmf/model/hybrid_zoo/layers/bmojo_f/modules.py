@@ -2,7 +2,7 @@
 B'MOJO layer wrapper that initializes from config and handles cache extraction.
 """
 
-from typing import Optional, Tuple, TYPE_CHECKING, Union
+from typing import Optional, Tuple, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -17,13 +17,7 @@ from ..gated_deltanet.modules import GatedDeltaNetLayer
 from ..gated_kalmanet.modules import GatedKalmaNetLayer
 
 if TYPE_CHECKING:
-    from hmf.model.hybrid_zoo.models.cache import (
-        HybridCache,
-        BMojoCache,
-        Mamba2Cache,
-        GatedDeltaNetCache,
-        GatedKalmaNetCache,
-    )
+    from hmf.model.hybrid_zoo.models.cache import BMojoCache, HybridCache
 
 logger = logging.get_logger(__name__)
 
@@ -109,35 +103,6 @@ class BMojoLayer(nn.Module):
         elif self.ssm_mixer_type.lower() in ["gated_kalmanet", "gka"]:
             return self.gka
 
-    def _get_fading_cache(
-        self, past_key_values: Optional["HybridCache"] = None
-    ) -> Union[
-        "Mamba2Cache", "GatedDeltaNetCache", "GatedKalmaNetCache"
-    ]:
-        """
-        Extracts the appropriate cache for the configured SSM mixer.
-
-        Args:
-            past_key_values: HybridCache object containing caches for different layer types
-
-        Returns:
-            The cache specific to the configured SSM mixer, or None if not present
-        """
-        if self.ssm_mixer_type.lower() == "mamba2" and hasattr(
-            past_key_values, "mamba2"
-        ):
-            return past_key_values.mamba2
-        elif self.ssm_mixer_type.lower() in ["gated_deltanet", "gdn"] and hasattr(
-            past_key_values, "gated_deltanet"
-        ):
-            return past_key_values.gated_deltanet
-        elif self.ssm_mixer_type.lower() in ["gated_kalmanet", "gka"] and hasattr(
-            past_key_values, "gka"
-        ):
-            return past_key_values.gka
-        else:
-            return None
-
     def forward(
         self,
         hidden_states: Tensor,
@@ -162,8 +127,7 @@ class BMojoLayer(nn.Module):
             attention_mask: Optional attention mask tensor (not currently used).
             position_ids: Optional position indices tensor (not currently used).
             past_key_values: HybridCache object, extracts B'MOJO-specific cache if present.
-            use_cache: Whether to use caching. Not used--caching determined based on whether
-                past_key_values is provided.
+            use_cache: Whether the SSM mixer keeps its state in the cache, which GDN and GKA need.
             cache_position: Optional cache position tensor (not currently used).
             position_embeddings: Optional tuple of (cos, sin) for rotary embeddings.
             **kwargs: Additional arguments, ignored.
@@ -176,11 +140,12 @@ class BMojoLayer(nn.Module):
         """
         self_attn_input = hidden_states
 
-        # Extract the appropriate cache for the SSM mixer
-        fading_past_key_values = self._get_fading_cache(past_key_values=past_key_values)
+        # The SSM mixer's layer (Mamba2Layer, GatedDeltaNetLayer, or GatedKalmaNetLayer) takes the whole HybridCache
+        # and finds its own part of it, and GDN and GKA keep their state only with use_cache
         fading_kwargs = {
             "position_embeddings": position_embeddings,
-            "past_key_values": fading_past_key_values,
+            "past_key_values": past_key_values,
+            "use_cache": use_cache,
         }
 
         # Extract B'MOJO-specific cache
