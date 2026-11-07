@@ -11,7 +11,9 @@ Values on the command line (key=value, e.g. jevbench.max_len=3072) override the 
     adapter_name_or_path: its LoRA adapter (the training output_dir), if any
     output_dir: where the reports go (required)
     max_len, prompt_format, force_bos, ordinal_smoothing, seed, dataset_dir: as for calibrate and evaluate
-    calibration: {dataset or data, split, limit, method}: fitted first, and used by everything after
+    calibration: {dataset or data, split, limit, method, gate}: fitted first, and used by everything after;
+        gate, optional, holds the gate settings (rule, target, params, take_options, min_count,
+        use_weights; see gate.py), and the benchmarks then report what the gate takes
     benchmarks: [{name, dataset or data, split, limit}, ...]: each evaluated in turn
     jevbench: {dir, commit, max_len, port, compare: [{name, results, run}, ...]}: JevBench on a server the
         run starts and stops
@@ -40,6 +42,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from ...extras import logging
 from .calibrate import calibrate
 from .evaluate import evaluate
+from .gate import check_gate_settings
 from .jevbench import compare, load_results
 from .predictor import DecisionPredictor, calibration_path, load_calibration
 
@@ -191,6 +194,14 @@ def _summary_table(results: Dict[str, Any]) -> str:
             f"{calibration['after']['ece']:.3f} after.",
             "",
         ]
+        gate = calibration.get("gate")
+        if gate:
+            target = "" if gate["target"] is None else f" {gate['target']}"
+            fitted = ", ".join(
+                f"{kind} {'none' if gate['thresholds'][kind] is None else format(gate['thresholds'][kind], '.4f')} "
+                f"({b['share']:.1%} taken)" for kind, b in gate["fitted"].items()
+            )
+            lines += [f"Gate ({gate['rule']}{target}), thresholds by kind: {fitted}.", ""]
     else:
         lines += [f"Calibration: {results['calibration_used']}.", ""]
     if results.get("benchmarks"):
@@ -206,6 +217,14 @@ def _summary_table(results: Dict[str, Any]) -> str:
                 f"{o['nll']:.3f} | {tasks} |"
             )
         lines.append("")
+        gated = {name: report["gate"] for name, report in results["benchmarks"].items() if report.get("gate")}
+        if gated:
+            lines += ["| benchmark | taken by the gate | accuracy of the taken answers |", "| --- | --- | --- |"]
+            for name, g in gated.items():
+                accuracy = "-" if g["overall"]["accuracy"] is None else f"{g['overall']['accuracy']:.3f}"
+                lines.append(f"| {name} | {g['overall']['taken']:,} of {g['overall']['rows']:,} "
+                             f"({g['overall']['share']:.1%}) | {accuracy} |")
+            lines.append("")
     jevbench = results.get("jevbench")
     if jevbench:
         s = jevbench["summary"]
@@ -244,6 +263,8 @@ def run_suite(path: str, *overrides: str) -> Dict[str, Any]:
     jevbench = suite.get("jevbench")
     # Every check before the first model is loaded
     calibration_data = resolve_data(suite["calibration"], dataset_dir) if suite.get("calibration") else None
+    if calibration_data is not None and suite["calibration"].get("gate") is not None:
+        check_gate_settings(suite["calibration"]["gate"])
     benchmarks = {b["name"]: (b, resolve_data(b, dataset_dir)) for b in suite.get("benchmarks") or []}
     if jevbench:
         _check_jevbench(jevbench, output_dir)
@@ -259,7 +280,7 @@ def run_suite(path: str, *overrides: str) -> Dict[str, Any]:
         results["calibration"] = calibrate(
             model, calibration_data, adapter, split=section.get("split", "calib"), limit=section.get("limit", 4000),
             seed=seed, ordinal_smoothing=suite.get("ordinal_smoothing", 0.1), method=section.get("method", "nll"),
-            predictor=predictor,
+            gate=section.get("gate"), predictor=predictor,
         )
         shutil.copy(saved, os.path.join(output_dir, "calibration.json"))
     # From here on, the model answers at its calibration, either the one just fitted or the one it had

@@ -113,3 +113,57 @@ def test_predictor_warns_about_a_calibration_without_a_method(trained, monkeypat
     new.write_text(json.dumps({"method": "nll", "temperature": 1.0, "temperature_by_kind": {}}))
     _predictor(trained, calibration=str(new))
     assert warnings == []
+
+
+def test_calibration_with_a_gate(trained):
+    # The choice option the model answers most often, which temperatures do not change, is the one the gate takes
+    rows = [row for row in (json.loads(line) for line in open(trained["data"])) if row["kind"] == "choice"]
+    tops = [row["options"][max(range(len(lp)), key=lp.__getitem__)][0]
+            for row, lp in zip(rows, _predictor(trained, calibration=None).log_probs(rows))]
+    acted_on = max(set(tops), key=tops.count)
+    other = next(name for name, _ in rows[0]["options"] if name != acted_on)
+    settings = {"rule": "accuracy", "target": 0.0, "min_count": 1, "take_options": [acted_on, "true"]}
+    calibration = calibrate(trained["model_dir"], trained["data"], trained["adapter_dir"], split="all", limit=0,
+                            min_rows_per_kind=20, gate=settings, predictor=_predictor(trained, calibration=None))
+
+    with open(os.path.join(trained["adapter_dir"], CALIBRATION_FILE)) as f:
+        gate = json.load(f)["gate"]
+    assert gate == json.loads(json.dumps(calibration["gate"]))
+    assert gate["take_options"] == [acted_on, "true"] and gate["fitted"]["noul"]["rows"] == 31
+    # At target 0, every candidate is taken, so each kind's threshold is its lowest candidate's probability
+    predictor = _predictor(trained)
+    candidates = []
+    for row, probs in zip(rows, predictor.probabilities(rows)):
+        top = max(range(len(probs)), key=probs.__getitem__)
+        if row["options"][top][0] == acted_on:
+            candidates.append(probs[top])
+            assert predictor.takes("choice", acted_on, probs[top])
+        assert not predictor.takes("choice", other, probs[top])
+    assert gate["thresholds"]["choice"] == pytest.approx(min(candidates))
+    assert gate["fitted"]["choice"]["taken"] == len(candidates)
+    assert gate["thresholds"]["score"] is None  # no score answer is a candidate
+
+    # Evaluation reports what the gate takes
+    report = evaluate(trained["model_dir"], trained["data"], trained["adapter_dir"], split="all", limit=0,
+                      predictor=predictor)
+    assert report["gate"]["by_kind"]["choice"]["taken"] == len(candidates) > 0
+    assert report["gate"]["by_kind"]["score"]["taken"] == 0
+    raw = evaluate(trained["model_dir"], trained["data"], trained["adapter_dir"], split="all", limit=0, raw=True,
+                   predictor=predictor)
+    assert "gate" not in raw  # the gate holds only at the temperatures it was fitted at
+
+
+def test_calibration_without_a_gate_saves_none(trained):
+    calibration = calibrate(trained["model_dir"], trained["data"], trained["adapter_dir"], split="all", limit=0,
+                            predictor=_predictor(trained, calibration=None))
+    assert "gate" not in calibration and _predictor(trained).gate is None
+
+
+def test_bad_gate_settings_fail_before_the_model_runs(trained):
+    class Unused:
+        def log_probs(self, rows):
+            raise AssertionError("the model ran")
+
+    with pytest.raises(ValueError, match="Unknown gate rule"):
+        calibrate(trained["model_dir"], trained["data"], trained["adapter_dir"], gate={"rule": "x", "target": 1},
+                  predictor=Unused())

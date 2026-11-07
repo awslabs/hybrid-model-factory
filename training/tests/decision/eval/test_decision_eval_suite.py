@@ -236,3 +236,23 @@ def test_decision_eval_command(tmp_path):
 def test_decision_serve_command_refuses_other_hosts(trained):
     result = _launch("decision-serve", trained["model_dir"], "--host", "0.0.0.0")
     assert result.returncode != 0 and "Refusing to listen on 0.0.0.0" in result.stderr
+
+
+def test_calibration_with_a_gate(tmp_path, trained):
+    gate = {"rule": "accuracy", "target": 0.0, "min_count": 1}
+    path = _suite(tmp_path, trained, calibration={"data": trained["data"], "split": "calib", "limit": 0, "gate": gate},
+                  benchmarks=[{"name": "toy", "data": trained["data"], "split": "test", "limit": 0}])
+
+    results = run_suite(path)
+
+    assert set(results["calibration"]["gate"]["thresholds"]) == {"noul", "choice", "score"}
+    assert results["benchmarks"]["toy"]["gate"]["overall"]["rows"] == results["benchmarks"]["toy"]["overall"]["n"]
+    summary = (tmp_path / "reports" / "summary.md").read_text()
+    assert "Gate (accuracy 0.0), thresholds by kind" in summary and "| toy | " in summary.split("taken by the gate")[1]
+
+
+def test_gate_settings_are_checked_first(tmp_path, trained):
+    path = _suite(tmp_path, trained, calibration={"data": trained["data"], "gate": {"rule": "x", "target": 1}})
+    with pytest.raises(ValueError, match="Unknown gate rule"):
+        run_suite(path)
+    assert not (tmp_path / "reports").exists()  # before anything ran

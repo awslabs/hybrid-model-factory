@@ -11,7 +11,9 @@ metrics.py). The rows are the test half of the file by default, which calibratio
     # An evaluation set, on every row (the task breakdown gives each source's accuracy)
     hmf decision-eval evaluate ... --data path/to/multistep_v14_eval.jsonl --split all --limit 0
 
-Rows whose prompt is longer than max_len are skipped, not truncated, and counted in the report.
+Rows whose prompt is longer than max_len are skipped, not truncated, and counted in the report. If
+the calibration holds a gate (see gate.py), the report also has what the gate takes of the rows and
+how often those answers are right, which checks that its thresholds hold on rows they were not fitted on.
 """
 
 import json
@@ -19,6 +21,7 @@ import os
 from typing import Any, Dict, Optional
 
 from .data import partition_rows, read_rows, sample_rows
+from .gate import evaluate_gate, format_gate
 from .metrics import DEFAULT_ORDINAL_SMOOTHING, format_summary, predictions, summarize
 from .predictor import DecisionPredictor
 
@@ -101,6 +104,9 @@ def evaluate(
         "ordinal_smoothing": ordinal_smoothing,
     }
     print(format_summary(report, title=f"{data} ({split}, {len(kept):,} rows, {report['num_skipped']} over max_len)"))
+    if calibrated and predictor.gate is not None:
+        report["gate"] = evaluate_gate(predictor.gate, [row for row, _ in kept], [p.probs for p in preds])
+        print(format_gate(predictor.gate, report["gate"]["by_kind"]))
     if out is not None:
         os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
         with open(out, "w", encoding="utf-8") as f:

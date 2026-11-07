@@ -23,16 +23,18 @@ The fit has three steps.
        [0.25, 6], as the ECE is a step function of the temperature.
 
 The temperatures are saved in decision_calibration.json in the adapter's folder (see
-predictor.py), with the metrics before and after.
+predictor.py), with the metrics before and after. With gate settings, calibration then also fits a
+gate on the same rows, one probability threshold per kind above which a caller acts on the answer
+(see gate.py), and saves it in the same file.
 
     hmf decision-eval calibrate path/to/decision-model --adapter_name_or_path path/to/lora \\
-        --data path/to/holdout_v5_norule.jsonl
+        --data path/to/holdout_v5_norule.jsonl [--gate '{rule: accuracy, target: 0.95}']
 """
 
 import json
 import math
 import os
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -40,7 +42,8 @@ import torch
 from ...extras import logging
 from ...train.decision.metric import NUM_ECE_BINS, expected_calibration_error
 from .data import partition_rows, read_rows, sample_rows
-from .metrics import DEFAULT_ORDINAL_SMOOTHING, predictions, summarize
+from .gate import check_gate_settings, fit_gate, format_gate
+from .metrics import DEFAULT_ORDINAL_SMOOTHING, apply_temperature, predictions, summarize
 from .predictor import DecisionPredictor, calibration_path
 
 
@@ -169,6 +172,7 @@ def calibrate(
     ordinal_smoothing: float = DEFAULT_ORDINAL_SMOOTHING,
     min_rows_per_kind: int = MIN_ROWS_PER_KIND,
     method: str = "nll",
+    gate: Optional[Union[Dict[str, Any], str]] = None,
     prompt_format: str = "strands",
     force_bos: bool = False,
     max_len: Optional[int] = 4096,
@@ -195,6 +199,9 @@ def calibrate(
         method: How each kind's temperature is fitted, "nll", "ece_top_probability", or
             "strands_decider" (see the module's docstring). Defaults to "nll"; "strands_decider"
             reproduces Strands Decider's temperatures.
+        gate: Gate settings (rule, target, params, take_options, min_count, use_weights; see gate.py),
+            as a mapping, YAML text, or a YAML file's path, to also fit a gate on the calibrated
+            probabilities. Defaults to None, no gate.
         prompt_format: The prompt format of training (decision_prompt_format). Defaults to "strands".
         force_bos: Whether prompts start with the BOS token (decision_force_bos). Defaults to False.
         max_len: The longest prompt, in tokens; longer rows are skipped. Defaults to 4096.
@@ -202,10 +209,12 @@ def calibrate(
         predictor: A DecisionPredictor to use instead of loading the model. Defaults to None.
 
     Returns:
-        The calibration, with the temperatures and the metrics before and after.
+        The calibration, with the temperatures, the metrics before and after, and the gate if one was fitted.
     """
     if method not in CALIBRATION_METHODS:
         raise ValueError(f"Unknown calibration method {method!r}; use one of {', '.join(CALIBRATION_METHODS)}.")
+    if gate is not None:
+        check_gate_settings(gate)  # before the model runs
     rows = sample_rows(partition_rows(read_rows(data), split, seed), limit, seed)
     predictor = predictor or DecisionPredictor(
         model_name_or_path, adapter_name_or_path, device=device, prompt_format=prompt_format, force_bos=force_bos,
@@ -243,6 +252,10 @@ def calibrate(
         # As the predictor applies them, where a kind without its own temperature gets the overall one
         "after": overall_metrics(by_kind or overall, default=overall),
     }
+    if gate is not None:
+        # On the probabilities at the temperatures just fitted, as the predictor and the server will apply them
+        probabilities = [apply_temperature(lp, by_kind.get(kind, overall)) for kind, lp in zip(kinds, kept_log_probs)]
+        calibration["gate"] = fit_gate([row for row, _ in kept], probabilities, gate)
     output = output or calibration_path(model_name_or_path, adapter_name_or_path)
     if os.path.exists(output):
         logger.info_rank0(f"Replacing the calibration {output}.")
@@ -255,6 +268,8 @@ def calibrate(
         m = calibration[name]
         print(f"  {name:<26} n={m['n']:,} accuracy={m['accuracy']:.3f} ece={m['ece']:.3f} "
               f"ece_top_probability={m['ece_top_probability']:.3f} nll={m['nll']:.3f}")
+    if gate is not None:
+        print(format_gate(calibration["gate"], calibration["gate"]["fitted"]))
     print(f"Saved to {output}")
     return calibration
 

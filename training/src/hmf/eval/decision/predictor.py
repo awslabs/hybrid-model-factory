@@ -5,7 +5,8 @@ A trained model is a decision model (from hmf decision-init) and, when trained w
 (the training output_dir, the folder that holds adapter_config.json). Calibration (see calibrate.py)
 saves its temperatures in decision_calibration.json in the adapter's folder, never in the decision
 model's folder, which several adapters may be trained on. A model without an adapter (trained with
-finetuning_type: full, or merged with hmf export) gets the file in its own folder.
+finetuning_type: full, or merged with hmf export) gets the file in its own folder. The file also
+holds the model's gate, if calibration fitted one (see gate.py).
 """
 
 import json
@@ -16,6 +17,7 @@ import torch
 
 from ...data.decision_teachers import DecisionModelTeacher
 from ...extras import logging
+from .gate import takes
 from .metrics import apply_temperature
 
 
@@ -105,6 +107,15 @@ class DecisionPredictor:
         if self.calibration is None:
             return 1.0
         return float(self.calibration["temperature_by_kind"].get(kind, self.calibration["temperature"]))
+
+    @property
+    def gate(self) -> Optional[Dict[str, Any]]:
+        """The gate fitted with the calibration, or None if there is none."""
+        return (self.calibration or {}).get("gate")
+
+    def takes(self, kind: str, option: str, probability: float) -> Optional[bool]:
+        """Whether the gate takes an answer, from its option's name and calibrated probability, or None."""
+        return takes(self.gate, kind, option, probability)
 
     def log_probs(self, rows: Sequence[Dict[str, Any]]) -> List[Optional[List[float]]]:
         """Each row's log-probabilities over its options at temperature 1, or None if its prompt is too long."""

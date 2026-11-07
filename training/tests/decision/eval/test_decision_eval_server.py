@@ -255,3 +255,52 @@ def test_compare_runs(tmp_path):
     assert result["both_right"] == 1 and result["both_wrong"] == 1
     with pytest.raises(ValueError, match="name the run"):
         load_results(str(b))
+
+
+# The gate
+
+
+def _gated_server(trained, tmp_path, thresholds, take_options=None, **kwargs) -> DecisionServer:
+    calibration = tmp_path / "gated_calibration.json"
+    calibration.write_text(json.dumps({
+        "method": "nll", "temperature": 1.0, "temperature_by_kind": {},
+        "gate": {"rule": "accuracy", "target": 0.9, "params": {}, "take_options": take_options, "min_count": 1,
+                 "use_weights": False, "thresholds": thresholds},
+    }))
+    return _server(trained, calibration=str(calibration), **kwargs)
+
+
+def test_the_gate_compares_the_top_probability(trained, tmp_path):
+    pick = {"pick": QUESTIONS["pick"]}
+    probs = _server(trained).answer(_request(pick))["answers"]["pick"]["probabilities"]
+    top = max(probs.values())
+    confidence = choice_confidence(list(probs.values()))
+    # A threshold between the answer's confidence and its top probability: the gate takes it, as it reads the
+    # top probability, which the threshold was fitted on
+    between = (confidence + top) / 2
+    answer = _gated_server(trained, tmp_path, {"choice": between}).answer(_request(pick))["answers"]["pick"]
+    assert answer["take"] is True and answer["confidence"] < between
+    above = _gated_server(trained, tmp_path, {"choice": min(1.0, top + 0.01)})
+    assert above.answer(_request(pick))["answers"]["pick"]["take"] is False
+
+
+def test_the_gate_only_takes_its_options_and_kinds(trained, tmp_path):
+    reply = _server(trained).answer(_request())
+    choice = reply["answers"]["pick"]["choice"]
+    others = [name for name in QUESTIONS["pick"]["criteria"] if name != choice]
+
+    taken = _gated_server(trained, tmp_path, {"choice": 0.0}, take_options=[choice]).answer(_request())["answers"]
+    assert taken["pick"]["take"] is True
+    assert taken["yes_no"]["take"] is False and taken["rate"]["take"] is False  # no threshold for these kinds
+
+    not_taken = _gated_server(trained, tmp_path, {"choice": 0.0}, take_options=others).answer(_request())["answers"]
+    assert not_taken["pick"]["take"] is False
+
+
+def test_without_a_gate_or_raw_answers_have_no_take(trained, tmp_path):
+    assert all("take" not in a for a in _server(trained).answer(_request())["answers"].values())
+    raw = _gated_server(trained, tmp_path, {"choice": 0.0}, raw=True)
+    assert all("take" not in a for a in raw.answer(_request())["answers"].values())
+    assert raw.health()["gate"] is None
+    gated = _gated_server(trained, tmp_path, {"choice": 0.5}).health()["gate"]
+    assert gated["rule"] == "accuracy" and gated["thresholds"] == {"choice": 0.5}

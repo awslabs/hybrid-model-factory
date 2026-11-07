@@ -29,7 +29,10 @@ The reply holds one answer per question (probabilities rounded to 4 decimals):
     - score: {"type": "score", "score": the expected level, "legend": {"0": level 0's text, ...},
       "probabilities": {"0": p, ...}, "confidence": c}
 
-Confidence is defined in metrics.py. GET /health describes the model served. An invalid request is
+Confidence is defined in metrics.py. If the model's calibration holds a gate (see gate.py), each
+answer also has "take": true when its option is one the caller can act on and its calibrated
+probability reaches its kind's threshold, else false. The gate compares the top probability, not
+the confidence. GET /health describes the model served, with its gate. An invalid request is
 refused with status 422 and the reason.
 
 Each question is rendered with the model's prompt format, its options in the order the request lists
@@ -162,7 +165,7 @@ class DecisionServer:
 
     Args:
         predictor: The model (see predictor.py), with its calibration unless raw.
-        raw: Whether to answer at temperature 1, ignoring the calibration. Defaults to False.
+        raw: Whether to answer at temperature 1, ignoring the calibration and its gate. Defaults to False.
         strict_window: Whether to refuse prompts longer than the window rather than cut their state.
             Defaults to False.
         model_name: The name replies give as their model. Defaults to the adapter's folder name, else
@@ -192,6 +195,11 @@ class DecisionServer:
     def temperature(self, kind: str) -> float:
         return 1.0 if self.raw else self.predictor.temperature(kind)
 
+    @property
+    def gate(self) -> Optional[Dict[str, Any]]:
+        """The model's gate, which applies only to calibrated answers, as it was fitted on them."""
+        return None if self.raw else self.predictor.gate
+
     def health(self) -> Dict[str, Any]:
         return {
             "status": "ok",
@@ -201,6 +209,9 @@ class DecisionServer:
             "max_length": self.max_len,
             "calibrated": self.predictor.calibration is not None and not self.raw,
             "temperature_by_kind": {kind: self.temperature(kind) for kind in ("noul", "choice", "score")},
+            "gate": None if self.gate is None else {
+                key: self.gate.get(key) for key in ("rule", "target", "params", "take_options", "thresholds")
+            },
             "strict_window": self.strict_window,
             "device": self.predictor.device,
         }
@@ -291,11 +302,24 @@ class DecisionServer:
             log_probs = out.log_probs[i, : len(encoded[i].opt_idx)].float().tolist()
             probs = apply_temperature(log_probs, self.temperature(question.type))
             answers[name] = self._to_answer(question, probs)
+            if self.gate is not None:
+                top = max(range(len(probs)), key=probs.__getitem__)
+                option = self._option_names(question)[top]
+                answers[name]["take"] = self.predictor.takes(question.type, option, probs[top])
         return {
             "model": self.model_name,
             "answers": answers,
             "usage": {"input_tokens": int(attention_mask.sum()), "output_tokens": len(names)},
         }
+
+    @staticmethod
+    def _option_names(question) -> List[str]:
+        """The names of a question's options, in the order of its probabilities."""
+        if question.type == "noul":
+            return list(NOUL_OPTION_NAMES)
+        if question.type == "choice":
+            return list(question.criteria)
+        return [str(level) for level in range(len(question.criteria))]
 
     def _to_answer(self, question, probs: List[float]) -> Dict[str, Any]:
         if question.type == "noul":
