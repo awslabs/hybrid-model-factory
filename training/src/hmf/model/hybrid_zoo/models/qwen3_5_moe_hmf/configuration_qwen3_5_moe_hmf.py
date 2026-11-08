@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from transformers.configuration_utils import PreTrainedConfig, layer_type_validation
+from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_rope_utils import RopeParameters
 
 
@@ -182,7 +182,7 @@ class Qwen3_5MoeHMFTextConfig(PreTrainedConfig):
                 "linear_attention" if bool((i + 1) % interval_pattern) else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
-        layer_type_validation(self.layer_types, self.num_hidden_layers)
+        # Transformers checks layer_types at the end of PreTrainedConfig.__init__, so there's no check here
 
         # MoE args
         self.moe_intermediate_size = moe_intermediate_size

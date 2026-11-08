@@ -250,14 +250,13 @@ class Qwen3_5MoeDynamicCache:
             return 0
         return self.key_cache[layer_idx].shape[-2]
 
-    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
+    def get_mask_sizes(self, query_length: int, layer_idx: int) -> tuple[int, int]:
         """
         Return a tuple (kv_length, kv_offset) corresponding to the length and offset that will be returned for
         the given layer at `layer_idx`.
         The masks are then prepared according to the given lengths (kv_length, kv_offset) and patterns for each layer.
         """
         kv_offset = 0
-        query_length = cache_position.shape[0]
         past_seen_tokens = self.get_seq_length(layer_idx)
         kv_length = query_length + past_seen_tokens
         return kv_length, kv_offset
@@ -519,7 +518,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cache_params: Qwen3_5MoeDynamicCache | None = None,
-        cache_position: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ):
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
@@ -531,7 +529,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             cache_params is not None
             and cache_params.has_previous_state
             and seq_len == 1
-            and cache_position is not None
         )
 
         # getting projected states from cache if it exists
@@ -752,7 +749,6 @@ class Qwen3_5MoeAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -771,9 +767,7 @@ class Qwen3_5MoeAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -943,7 +937,6 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.FloatTensor:
         residual = hidden_states
@@ -955,7 +948,6 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -1032,7 +1024,6 @@ class Qwen3_5MoeHybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: HybridCache | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.FloatTensor:
         """
@@ -1049,8 +1040,6 @@ class Qwen3_5MoeHybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
                 `(batch, sequence_length)` where padding elements are indicated by 0.
             position_ids (`torch.FloatTensor`,  *optional*): Position IDs for the input.
             past_key_values (`HybridCache`, *optional*): cached past key and value projection states
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
             kwargs (`dict`, *optional*):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
@@ -1068,7 +1057,6 @@ class Qwen3_5MoeHybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -1151,7 +1139,6 @@ class Qwen3_5MoeDualAttDecoderLayer(GradientCheckpointingLayer):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
 
@@ -1167,8 +1154,6 @@ class Qwen3_5MoeDualAttDecoderLayer(GradientCheckpointingLayer):
                 `(batch, sequence_length)` where padding elements are indicated by 0.
             position_ids (`torch.LongTensor`, *optional*): Position IDs for the input sequence
             past_key_values (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
             kwargs (`dict`, *optional*):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
@@ -1189,7 +1174,6 @@ class Qwen3_5MoeDualAttDecoderLayer(GradientCheckpointingLayer):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
         hidden_states = residual + attn_mixer_out
@@ -1211,7 +1195,6 @@ class Qwen3_5MoeDualAttDecoderLayer(GradientCheckpointingLayer):
         past_key_values: HybridCache | None = None,
         output_attentions: bool | None = False,
         use_cache: bool | None = False,
-        cache_position: torch.LongTensor | None = None,
         position_embeddings: torch.Tensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, 
@@ -1236,7 +1219,6 @@ class Qwen3_5MoeDualAttDecoderLayer(GradientCheckpointingLayer):
             past_key_values (`Tuple[torch.Tensor]`, *optional*): Cached key/value states
             output_attentions (`bool`, *optional*): Whether to return attention weights
             use_cache (`bool`, *optional*): Whether to cache key/value states
-            cache_position (`torch.LongTensor`, *optional*): Cache position indices
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*): 
                 Cosine and sine positional embeddings
             **kwargs: Additional arguments for FSDP compatibility
@@ -1255,7 +1237,6 @@ class Qwen3_5MoeDualAttDecoderLayer(GradientCheckpointingLayer):
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
 
@@ -1267,7 +1248,6 @@ class Qwen3_5MoeDualAttDecoderLayer(GradientCheckpointingLayer):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 use_cache=use_cache,
-                cache_position=cache_position,
                 position_embeddings=position_embeddings,
             )
         else:
@@ -1342,7 +1322,6 @@ class Qwen3_5MoeFusedAttHybridDecoderLayer(GradientCheckpointingLayer, ABC):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
         use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,
@@ -1360,8 +1339,6 @@ class Qwen3_5MoeFusedAttHybridDecoderLayer(GradientCheckpointingLayer, ABC):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
                 Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
                 with `head_dim` being the embedding dimension of each attention head.
@@ -1382,7 +1359,6 @@ class Qwen3_5MoeFusedAttHybridDecoderLayer(GradientCheckpointingLayer, ABC):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
         
@@ -1404,7 +1380,6 @@ class Qwen3_5MoeFusedAttHybridDecoderLayer(GradientCheckpointingLayer, ABC):
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,
@@ -1427,8 +1402,6 @@ class Qwen3_5MoeFusedAttHybridDecoderLayer(GradientCheckpointingLayer, ABC):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
                 Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
                 with `head_dim` being the embedding dimension of each attention head.
@@ -1453,7 +1426,6 @@ class Qwen3_5MoeFusedAttHybridDecoderLayer(GradientCheckpointingLayer, ABC):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
         hidden_states = residual + attn_mixer_out
@@ -1480,7 +1452,6 @@ class Qwen3_5MoeFusedAttHybridDecoderLayer(GradientCheckpointingLayer, ABC):
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,
@@ -1511,8 +1482,6 @@ class Qwen3_5MoeFusedAttHybridDecoderLayer(GradientCheckpointingLayer, ABC):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
                 Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
                 with `head_dim` being the embedding dimension of each attention head.
@@ -1538,7 +1507,6 @@ class Qwen3_5MoeFusedAttHybridDecoderLayer(GradientCheckpointingLayer, ABC):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
 
@@ -1547,7 +1515,6 @@ class Qwen3_5MoeFusedAttHybridDecoderLayer(GradientCheckpointingLayer, ABC):
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
 
@@ -1648,7 +1615,6 @@ class Qwen3_5MoeFusedHybridHybridDecoderLayer(GradientCheckpointingLayer, ABC):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
         use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,
@@ -1669,8 +1635,6 @@ class Qwen3_5MoeFusedHybridHybridDecoderLayer(GradientCheckpointingLayer, ABC):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
                 Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
                 with `head_dim` being the embedding dimension of each attention head.
@@ -1693,7 +1657,6 @@ class Qwen3_5MoeFusedHybridHybridDecoderLayer(GradientCheckpointingLayer, ABC):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
         
@@ -1720,7 +1683,6 @@ class Qwen3_5MoeFusedHybridHybridDecoderLayer(GradientCheckpointingLayer, ABC):
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,
@@ -1751,8 +1713,6 @@ class Qwen3_5MoeFusedHybridHybridDecoderLayer(GradientCheckpointingLayer, ABC):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
                 Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
                 with `head_dim` being the embedding dimension of each attention head.
@@ -1779,7 +1739,6 @@ class Qwen3_5MoeFusedHybridHybridDecoderLayer(GradientCheckpointingLayer, ABC):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
 
@@ -1789,7 +1748,6 @@ class Qwen3_5MoeFusedHybridHybridDecoderLayer(GradientCheckpointingLayer, ABC):
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
 
@@ -2311,7 +2269,6 @@ class Qwen3_5MoeHMFTextModel(Qwen3_5MoeHMFPreTrainedModel):
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -2330,15 +2287,12 @@ class Qwen3_5MoeHMFTextModel(Qwen3_5MoeHMFPreTrainedModel):
             del past_key_values
             past_key_values = HybridCache(self.config)
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
 
         # mrope: the hard coded `4` is for text, temporal, height and width.
         if position_ids is None:
-            position_ids = cache_position.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
 
@@ -2352,11 +2306,10 @@ class Qwen3_5MoeHMFTextModel(Qwen3_5MoeHMFPreTrainedModel):
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=text_position_ids,
         )
-        linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
+        linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_seen_tokens)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -2371,7 +2324,6 @@ class Qwen3_5MoeHMFTextModel(Qwen3_5MoeHMFPreTrainedModel):
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
-                cache_position=cache_position,
                 **kwargs,
             )
 
@@ -2382,7 +2334,7 @@ class Qwen3_5MoeHMFTextModel(Qwen3_5MoeHMFPreTrainedModel):
             past_key_values=past_key_values,
         )
 
-    def _update_linear_attn_mask(self, attention_mask, cache_position):
+    def _update_linear_attn_mask(self, attention_mask, past_seen_tokens):
         """
         NOTE: Left-padding is used for linear attention mask.
         No need for zeroing states when
@@ -2390,7 +2342,7 @@ class Qwen3_5MoeHMFTextModel(Qwen3_5MoeHMFPreTrainedModel):
             2. Attending to all inputs
         """
         linear_attn_mask = attention_mask
-        if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
+        if past_seen_tokens > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
             linear_attn_mask = None
         return linear_attn_mask
 
@@ -2704,7 +2656,7 @@ class Qwen3_5MoeHMFModel(Qwen3_5MoeHMFPreTrainedModel):
             delta = self.rope_deltas.repeat_interleave(batch_size // self.rope_deltas.shape[0], dim=0)
             position_ids = position_ids + delta.to(device=inputs_embeds.device)
         else:
-            # Can't build correct 3D positions. Let the model infer it from `cache_position`
+            # Can't build correct 3D positions. Let the model infer them from the cache's length
             position_ids = None
         return position_ids
 
@@ -2722,7 +2674,6 @@ class Qwen3_5MoeHMFModel(Qwen3_5MoeHMFPreTrainedModel):
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5MoeHMFModelOutputWithPast:
         r"""
@@ -2776,7 +2727,6 @@ class Qwen3_5MoeHMFModel(Qwen3_5MoeHMFPreTrainedModel):
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
             **kwargs,
         )
 
@@ -2888,6 +2838,16 @@ class Qwen3_5MoeHMFForCausalLM(Qwen3_5MoeHMFPreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def _prepare_cache_for_generation(self, generation_config, model_kwargs, *args, **kwargs):
+        """
+        Gives generate() a HybridCache, which holds the state of every layer type. Otherwise, generate() would
+        build transformers' own cache from config.layer_types, and that cache has no room for the states of the
+        hybrid layers.
+        """
+        if model_kwargs.get("past_key_values") is None and generation_config.use_cache is not False:
+            model_kwargs["past_key_values"] = HybridCache(self.config.get_text_config())
+        return super()._prepare_cache_for_generation(generation_config, model_kwargs, *args, **kwargs)
+
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -2900,7 +2860,6 @@ class Qwen3_5MoeHMFForCausalLM(Qwen3_5MoeHMFPreTrainedModel, GenerationMixin):
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         output_router_logits: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeCausalLMOutputWithPast:
@@ -2924,7 +2883,6 @@ class Qwen3_5MoeHMFForCausalLM(Qwen3_5MoeHMFPreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_router_logits=output_router_logits,
-            cache_position=cache_position,
             **kwargs,
         )
 
@@ -2980,6 +2938,16 @@ class Qwen3_5MoeHMFForConditionalGeneration(Qwen3_5MoeHMFPreTrainedModel, Genera
 
         self.post_init()
 
+    def _prepare_cache_for_generation(self, generation_config, model_kwargs, *args, **kwargs):
+        """
+        Gives generate() a HybridCache, which holds the state of every layer type. Otherwise, generate() would
+        build transformers' own cache from config.layer_types, and that cache has no room for the states of the
+        hybrid layers.
+        """
+        if model_kwargs.get("past_key_values") is None and generation_config.use_cache is not False:
+            model_kwargs["past_key_values"] = HybridCache(self.config.get_text_config())
+        return super()._prepare_cache_for_generation(generation_config, model_kwargs, *args, **kwargs)
+
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
 
@@ -3032,7 +3000,6 @@ class Qwen3_5MoeHMFForConditionalGeneration(Qwen3_5MoeHMFPreTrainedModel, Genera
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
-        cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5MoeCausalLMOutputWithPast:
@@ -3058,7 +3025,6 @@ class Qwen3_5MoeHMFForConditionalGeneration(Qwen3_5MoeHMFPreTrainedModel, Genera
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
             **kwargs,
         )
 
@@ -3102,7 +3068,6 @@ class Qwen3_5MoeHMFForConditionalGeneration(Qwen3_5MoeHMFPreTrainedModel, Genera
         past_key_values=None,
         attention_mask=None,
         inputs_embeds=None,
-        cache_position=None,
         position_ids=None,
         use_cache=True,
         pixel_values=None,
@@ -3119,7 +3084,6 @@ class Qwen3_5MoeHMFForConditionalGeneration(Qwen3_5MoeHMFPreTrainedModel, Genera
             past_key_values=past_key_values,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
             position_ids=position_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
@@ -3300,8 +3264,7 @@ class Qwen3_5MoeHMFForConditionalGeneration(Qwen3_5MoeHMFPreTrainedModel, Genera
                 if key == "position_ids" and dict_to_expand[key].ndim == 3:
                     dict_to_expand[key] = dict_to_expand[key].repeat_interleave(expand_size, dim=1)
                 elif (
-                    key != "cache_position"
-                    and dict_to_expand[key] is not None
+                    dict_to_expand[key] is not None
                     and isinstance(dict_to_expand[key], torch.Tensor)
                     and key not in visual_keys
                 ):

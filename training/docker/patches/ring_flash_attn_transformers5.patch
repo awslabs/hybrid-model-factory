@@ -1,0 +1,22 @@
+--- a/ring_flash_attn/adapters/hf_adapter.py
++++ b/ring_flash_attn/adapters/hf_adapter.py
+@@ -11,11 +11,15 @@
+         is_flash_attn_greater_or_equal_2_10,
+     )
+ except ImportError:
+-    # transformers <= 4.53.x
+-    from transformers.modeling_flash_attention_utils import (
+-        is_flash_attn_greater_or_equal_2_10,
+-    )
++    # Transformers 5 deprecated is_flash_attn_greater_or_equal_2_10, so it's defined here if it's gone
++    try:
++        from transformers.utils.import_utils import is_flash_attn_greater_or_equal_2_10
++    except ImportError:
++        def is_flash_attn_greater_or_equal_2_10():
++            from transformers.utils.import_utils import is_flash_attn_greater_or_equal
+ 
++            return is_flash_attn_greater_or_equal("2.1.0")
++
+ from ..llama3_flash_attn_varlen import (
+     llama3_flash_attn_varlen_func,
+     llama3_flash_attn_prepare_cu_seqlens,

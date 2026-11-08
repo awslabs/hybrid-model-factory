@@ -189,22 +189,14 @@ class CustomTrainer(SaveShardMixin, Seq2SeqTrainer):
         # Use position_ids from inputs if available (handles SP correctly), otherwise compute local position IDs
         if "position_ids" in inputs:
             position_ids = inputs["position_ids"]
-            cache_position = position_ids[0]
         else:
-            past_seen_tokens = 0
-            cache_position = torch.arange(
-                past_seen_tokens,
-                past_seen_tokens + inputs_embeds.shape[1],
-                device=inputs_embeds.device,
-            )
-            position_ids = cache_position.unsqueeze(0)
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
 
         # Create causal mask mapping for different attention types
         mask_kwargs = {
             "config": model.model.config,
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
-            "cache_position": cache_position,
             "past_key_values": None,
             "position_ids": position_ids,
         }
@@ -232,7 +224,6 @@ class CustomTrainer(SaveShardMixin, Seq2SeqTrainer):
                     None,  # past_key_values (we do not use fused layers for inference)
                     False,  # output_attentions
                     False,  # use_cache
-                    cache_position,
                     position_embeddings,
                 )
             else:
@@ -244,7 +235,6 @@ class CustomTrainer(SaveShardMixin, Seq2SeqTrainer):
                     past_key_values=None,
                     output_attentions=False,
                     use_cache=False,
-                    cache_position=cache_position,
                     position_embeddings=position_embeddings,
                 )
 

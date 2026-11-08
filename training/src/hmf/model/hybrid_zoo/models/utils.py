@@ -24,6 +24,45 @@ LAYER_TYPE_PATTERNS = {
 }
 
 
+def validate_hybrid_layer_types(config) -> None:
+    """
+    Checks a hybrid config's layer_types, which hold the entries of its hybrid_override_pattern (such as "*", "GKA",
+    or "GDN>GKA") rather than only transformers' layer types. Transformers' own check (validate_layer_type, run
+    for every config) accepts only its layer types, so hybrid configs override it with this one, which also
+    accepts the pattern's entries (LAYER_TYPE_PATTERNS) and checks that there is one per layer.
+    """
+    from transformers.configuration_utils import ALLOWED_ATTN_LAYER_TYPES
+
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is None or getattr(config, "num_hidden_layers", None) is None:
+        return
+    allowed = set(ALLOWED_ATTN_LAYER_TYPES) | set(LAYER_TYPE_PATTERNS)
+    unknown = sorted({t for t in layer_types if t not in allowed})
+    if unknown:
+        raise ValueError(f"The `layer_types` entries must be layer types or hybrid pattern entries, got {unknown}")
+    if len(layer_types) != config.num_hidden_layers:
+        raise ValueError(
+            f"`num_hidden_layers` ({config.num_hidden_layers}) must equal the number of `layer_types` "
+            f"({len(layer_types)})"
+        )
+
+
+def validate_hybrid_config(config) -> None:
+    """
+    Runs transformers' checks of a config (the class validators of PreTrainedConfig), with the hybrid check
+    validate_hybrid_layer_types in place of validate_layer_type. Hybrid configs override validate() with this
+    function, since save_pretrained calls validate(), while the checks at the end of PreTrainedConfig.__init__ run
+    before the hybrid configs set their layer_types.
+    """
+    from transformers import PreTrainedConfig
+
+    for validator in PreTrainedConfig.__class_validators__:
+        if validator.__name__ == "validate_layer_type":
+            validate_hybrid_layer_types(config)
+        else:
+            validator(config)
+
+
 def build_decoder_layer_registry(module_or_dict, model_prefix: str) -> Dict[str, Type]:
     """
     Automatically build a decoder layer registry by finding classes in a module.

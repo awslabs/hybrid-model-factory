@@ -238,7 +238,10 @@ class CacheComposerMixin:
         past_key_values: HybridCache,
         kwargs: Dict[str, Any]
     ) -> torch.Tensor:
-        """Prepend prefix, create attention mask, compute cache position."""
+        """
+        Prepends the prefix, builds the attention mask, and sets the positions when the cache's length doesn't
+        match the number of tokens.
+        """
         attention_mask = torch.ones_like(input_ids)
         final_input_ids = input_ids
         
@@ -251,11 +254,6 @@ class CacheComposerMixin:
             attention_mask = self._create_attention_mask(final_input_ids, past_key_values)
         
         kwargs['attention_mask'] = attention_mask
-        kwargs['cache_position'] = torch.tensor(
-            [final_input_ids.shape[1] - 1], 
-            device=final_input_ids.device,
-            dtype=torch.long
-        )
         
         if past_key_values is not None and not past_key_values.check_seqlen_match():
             kwargs['position_ids'] = torch.full(

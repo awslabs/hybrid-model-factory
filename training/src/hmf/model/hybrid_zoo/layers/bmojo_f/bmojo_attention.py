@@ -542,7 +542,6 @@ class BMOJOAttention(nn.Module):
         past_key_values: Optional["BMojoCache"] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: Optional[Tensor] = None,
         position_embeddings: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> Tuple[Tensor, None, Optional[Tensor]]:
         """
@@ -557,7 +556,6 @@ class BMOJOAttention(nn.Module):
             past_key_values: BMojoCache object containing KV cache for in-context and fading tokens.
             output_attentions: Whether to return attention weights (not currently used).
             use_cache: Whether to use KV caching (not currently used).
-            cache_position: Optional cache position indices (not currently used).
             position_embeddings: Tuple of (cos, sin) tensors for rotary positional embeddings,
                 each with shape [B, L, D] or [1, L, D]. Required for proper position encoding.
 

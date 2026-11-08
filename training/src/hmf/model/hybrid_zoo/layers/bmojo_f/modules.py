@@ -110,7 +110,6 @@ class BMojoLayer(nn.Module):
         position_ids: Optional[Tensor] = None,
         past_key_values: Optional["HybridCache"] = None,
         use_cache: Optional[bool] = False,
-        cache_position: Optional[Tensor] = None,
         position_embeddings: Optional[Tuple[Tensor, Tensor]] = None,
         **kwargs,
     ) -> Tuple[Tensor, None, Optional["BMojoCache"]]:
@@ -128,7 +127,6 @@ class BMojoLayer(nn.Module):
             position_ids: Optional position indices tensor (not currently used).
             past_key_values: HybridCache object, extracts B'MOJO-specific cache if present.
             use_cache: Whether the SSM mixer keeps its state in the cache, which GDN and GKA need.
-            cache_position: Optional cache position tensor (not currently used).
             position_embeddings: Optional tuple of (cos, sin) for rotary embeddings.
             **kwargs: Additional arguments, ignored.
 
@@ -169,7 +167,6 @@ class BMojoLayer(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=bmojo_f_past_key_values,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
 

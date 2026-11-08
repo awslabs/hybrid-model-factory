@@ -267,7 +267,6 @@ class Qwen2Attention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -281,9 +280,7 @@ class Qwen2Attention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -345,14 +342,13 @@ class Qwen2SWAttention(Qwen2Attention):
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[HybridCache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         
         if self.sequence_parallel_group is not None:
             return self._forward_sp(
                 hidden_states, position_embeddings, attention_mask,
-                past_key_values, cache_position, **kwargs,
+                past_key_values, **kwargs,
             )
         
         attn_output, attn_weights = super().forward(
@@ -360,7 +356,6 @@ class Qwen2SWAttention(Qwen2Attention):
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
-            cache_position=cache_position,
             **kwargs
         )
         
@@ -374,7 +369,6 @@ class Qwen2SWAttention(Qwen2Attention):
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[HybridCache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], None]:
         assert attention_mask is None, (
@@ -406,7 +400,6 @@ class Qwen2SWAttention(Qwen2Attention):
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
-                cache_position=cache_position,
                 **kwargs,
             )
 
@@ -441,7 +434,6 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         position_ids: torch.LongTensor | None = None,
         past_key_values: HybridCache | None = None,
         use_cache: bool | None = False,
-        cache_position: torch.LongTensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
@@ -454,7 +446,6 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -534,7 +525,6 @@ class Qwen2HybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
         past_key_values: Optional[HybridCache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,
@@ -557,8 +547,6 @@ class Qwen2HybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
                 Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
                 with `head_dim` being the embedding dimension of each attention head.
@@ -580,7 +568,6 @@ class Qwen2HybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -698,7 +685,6 @@ class Qwen2DualAttDecoderLayer(nn.Module):
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,
@@ -720,8 +706,6 @@ class Qwen2DualAttDecoderLayer(nn.Module):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
                 Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
                 with `head_dim` being the embedding dimension of each attention head.
@@ -746,7 +730,6 @@ class Qwen2DualAttDecoderLayer(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
         hidden_states = residual + attn_mixer_out
@@ -768,7 +751,6 @@ class Qwen2DualAttDecoderLayer(nn.Module):
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,
@@ -795,7 +777,6 @@ class Qwen2DualAttDecoderLayer(nn.Module):
             past_key_values (`Tuple[torch.Tensor]`, *optional*): Cached key/value states
             output_attentions (`bool`, *optional*): Whether to return attention weights
             use_cache (`bool`, *optional*): Whether to cache key/value states
-            cache_position (`torch.LongTensor`, *optional*): Cache position indices
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*): 
                 Cosine and sine positional embeddings
             **kwargs: Additional arguments for FSDP compatibility
@@ -814,7 +795,6 @@ class Qwen2DualAttDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
 
@@ -826,7 +806,6 @@ class Qwen2DualAttDecoderLayer(nn.Module):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 use_cache=use_cache,
-                cache_position=cache_position,
                 position_embeddings=position_embeddings,
             )
         else:
@@ -908,7 +887,6 @@ class Qwen2FusedAttHybridDecoderLayer(nn.Module, ABC):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
         use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,
@@ -926,8 +904,6 @@ class Qwen2FusedAttHybridDecoderLayer(nn.Module, ABC):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
                 Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
                 with `head_dim` being the embedding dimension of each attention head.
@@ -948,7 +924,6 @@ class Qwen2FusedAttHybridDecoderLayer(nn.Module, ABC):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
         
@@ -970,7 +945,6 @@ class Qwen2FusedAttHybridDecoderLayer(nn.Module, ABC):
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,
@@ -993,8 +967,6 @@ class Qwen2FusedAttHybridDecoderLayer(nn.Module, ABC):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
                 Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
                 with `head_dim` being the embedding dimension of each attention head.
@@ -1020,7 +992,6 @@ class Qwen2FusedAttHybridDecoderLayer(nn.Module, ABC):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
         hidden_states = residual + attn_mixer_out
@@ -1047,7 +1018,6 @@ class Qwen2FusedAttHybridDecoderLayer(nn.Module, ABC):
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,
@@ -1078,8 +1048,6 @@ class Qwen2FusedAttHybridDecoderLayer(nn.Module, ABC):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
                 Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
                 with `head_dim` being the embedding dimension of each attention head.
@@ -1105,7 +1073,6 @@ class Qwen2FusedAttHybridDecoderLayer(nn.Module, ABC):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
 
@@ -1114,7 +1081,6 @@ class Qwen2FusedAttHybridDecoderLayer(nn.Module, ABC):
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
 
@@ -1249,7 +1215,6 @@ class HybridQwen2Model(HybridQwen2PreTrainedModel):
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1268,14 +1233,10 @@ class HybridQwen2Model(HybridQwen2PreTrainedModel):
             del past_key_values
             past_key_values = HybridCache(self.config)
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
-
         if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.unsqueeze(0)
 
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
@@ -1298,7 +1259,6 @@ class HybridQwen2Model(HybridQwen2PreTrainedModel):
                     "config": self.config,
                     "inputs_embeds": inputs_embeds,
                     "attention_mask": attention_mask,
-                    "cache_position": cache_position,
                     "past_key_values": past_key_values,
                     "position_ids": position_ids,
                 }
@@ -1322,7 +1282,6 @@ class HybridQwen2Model(HybridQwen2PreTrainedModel):
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
-                cache_position=cache_position,
                 **kwargs,
             )
 
@@ -1348,6 +1307,16 @@ class HybridQwen2ForCausalLM(HybridQwen2PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def _prepare_cache_for_generation(self, generation_config, model_kwargs, *args, **kwargs):
+        """
+        Gives generate() a HybridCache, which holds the state of every layer type. Otherwise, generate() would
+        build a DynamicCache from config.layer_types, but those hold the hybrid pattern's entries (such as "GKA")
+        rather than transformers' layer types.
+        """
+        if model_kwargs.get("past_key_values") is None and generation_config.use_cache is not False:
+            model_kwargs["past_key_values"] = HybridCache(self.config)
+        return super()._prepare_cache_for_generation(generation_config, model_kwargs, *args, **kwargs)
+
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -1359,7 +1328,6 @@ class HybridQwen2ForCausalLM(HybridQwen2PreTrainedModel, GenerationMixin):
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
@@ -1370,7 +1338,6 @@ class HybridQwen2ForCausalLM(HybridQwen2PreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            cache_position=cache_position,
             **kwargs,
         )
 

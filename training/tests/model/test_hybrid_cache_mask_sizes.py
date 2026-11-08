@@ -60,12 +60,14 @@ def _left_padded_mask(ids, pad=4):
 
 def test_mask_sizes_count_cached_tokens():
     cache = HybridCache(_model().config)
-    assert cache.get_mask_sizes(torch.arange(5), 0) == (5, 0)  # nothing cached yet
+    assert cache.get_mask_sizes(5, 0) == (5, 0)  # nothing cached yet
+    assert cache.get_query_offset(0) == 0
     k = torch.zeros(1, 2, 7, 16)
     cache.update(k, k, layer_idx=3)
-    # Asked about a layer without K/V (e.g. a GDN layer 0): still the attention length.
-    assert cache.get_mask_sizes(torch.arange(7, 10), 0) == (10, 0)
-    assert cache.get_mask_sizes(torch.arange(7, 8), 3) == (8, 0)
+    # A layer without keys and values, such as a GDN layer 0, still gets the attention cache's length
+    assert cache.get_mask_sizes(3, 0) == (10, 0)
+    assert cache.get_mask_sizes(1, 3) == (8, 0)
+    assert cache.get_query_offset(0) == cache.get_query_offset(3) == 7
 
 
 @pytest.mark.parametrize("attn", ["sdpa", "eager"])

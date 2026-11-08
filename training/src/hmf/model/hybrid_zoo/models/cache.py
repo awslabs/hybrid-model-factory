@@ -305,10 +305,10 @@ class HybridCache(Cache):
         # This includes: GDN, GKA, Mamba2, and B'MOJO
         return self.seqlen_offset
 
-    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> Tuple[int, int]:
+    def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> Tuple[int, int]:
         """
-        Returns the key length and offset that the attention masks of transformers' create_causal_mask
-        cover, which are the tokens already in the attention cache plus the new ones, starting at 0.
+        Returns the key length and offset that the attention masks of transformers' create_causal_mask cover,
+        which are the tokens already in the attention cache plus the query_length new ones, starting at 0.
 
         The base Cache reads these sizes from self.layers, which HybridCache leaves empty, so without this
         override the masks would cover only the new tokens. The padding of the cached tokens would then go
@@ -317,7 +317,14 @@ class HybridCache(Cache):
         entry gives the cached length. layer_idx is not used, because the layer that create_causal_mask asks
         about may be a GDN or other non-attention layer.
         """
-        return self._cached_attention_length() + cache_position.shape[0], 0
+        return self._cached_attention_length() + query_length, 0
+
+    def get_query_offset(self, layer_idx: int = 0) -> int:
+        """
+        Returns the position of the first new query among the keys that create_causal_mask covers, which is the
+        number of tokens already in the attention cache (see get_mask_sizes, whose keys start at 0).
+        """
+        return self._cached_attention_length()
 
     def _cached_attention_length(self) -> int:
         """Returns the number of tokens in the attention key and value cache, 0 before the first update."""

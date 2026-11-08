@@ -17,6 +17,8 @@ from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_rope_utils import RopeParameters
 from transformers.utils import logging
 
+from ..utils import validate_hybrid_config
+
 
 logger = logging.get_logger(__name__)
 
@@ -152,7 +154,6 @@ class HybridQwen2Config(PreTrainedConfig):
         self.sliding_window = sliding_window if self.use_sliding_window else None
         self.max_window_layers = max_window_layers
         self.hybrid_override_pattern = hybrid_override_pattern
-        self.layer_types = layer_types
 
         # for backward compatibility
         if num_key_value_heads is None:
@@ -166,9 +167,9 @@ class HybridQwen2Config(PreTrainedConfig):
         self.attention_dropout = attention_dropout
 
         if self.hybrid_override_pattern is not None:
-            self.layer_types = self.hybrid_override_pattern.split("-")
-        elif self.layer_types is None:
-            self.layer_types = [
+            layer_types = self.hybrid_override_pattern.split("-")
+        elif layer_types is None:
+            layer_types = [
                 (
                     "sliding_attention"
                     if self.sliding_window is not None and i >= self.max_window_layers
@@ -176,7 +177,10 @@ class HybridQwen2Config(PreTrainedConfig):
                 )
                 for i in range(self.num_hidden_layers)
             ]
-        assert len(self.layer_types) == self.num_hidden_layers, f"Number of elements in layer_types ({len(self.layer_types)}) does not equal num_hidden_layers ({self.num_hidden_layers})"
+        assert len(layer_types) == self.num_hidden_layers, (
+            f"Number of elements in layer_types ({len(layer_types)}) "
+            f"does not equal num_hidden_layers ({self.num_hidden_layers})"
+        )
 
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
@@ -185,6 +189,14 @@ class HybridQwen2Config(PreTrainedConfig):
         self.rope_parameters = rope_parameters
 
         super().__init__(**kwargs)
+        # layer_types is set only now, since the checks at the end of PreTrainedConfig.__init__ accept only
+        # transformers' layer types, while a hybrid config's layer_types hold the hybrid pattern's entries. The
+        # validate() override below checks them instead, and save_pretrained calls it.
+        self.layer_types = layer_types
+
+    def validate(self):
+        """Runs transformers' checks of the config, with the hybrid check of layer_types in place of its own."""
+        validate_hybrid_config(self)
 
 
 __all__ = ["HybridQwen2Config"]

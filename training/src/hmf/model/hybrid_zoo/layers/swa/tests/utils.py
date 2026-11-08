@@ -25,10 +25,24 @@ from transformers import AutoConfig
 
 from hmf.train.pt.workflow import set_sequence_parallel_group_recursive
 from hmf.model.hybrid_zoo.models.model_register import register_hybrid_models
+from hmf.model.hybrid_zoo.models.hybrid_ministral3.modeling_hybrid_ministral3 import (
+    Ministral3RotaryEmbedding,
+    Ministral3SWAttention,
+)
 from hmf.model.hybrid_zoo.models.hybrid_qwen3.modeling_hybrid_qwen3 import (
     Qwen3RotaryEmbedding,
     Qwen3SWAttention,
 )
+
+
+def swa_classes(config):
+    """
+    Returns the SWA attention and rotary embedding classes of the config's family, which are hybrid Ministral3's
+    for a hybrid_ministral3 config, whose SWA also scales its queries by position, and hybrid Qwen3's otherwise.
+    """
+    if config.model_type == "hybrid_ministral3":
+        return Ministral3SWAttention, Ministral3RotaryEmbedding
+    return Qwen3SWAttention, Qwen3RotaryEmbedding
 
 
 def set_seed(rank, seed=42):
@@ -163,7 +177,7 @@ def make_position_embeddings(
     Returns:
         Tuple of (cos, sin), each of shape [1, seqlen, head_dim].
     """
-    rotary_emb = Qwen3RotaryEmbedding(config, device=device)
+    rotary_emb = swa_classes(config)[1](config, device=device)
     # Dummy hidden states just for dtype/device
     dummy = torch.zeros(1, seqlen, config.hidden_size, device=device, dtype=dtype)
     position_ids = torch.arange(seqlen, device=device).unsqueeze(0)
@@ -186,7 +200,7 @@ def get_local_result(
     assert seqlen % (2 * world_size) == 0
 
     # Create model
-    local_model = Qwen3SWAttention(config=config, layer_idx=0)
+    local_model = swa_classes(config)[0](config=config, layer_idx=0)
     set_sequence_parallel_group_recursive(local_model, sp_group)
 
     if state_dict_path is not None:
@@ -206,9 +220,11 @@ def get_local_result(
     local_input = extract_local(input_tensor, rank, world_size).detach().clone()
     local_input.requires_grad = True
 
-    # Extract local position embeddings
+    # Extract local position embeddings, and the positions, which the layers get in kwargs as in a model
     local_cos = extract_local(cos, rank, world_size).detach().clone()
     local_sin = extract_local(sin, rank, world_size).detach().clone()
+    position_ids = torch.arange(seqlen, device=device).unsqueeze(0)
+    local_position_ids = extract_local(position_ids, rank, world_size)
 
     # Extract local dout
     dout_tensor = dout_tensor.to(device=device, dtype=dtype)
@@ -222,6 +238,7 @@ def get_local_result(
         hidden_states=local_input,
         position_embeddings=(local_cos, local_sin),
         attention_mask=None,
+        position_ids=local_position_ids,
     )
 
     if rank == 0:
@@ -271,7 +288,7 @@ def get_global_result(
     rank, world_size, device, cp_size, sp_group = distr_configs
 
     # Create model without SP
-    global_model = Qwen3SWAttention(config=config, layer_idx=0)
+    global_model = swa_classes(config)[0](config=config, layer_idx=0)
     global_model.load_state_dict(state_dict)
     global_model.to(device, dtype)
 
@@ -283,8 +300,12 @@ def get_global_result(
     input_tensor = input_tensor.to(device=device, dtype=dtype)
 
     # Forward
+    position_ids = torch.arange(seqlen, device=device).unsqueeze(0)
     global_out, _, _ = global_model(
-        hidden_states=input_tensor, position_embeddings=(cos, sin), attention_mask=None
+        hidden_states=input_tensor,
+        position_embeddings=(cos, sin),
+        attention_mask=None,
+        position_ids=position_ids,
     )
 
     if rank == 0:

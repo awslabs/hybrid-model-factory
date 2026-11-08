@@ -67,7 +67,7 @@ def _mask_for(attn, padding, q_len, past=0):
         config=cfg,
         inputs_embeds=torch.zeros(padding.shape[0], q_len, HIDDEN),
         attention_mask=padding,
-        cache_position=torch.arange(past, past + q_len),
+        position_ids=torch.arange(past, past + q_len).unsqueeze(0),
         past_key_values=cache,
     )
 
