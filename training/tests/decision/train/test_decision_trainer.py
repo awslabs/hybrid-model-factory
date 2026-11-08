@@ -597,7 +597,7 @@ def _train_on(tmp_path, name, model_dir, lora_target, rows, **overrides):
         "learning_rate": 1e-3,
         "decision_head_lr": 1e-2,
         "lr_scheduler_type": "constant",
-        "warmup_ratio": 0.0,
+        "warmup_steps": 0,
         "train_sampling_strategy": "sequential",
         "save_strategy": "no",
         "logging_steps": 1,

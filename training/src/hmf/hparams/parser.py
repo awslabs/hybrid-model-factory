@@ -71,10 +71,38 @@ def read_args(args: dict[str, Any] | list[str] | None = None) -> dict[str, Any] 
         return sys.argv[1:]
 
 
+def _check_removed_args(args: dict[str, Any] | list[str]) -> None:
+    r"""
+    Raises an error that says how to fix a config that sets warmup_ratio, which transformers 5.22.2 removed.
+    Otherwise, the parser would only report it as an unused key, or drop it silently under ALLOW_EXTRA_ARGS.
+    """
+    if isinstance(args, dict):
+        if "warmup_ratio" not in args:
+            return
+        ratio, has_steps = args["warmup_ratio"], "warmup_steps" in args
+    else:
+        flags = [arg.split("=", 1)[0] for arg in args]
+        if "--warmup_ratio" not in flags:
+            return
+        index = flags.index("--warmup_ratio")
+        if "=" in args[index]:
+            ratio = args[index].split("=", 1)[1]
+        else:
+            ratio = args[index + 1] if index + 1 < len(args) else "<ratio>"
+        has_steps = "--warmup_steps" in flags
+
+    fix = "remove warmup_ratio and keep warmup_steps" if has_steps else f"set warmup_steps: {ratio} instead"
+    raise ValueError(
+        f"warmup_ratio was removed in transformers 5.22.2, so {fix}. Transformers reads a warmup_steps below 1 as a "
+        "ratio of the training steps."
+    )
+
+
 def _parse_args(
     parser: "HfArgumentParser", args: dict[str, Any] | list[str] | None = None, allow_extra_keys: bool = False
 ) -> tuple[Any]:
     args = read_args(args)
+    _check_removed_args(args)
     if isinstance(args, dict):
         return parser.parse_dict(args, allow_extra_keys=allow_extra_keys)
 

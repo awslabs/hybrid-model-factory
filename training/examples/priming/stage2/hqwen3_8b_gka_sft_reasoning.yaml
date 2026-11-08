@@ -27,7 +27,7 @@ per_device_train_batch_size: 1
 gradient_accumulation_steps: 1    # 4M token batch size on 128 GPUs
 learning_rate: 5.0e-5
 lr_scheduler_type: cosine
-warmup_ratio: 0.1
+warmup_steps: 0.1
 num_train_epochs: 1.0
 max_grad_norm: 1.0
 sequence_parallel_size: 1
