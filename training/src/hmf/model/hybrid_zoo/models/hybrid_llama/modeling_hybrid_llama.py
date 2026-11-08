@@ -674,6 +674,7 @@ class LlamaDualAttDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -681,7 +682,9 @@ class LlamaDualAttDecoderLayer(nn.Module):
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, 
                torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """
-        Forward pass that processes two separate hidden state streams through attention.
+        Forward pass that processes two separate hidden state streams through attention. output_attentions is
+        unused, and kept so that positional calls (the HKD trainer's gradient checkpointing) match the other
+        families' layers.
         """
         # Attention output given hybrid input (or initial embedding)
         hybrid_out, hybrid_mlp_out, hybrid_mixer_out = self._forward(

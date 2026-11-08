@@ -770,6 +770,7 @@ class Qwen3MoeDualAttDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[
@@ -796,6 +797,8 @@ class Qwen3MoeDualAttDecoderLayer(nn.Module):
             attention_mask (`torch.FloatTensor`, *optional*): Attention mask
             position_ids (`torch.LongTensor`, *optional*): Position IDs for the input
             past_key_values (`Tuple[torch.Tensor]`, *optional*): Cached key/value states
+            output_attentions (`bool`, *optional*): Unused, kept so that positional calls (the HKD trainer's
+                gradient checkpointing) match the other families' layers
             use_cache (`bool`, *optional*): Whether to cache key/value states
             cache_position (`torch.LongTensor`, *optional*): Cache position indices
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*): 
