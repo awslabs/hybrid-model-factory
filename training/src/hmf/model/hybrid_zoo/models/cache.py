@@ -84,11 +84,6 @@ class Mamba2Cache(_HybridCachePart):
 class BMojoCache(_HybridCachePart):
     """Cache for B'MOJO-F layer."""
 
-    def __init__(self, parent_cache):
-        super().__init__(parent_cache)
-        self.max_sequence_length = parent_cache.config.max_position_embeddings
-        self.max_batch_size = getattr(parent_cache.config, "batch_size", 1)
-
     @property
     def key_value_memory_dict(self) -> Dict[int, Any]:
         return self.parent._bmojo_f_memory_dict
@@ -101,12 +96,6 @@ class BMojoCache(_HybridCachePart):
     def seqlen_offset(self) -> int:
         """Expose parent's global seqlen_offset for BMojo attention"""
         return self.parent.seqlen_offset
-
-    @property
-    def batch_size_offset(self) -> int:
-        """Expose batch_size_offset for batched inference"""
-        # If parent doesn't have it, default to 0
-        return getattr(self.parent, "batch_size_offset", 0)
 
 
 class GatedDeltaNetCache(_HybridCachePart):

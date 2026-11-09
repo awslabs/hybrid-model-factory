@@ -66,6 +66,15 @@ from ..sp_p2p_utils import reorder_for_ssm_p2p
 from .bmojo_attention_utils import bmojo_self_attention
 
 
+
+def _last_tokens(states: Tensor, count: int) -> Tensor:
+    """
+    Returns the last count tokens of states, shaped [L, B, Hkv, D], as a tensor of their own, so that the cache doesn't
+    keep the rest of the sequence alive through a view.
+    """
+    return states[-count:].clone() if states.shape[0] > count else states
+
+
 class BMOJOAttention(nn.Module):
     def __init__(
         self,
@@ -349,8 +358,8 @@ class BMOJOAttention(nn.Module):
         - With cache, decoding (seqlen_offset > 0): Incremental generation, one token at a time
 
         During cached inference, this method:
-        - Allocates cache buffers on first call
-        - Updates cache with new KV pairs and retrieves cached tokens
+        - Appends the new keys and values to the cached ones, and keeps those of the last 2w tokens in the cache,
+          since no later token reads further back (w = bmojo_config["window_size"])
         - Adjusts fading memory to exclude the last W tokens (handled by in-context path)
 
         The fading tensors (query_fading, key_fading, value_fading) become None when the total sequence
@@ -398,89 +407,27 @@ class BMOJOAttention(nn.Module):
                 value_fading,
             )
 
-        # Allocate cache buffers on first use
-        if self.layer_idx not in past_key_values.key_value_memory_dict:
-            inf_max_seq_length = past_key_values.max_sequence_length
-            # The cache's batch size comes from config.batch_size, 1 by default, so a larger batch gets buffers of
-            # its own size, as Mamba2's cache does
-            inf_max_batch_size = max(past_key_values.max_batch_size, key_in_ctx.size(1))
-
-            inference_key_memory = {
-                "in-context": self._allocate_memory(
-                    inf_max_seq_length,
-                    inf_max_batch_size,
-                    self.head_dim,
-                    key_in_ctx.dtype,
-                ),
-                "fading-memory": self._allocate_memory(
-                    inf_max_seq_length,
-                    inf_max_batch_size,
-                    self.head_dim,
-                    key_fading.dtype,
-                ),
-            }
-
-            inference_value_memory = {
-                "in-context": self._allocate_memory(
-                    inf_max_seq_length,
-                    inf_max_batch_size,
-                    self.head_dim,
-                    value_in_ctx.dtype,
-                ),
-                "fading-memory": self._allocate_memory(
-                    inf_max_seq_length,
-                    inf_max_batch_size,
-                    self.head_dim,
-                    value_fading.dtype,
-                ),
-            }
-
-            past_key_values.key_value_memory_dict[self.layer_idx] = (
-                inference_key_memory,
-                inference_value_memory,
-            )
-        else:
-            # Retrieve pre-allocated buffers
-            inference_key_memory, inference_value_memory = past_key_values.key_value_memory_dict[
-                self.layer_idx
-            ]
-
-        # Determine batch and sequence slices for cache update
-        batch_start = past_key_values.batch_size_offset
-        batch_end = batch_start + key_in_ctx.size(1)
-        assert batch_end <= inference_key_memory["in-context"].size(1)
-
-        sequence_start = past_key_values.seqlen_offset
-        sequence_end = sequence_start + key_in_ctx.size(0)
-        assert sequence_end <= inference_key_memory["in-context"].size(0)
-
-        # Update in-context cache
-        inference_key_memory["in-context"][
-            sequence_start:sequence_end, batch_start:batch_end, ...
-        ] = key_in_ctx
-        inference_value_memory["in-context"][
-            sequence_start:sequence_end, batch_start:batch_end, ...
-        ] = value_in_ctx
-        key_in_ctx = inference_key_memory["in-context"][
-            :sequence_end, batch_start:batch_end, ...
-        ]
-        value_in_ctx = inference_value_memory["in-context"][
-            :sequence_end, batch_start:batch_end, ...
-        ]
-
-        # Update fading memory cache
-        inference_key_memory["fading-memory"][
-            sequence_start:sequence_end, batch_start:batch_end, ...
-        ] = key_fading
-        inference_value_memory["fading-memory"][
-            sequence_start:sequence_end, batch_start:batch_end, ...
-        ] = value_fading
-        key_fading = inference_key_memory["fading-memory"][
-            :sequence_end, batch_start:batch_end, ...
-        ]
-        value_fading = inference_value_memory["fading-memory"][
-            :sequence_end, batch_start:batch_end, ...
-        ]
+        # The token at position i reads in-context keys and values at [i-w+1, i] and fading ones at [i-2w+1, i-w],
+        # where w = bmojo_config["window_size"], so no later token reads further back than the last 2w tokens, and
+        # the cache keeps only those
+        kept_tokens = 2 * (window_size + 1)
+        cached = past_key_values.key_value_memory_dict.get(self.layer_idx)
+        if cached is not None:
+            cached_keys, cached_values = cached
+            key_in_ctx = torch.cat([cached_keys["in-context"], key_in_ctx])
+            value_in_ctx = torch.cat([cached_values["in-context"], value_in_ctx])
+            key_fading = torch.cat([cached_keys["fading-memory"], key_fading])
+            value_fading = torch.cat([cached_values["fading-memory"], value_fading])
+        past_key_values.key_value_memory_dict[self.layer_idx] = (
+            {
+                "in-context": _last_tokens(key_in_ctx, kept_tokens),
+                "fading-memory": _last_tokens(key_fading, kept_tokens),
+            },
+            {
+                "in-context": _last_tokens(value_in_ctx, kept_tokens),
+                "fading-memory": _last_tokens(value_fading, kept_tokens),
+            },
+        )
 
         # Adjust fading memory based on window size
         if len(key_fading) <= window_size + 1:
@@ -502,35 +449,6 @@ class BMOJOAttention(nn.Module):
             query_fading,
             key_fading,
             value_fading,
-        )
-
-    def _allocate_memory(
-        self,
-        inference_max_sequence_length: int,
-        batch_size: int,
-        dim: int,
-        dtype: torch.dtype,
-    ) -> Tensor:
-        """
-        Allocate memory buffer to store KV cache during inference.
-
-        Args:
-            inference_max_sequence_length: Maximum sequence length for inference.
-            batch_size: Batch size for inference.
-            dim: Head dimension (self.head_dim).
-            dtype: Data type for the cache tensor.
-
-        Returns:
-            Allocated tensor with shape [inference_max_sequence_length, batch_size,
-                num_key_value_heads, dim] on the current CUDA device.
-        """
-        return torch.empty(
-            inference_max_sequence_length,
-            batch_size,
-            self.num_key_value_heads,
-            dim,
-            dtype=dtype,
-            device=torch.cuda.current_device(),
         )
 
     def forward(
