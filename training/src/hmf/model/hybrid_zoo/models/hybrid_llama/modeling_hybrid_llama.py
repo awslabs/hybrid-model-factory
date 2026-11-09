@@ -260,7 +260,11 @@ class LlamaAttention(nn.Module):
         # Note: Llama does NOT use QK-norm (unlike Qwen3)
         # Added below for consistency with Qwen models
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
-        self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
+        # HybridLlamaConfig has no sliding_window of its own, since Llama has no sliding layers. HMF's SWA layers are
+        # the only sliding ones, and LlamaSWAttention sets their window from swa_config.
+        self.sliding_window = (
+            getattr(config, "sliding_window", None) if self.layer_type == "sliding_attention" else None
+        )
 
     def forward(
         self,
@@ -967,7 +971,7 @@ class HybridLlamaModel(HybridLlamaPreTrainedModel):
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-        self.has_sliding_layers = "sliding_attention" in self.config.layer_types or "SWA" in self.config.layer_types
+        self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1085,8 +1089,8 @@ class HybridLlamaForCausalLM(HybridLlamaPreTrainedModel, GenerationMixin):
     def _prepare_cache_for_generation(self, generation_config, model_kwargs, *args, **kwargs):
         """
         Gives generate() a HybridCache, which holds the state of every layer type. Otherwise, generate() would
-        build a DynamicCache from config.layer_types, but those hold the hybrid pattern's entries (such as "GKA")
-        rather than transformers' layer types.
+        build transformers' DynamicCache from config.layer_types, and a DynamicCache cannot hold the states of the
+        Mamba2, B'MOJO, GDN, and GKA layers.
         """
         if model_kwargs.get("past_key_values") is None and generation_config.use_cache is not False:
             model_kwargs["past_key_values"] = HybridCache(self.config)

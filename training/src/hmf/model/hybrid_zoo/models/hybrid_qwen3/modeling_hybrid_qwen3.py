@@ -1185,7 +1185,7 @@ class HybridQwen3Model(HybridQwen3PreTrainedModel):
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-        self.has_sliding_layers = "sliding_attention" in self.config.layer_types or "SWA" in self.config.layer_types
+        self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1301,8 +1301,8 @@ class HybridQwen3ForCausalLM(HybridQwen3PreTrainedModel, GenerationMixin):
     def _prepare_cache_for_generation(self, generation_config, model_kwargs, *args, **kwargs):
         """
         Gives generate() a HybridCache, which holds the state of every layer type. Otherwise, generate() would
-        build a DynamicCache from config.layer_types, but those hold the hybrid pattern's entries (such as "GKA")
-        rather than transformers' layer types.
+        build transformers' DynamicCache from config.layer_types, and a DynamicCache cannot hold the states of the
+        Mamba2, B'MOJO, GDN, and GKA layers.
         """
         if model_kwargs.get("past_key_values") is None and generation_config.use_cache is not False:
             model_kwargs["past_key_values"] = HybridCache(self.config)

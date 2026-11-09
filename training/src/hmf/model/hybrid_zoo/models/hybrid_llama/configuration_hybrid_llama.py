@@ -17,7 +17,7 @@ from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_rope_utils import RopeParameters
 from transformers.utils import logging
 
-from ..utils import validate_hybrid_config
+from ..utils import hybrid_layer_types
 
 
 logger = logging.get_logger(__name__)
@@ -166,8 +166,13 @@ class HybridLlamaConfig(PreTrainedConfig):
                 rope_parameters.update(rope_scaling)
         self.rope_parameters = rope_parameters
 
+        # A config with a hybrid pattern derives layer_types from the pattern, starting from the layers of the base
+        # Llama model, which are all full attention
         if self.hybrid_override_pattern is not None:
-            layer_types = self.hybrid_override_pattern.split("-")
+            layer_types = hybrid_layer_types(
+                self.hybrid_override_pattern, ["full_attention"] * self.num_hidden_layers
+            )
+        self.layer_types = layer_types
 
         self.tie_word_embeddings = tie_word_embeddings
         self.pad_token_id = pad_token_id
@@ -175,14 +180,6 @@ class HybridLlamaConfig(PreTrainedConfig):
         self.eos_token_id = eos_token_id
 
         super().__init__(**kwargs)
-        # layer_types is set only now, since the checks at the end of PreTrainedConfig.__init__ accept only
-        # transformers' layer types, while a hybrid config's layer_types hold the hybrid pattern's entries. The
-        # validate() override below checks them instead, and save_pretrained calls it.
-        self.layer_types = layer_types
-
-    def validate(self):
-        """Runs transformers' checks of the config, with the hybrid check of layer_types in place of its own."""
-        validate_hybrid_config(self)
 
 
 __all__ = ["HybridLlamaConfig"]

@@ -35,7 +35,11 @@ from hmf.model.hybrid_zoo.models.qwen3_5_moe_hmf.modeling_qwen3_5_moe_hmf import
 from hmf.model.hybrid_zoo.models.qwen3_5_hmf.modeling_qwen3_5_hmf import (
     Qwen3_5HMFForCausalLM,
 )
-from hmf.model.hybrid_zoo.models.utils import LAYER_TYPE_PATTERNS
+from hmf.model.hybrid_zoo.models.hybrid_llama.configuration_hybrid_llama import HybridLlamaConfig
+from hmf.model.hybrid_zoo.models.hybrid_qwen2.configuration_hybrid_qwen2 import HybridQwen2Config
+from hmf.model.hybrid_zoo.models.hybrid_qwen3.configuration_hybrid_qwen3 import HybridQwen3Config
+from hmf.model.hybrid_zoo.models.hybrid_qwen3_moe.configuration_hybrid_qwen3_moe import HybridQwen3MoeConfig
+from hmf.model.hybrid_zoo.models.utils import LAYER_TYPE_PATTERNS, hybrid_layer_types
 
 
 logger = get_logger(__name__)
@@ -144,36 +148,12 @@ def load_model(
     return model, config, tokenizer
 
 
-def unfuse_layer_type(layer_type: str) -> str:
-    """
-    Convert a single fused layer type to its unfused equivalent.
-    
-    Args:
-        layer_type: A single layer type string (e.g., "*DA", "GDN*", "*", "GDN>GKA").
-        
-    Returns:
-        The unfused layer type (e.g., "*DA" -> "*", "GDN*" -> "GDN", "GDN>GKA" -> "GKA").
-    """
-    # Replace fused dual Attention with standard Attention
-    if layer_type == "*DA":
-        return "*"
-
-    # Convert fused hybrid layers to pure layers (e.g., "GDN*" -> "GDN")
-    if layer_type.endswith("*") and layer_type != "*":
-        return layer_type[:-1]
-
-    # Convert fused hybrid-to-hybrid layers to target layer (e.g., "GDN>GKA" -> "GKA")
-    if ">" in layer_type:
-        return layer_type.split(">")[1]
-
-    return layer_type
-
-
 def get_unfused_config(config: AutoConfig) -> AutoConfig:
     """
     Convert a fused model config to an unfused (standard) hybrid model config.
     
-    Performs two types of conversions in the hybrid_override_pattern and layer_types:
+    Performs two types of conversions in the hybrid_override_pattern, and then derives the layer_types of
+    the hybrid Qwen2, Qwen3, Qwen3-MoE, and Llama configs from the new pattern:
     1. Fused layers (X*) -> Pure layers (X): e.g., M2* -> M2, BMF* -> BMF
     2. Dual attention (*DA, *XBP) -> Standard attention (*): e.g., *DA -> *, *BMFBP -> *
     
@@ -213,9 +193,12 @@ def get_unfused_config(config: AutoConfig) -> AutoConfig:
 
     target_config.hybrid_override_pattern = new_hybrid_pattern
 
-    # Also update layer_types if present
-    if hasattr(target_config, "layer_types") and target_config.layer_types is not None:
-        target_config.layer_types = [unfuse_layer_type(lt) for lt in target_config.layer_types]
+    # The hybrid Qwen2, Qwen3, Qwen3-MoE, and Llama configs derive layer_types from the pattern, so they need new
+    # ones for the unfused pattern. Their current layer_types serve as the base model's kinds, since a fused layer
+    # keeps the base model's attention kind at its layer. The Qwen3.5, Qwen3.5-MoE, and Qwen3-Next configs keep the
+    # base model's layer_types, which unfusing doesn't change, and the Ministral3 config has none.
+    if isinstance(target_config, (HybridQwen2Config, HybridQwen3Config, HybridQwen3MoeConfig, HybridLlamaConfig)):
+        target_config.layer_types = hybrid_layer_types(new_hybrid_pattern, target_config.layer_types)
 
     return new_config
 

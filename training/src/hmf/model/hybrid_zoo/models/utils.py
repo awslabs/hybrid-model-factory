@@ -24,43 +24,50 @@ LAYER_TYPE_PATTERNS = {
 }
 
 
-def validate_hybrid_layer_types(config) -> None:
-    """
-    Checks a hybrid config's layer_types, which hold the entries of its hybrid_override_pattern (such as "*", "GKA",
-    or "GDN>GKA") rather than only transformers' layer types. Transformers' own check (validate_layer_type, run
-    for every config) accepts only its layer types, so hybrid configs override it with this one, which also
-    accepts the pattern's entries (LAYER_TYPE_PATTERNS) and checks that there is one per layer.
-    """
-    from transformers.configuration_utils import ALLOWED_ATTN_LAYER_TYPES
+# Maps each hybrid pattern entry to the entry that its layer gets in config.layer_types, in transformers' names. The
+# layers that keep the base model's attention (such as "*" and the fused layers) map to None, since they keep the
+# base model's own attention kind at that layer.
+PATTERN_TO_LAYER_TYPE = {
+    "*": None,
+    "M2": "linear_attention",
+    "BMF": "linear_attention",
+    "GDN": "linear_attention",
+    "GKA": "linear_attention",
+    "SWA": "sliding_attention",
+    "M2*": None,
+    "BMF*": None,
+    "GDN*": None,
+    "GKA*": None,
+    "SWA*": None,
+    "GDN>GKA": "linear_attention",
+    "*DA": None,
+}
 
-    layer_types = getattr(config, "layer_types", None)
-    if layer_types is None or getattr(config, "num_hidden_layers", None) is None:
-        return
-    allowed = set(ALLOWED_ATTN_LAYER_TYPES) | set(LAYER_TYPE_PATTERNS)
-    unknown = sorted({t for t in layer_types if t not in allowed})
+
+def hybrid_layer_types(hybrid_override_pattern: str, base_layer_types: List[str]) -> List[str]:
+    """
+    Returns the config.layer_types of a hybrid model, which give each layer's kind in transformers' names (such as
+    "full_attention", "sliding_attention", or "linear_attention"). PATTERN_TO_LAYER_TYPE maps each entry of
+    hybrid_override_pattern to its kind, and the layers that keep the base model's attention take their kind from
+    base_layer_types. Transformers checks these names whenever a config is created or saved, and its model code
+    and generate() read them, while the decoder layer classes still come from hybrid_override_pattern.
+
+    Raises:
+        ValueError: If the pattern has an unknown entry, or if its length differs from that of base_layer_types.
+    """
+    entries = list(parse_override_pattern(hybrid_override_pattern).values())
+    unknown = sorted(set(entries) - set(PATTERN_TO_LAYER_TYPE))
     if unknown:
-        raise ValueError(f"The `layer_types` entries must be layer types or hybrid pattern entries, got {unknown}")
-    if len(layer_types) != config.num_hidden_layers:
         raise ValueError(
-            f"`num_hidden_layers` ({config.num_hidden_layers}) must equal the number of `layer_types` "
-            f"({len(layer_types)})"
+            f"Unknown layer types {unknown} in hybrid_override_pattern '{hybrid_override_pattern}'. "
+            f"Valid types: {list(PATTERN_TO_LAYER_TYPE)}"
         )
-
-
-def validate_hybrid_config(config) -> None:
-    """
-    Runs transformers' checks of a config (the class validators of PreTrainedConfig), with the hybrid check
-    validate_hybrid_layer_types in place of validate_layer_type. Hybrid configs override validate() with this
-    function, since save_pretrained calls validate(), while the checks at the end of PreTrainedConfig.__init__ run
-    before the hybrid configs set their layer_types.
-    """
-    from transformers import PreTrainedConfig
-
-    for validator in PreTrainedConfig.__class_validators__:
-        if validator.__name__ == "validate_layer_type":
-            validate_hybrid_layer_types(config)
-        else:
-            validator(config)
+    if len(entries) != len(base_layer_types):
+        raise ValueError(
+            f"hybrid_override_pattern '{hybrid_override_pattern}' has {len(entries)} layers, but the model has "
+            f"{len(base_layer_types)}"
+        )
+    return [PATTERN_TO_LAYER_TYPE[entry] or base for entry, base in zip(entries, base_layer_types)]
 
 
 def build_decoder_layer_registry(module_or_dict, model_prefix: str) -> Dict[str, Type]:
