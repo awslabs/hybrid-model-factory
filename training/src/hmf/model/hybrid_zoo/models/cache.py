@@ -8,14 +8,34 @@ manages layer-specific states. The HybridCache class provides a unified interfac
 that coordinates all cache types within a single model.
 """
 
-import gc
+import weakref
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 from transformers.cache_utils import Cache
 
 
-class Mamba2Cache:
+class _HybridCachePart:
+    """
+    Base class of the per-layer-type caches (Mamba2Cache, BMojoCache, GatedDeltaNetCache, and GatedKalmaNetCache),
+    which store their states in the HybridCache that creates them and access it through their parent property. They
+    keep only a weak reference to it, because a strong one would form a reference cycle with the HybridCache's
+    references to them. Python frees such a cycle only when its garbage collector runs, so a finished cache's GPU
+    memory would stay allocated until then.
+    """
+
+    def __init__(self, parent_cache):
+        self._parent = weakref.ref(parent_cache)
+
+    @property
+    def parent(self) -> "HybridCache":
+        parent = self._parent()
+        if parent is None:
+            raise ReferenceError(f"the HybridCache that created this {type(self).__name__} has been freed")
+        return parent
+
+
+class Mamba2Cache(_HybridCachePart):
     """Cache for Mamba2 layer.
     
     Attributes:
@@ -29,7 +49,7 @@ class Mamba2Cache:
         max_sequence_length: Optional[int] = None,
         max_batch_size: Optional[int] = None,
     ):
-        self.parent = parent_cache
+        super().__init__(parent_cache)
 
         # Enable caching of cumulative A products for PICASO state composition
         self.cache_aprods = True
@@ -61,11 +81,11 @@ class Mamba2Cache:
         return self.parent.seqlen_offset
 
 
-class BMojoCache:
+class BMojoCache(_HybridCachePart):
     """Cache for B'MOJO-F layer."""
 
     def __init__(self, parent_cache):
-        self.parent = parent_cache
+        super().__init__(parent_cache)
         self.max_sequence_length = parent_cache.config.max_position_embeddings
         self.max_batch_size = getattr(parent_cache.config, "batch_size", 1)
 
@@ -89,7 +109,7 @@ class BMojoCache:
         return getattr(self.parent, "batch_size_offset", 0)
 
 
-class GatedDeltaNetCache:
+class GatedDeltaNetCache(_HybridCachePart):
     """Cache for Gated DeltaNet layer."""
 
     def __init__(
@@ -98,7 +118,7 @@ class GatedDeltaNetCache:
         max_sequence_length: Optional[int] = None,
         max_batch_size: Optional[int] = None,
     ):
-        self.parent = parent_cache
+        super().__init__(parent_cache)
 
         if max_sequence_length is None:
             self.max_sequence_length = parent_cache.config.max_position_embeddings
@@ -146,7 +166,7 @@ class GatedDeltaNetCache:
             self.key_value_memory_dict[layer_idx] = {"recurrent_state": recurrent_state}
 
 
-class GatedKalmaNetCache:
+class GatedKalmaNetCache(_HybridCachePart):
     """Cache for Gated KalmaNet layer."""
 
     def __init__(
@@ -155,7 +175,7 @@ class GatedKalmaNetCache:
         max_sequence_length: Optional[int] = None,
         max_batch_size: Optional[int] = None,
     ):
-        self.parent = parent_cache
+        super().__init__(parent_cache)
 
         if max_sequence_length is None:
             self.max_sequence_length = parent_cache.config.max_position_embeddings
@@ -392,15 +412,6 @@ class HybridCache(Cache):
 
         # Reset offsets
         self.seqlen_offset = 0
-
-    def __del__(self):
-        try:
-            self.clear()
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
 
     def copy(self) -> "HybridCache":
         """Create a deep copy of this cache."""
