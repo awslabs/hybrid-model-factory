@@ -70,9 +70,9 @@ def test_parts_read_and_write_the_state_of_their_cache():
     cache = HybridCache(_config())
     cache.mamba2.key_value_memory_dict[0] = "mamba"
     cache.gated_kalmanet.key_value_memory_dict = {1: "gka"}
-    cache.update_offset(7)
+    cache.mamba2.record_tokens(0, 7)
     assert cache._mamba_memory_dict == {0: "mamba"} and cache._gated_kalmanet_memory_dict == {1: "gka"}
-    assert cache.mamba2.seqlen_offset == cache.bmojo_f.seqlen_offset == 7
+    assert cache.mamba2.seen_tokens(0) == cache.get_seq_length(0) == 7
     for part in (cache.mamba2, cache.bmojo_f, cache.gated_deltanet, cache.gated_kalmanet):
         assert part.parent is cache
 

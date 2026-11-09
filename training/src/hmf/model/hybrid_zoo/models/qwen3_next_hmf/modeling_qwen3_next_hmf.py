@@ -1593,13 +1593,6 @@ class Qwen3NextHMFForCausalLM(Qwen3NextHMFPreTrainedModel, GenerationMixin):
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 
-        # Keep track of sequence offset (e.g., # tokens seen) for Hybrid layers
-        past_key_values_ = outputs.past_key_values
-        if use_cache and past_key_values_ is not None:
-            if hasattr(past_key_values_, "update_offset"):
-                seq_len = hidden_states.shape[1]
-                past_key_values_.update_offset(seq_len)
-
         return MoeCausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,

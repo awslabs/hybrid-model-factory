@@ -354,8 +354,8 @@ class BMOJOAttention(nn.Module):
 
         This method handles different scenarios:
         - No cache (past_key_values is None): Training or inference without cache object
-        - With cache, prefill (seqlen_offset == 0): First pass, populates cache
-        - With cache, decoding (seqlen_offset > 0): Incremental generation, one token at a time
+        - With cache, prefill (nothing cached for this layer yet): First pass, populates cache
+        - With cache, decoding (keys and values cached): Incremental generation, one token at a time
 
         During cached inference, this method:
         - Appends the new keys and values to the cached ones, and keeps those of the last 2w tokens in the cache,
@@ -411,6 +411,7 @@ class BMOJOAttention(nn.Module):
         # where w = bmojo_config["window_size"], so no later token reads further back than the last 2w tokens, and
         # the cache keeps only those
         kept_tokens = 2 * (window_size + 1)
+        past_key_values.record_tokens(self.layer_idx, key_in_ctx.shape[0])
         cached = past_key_values.key_value_memory_dict.get(self.layer_idx)
         if cached is not None:
             cached_keys, cached_values = cached
@@ -439,7 +440,7 @@ class BMOJOAttention(nn.Module):
         value_fading = value_fading[: -window_size - 1]
 
         # During prefill, adjust query to skip tokens without fading memory
-        if past_key_values.seqlen_offset == 0:
+        if cached is None:
             query_fading = query_fading[window_size + 1 :]  # [L-W, B, H, D]
 
         return (

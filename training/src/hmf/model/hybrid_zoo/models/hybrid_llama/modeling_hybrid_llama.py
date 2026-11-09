@@ -1131,13 +1131,6 @@ class HybridLlamaForCausalLM(HybridLlamaPreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        # Keep track of sequence offset (e.g., # tokens seen) for Hybrid layers
-        past_key_values_ = outputs.past_key_values
-        if use_cache and past_key_values_ is not None:
-            if hasattr(past_key_values_, "update_offset"):
-                seq_len = hidden_states.shape[1]
-                past_key_values_.update_offset(seq_len)
-
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,

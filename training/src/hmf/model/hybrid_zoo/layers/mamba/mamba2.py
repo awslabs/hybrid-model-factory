@@ -400,7 +400,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             cu_seqlens: Optional tensor of cumulative sequence lengths for packed sequences.
                 Shape [num_sequences + 1,] where cu_seqlens[i] is the start position of sequence i.
             past_key_values: Optional Mamba2Cache containing conv_state and ssm_state for inference.
-                When provided with seqlen_offset > 0, performs incremental decoding via step().
+                Once this layer has processed tokens, the layer decodes incrementally via step().
 
         Returns:
             Tuple of (output, None, past_key_values) where:
@@ -428,7 +428,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             log_aprods = self._get_log_aprods_from_cache(
                 past_key_values, inference_batch
             )
-            if past_key_values.seqlen_offset > 0:
+            if past_key_values.seen_tokens(self.layer_idx) > 0:
                 # Single-token decoding - states are updated inplace
                 out, _, _ = self.step(
                     hidden_states,
@@ -437,6 +437,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                     position_embeddings=position_embeddings,
                     log_aprods=log_aprods,
                 )
+                past_key_values.record_tokens(self.layer_idx, seqlen)
                 return out, None, past_key_values
 
         zxbcdt = self.in_proj(hidden_states)  # [B, L, Din + Dxbc + H]
@@ -685,11 +686,13 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             log_dA = dt * A
             log_next_aprods = torch.sum(log_dA, dim=1)
             
-            if past_key_values.seqlen_offset <= 0:
+            if past_key_values.seen_tokens(self.layer_idx) <= 0:
                 log_aprods.copy_(log_next_aprods)
             else:
                 log_aprods.copy_(log_aprods + log_next_aprods)
 
+        if past_key_values is not None:
+            past_key_values.record_tokens(self.layer_idx, seqlen)
         return out, None, past_key_values
 
     def step(

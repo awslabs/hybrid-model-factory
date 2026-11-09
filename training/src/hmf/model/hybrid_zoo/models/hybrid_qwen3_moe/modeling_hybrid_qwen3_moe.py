@@ -1540,15 +1540,6 @@ class HybridQwen3MoeForCausalLM(HybridQwen3MoePreTrainedModel, GenerationMixin):
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 
-        # Keep track of sequence offset (e.g., # tokens seen) for Hybrid layers, as the other hybrid families do.
-        # HybridCache.get_seq_length() returns this offset when layer 0 is not attention, so without it every
-        # decoding step after the prefill would restart at position 0.
-        past_key_values_ = outputs.past_key_values
-        if use_cache and past_key_values_ is not None:
-            if hasattr(past_key_values_, "update_offset"):
-                seq_len = hidden_states.shape[1]
-                past_key_values_.update_offset(seq_len)
-
         return MoeCausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,

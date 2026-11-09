@@ -165,8 +165,8 @@ class CacheComposerMixin:
         self._store_composition_metadata(context_ids, config['num_chunks'])
         past_key_values = self.prefill_query(query_ids, config['query_len'], past_key_values)
         
-        logger.info(f"After prefill_query: seqlen_offset={past_key_values.seqlen_offset}, "
-                   f"kv_seq_len={past_key_values.get_seq_length()}")
+        logger.info(f"After prefill_query: tokens read={past_key_values.get_seq_length()}, "
+                   f"kv_seq_len={past_key_values.cached_attention_length()}")
         
         # Prepare final inputs
         input_ids = self._prepare_final_inputs(input_ids, past_key_values, kwargs)
@@ -239,8 +239,8 @@ class CacheComposerMixin:
         kwargs: Dict[str, Any]
     ) -> torch.Tensor:
         """
-        Prepends the prefix, builds the attention mask, and sets the positions when the cache's length doesn't
-        match the number of tokens.
+        Prepends the prefix, builds the attention mask, and sets the positions when the attention cache holds
+        fewer tokens than the composed cache has read (see HybridCache.get_seq_length).
         """
         attention_mask = torch.ones_like(input_ids)
         final_input_ids = input_ids
@@ -255,10 +255,12 @@ class CacheComposerMixin:
         
         kwargs['attention_mask'] = attention_mask
         
-        if past_key_values is not None and not past_key_values.check_seqlen_match():
+        if past_key_values is not None and (
+            past_key_values.get_seq_length() != past_key_values.cached_attention_length()
+        ):
             kwargs['position_ids'] = torch.full(
                 (final_input_ids.shape[0], 1), 
-                past_key_values.seqlen_offset, 
+                past_key_values.get_seq_length(), 
                 device=final_input_ids.device, 
                 dtype=torch.long
             )
@@ -329,15 +331,12 @@ class CacheComposerMixin:
         concat_tokenize_inputs = torch.cat(tokenized_inputs, dim=1)
         output = self.model(input_ids=concat_tokenize_inputs, use_cache=True)
         concat_cache = output.past_key_values
-        seq_len = output[0].shape[1]
-        concat_cache.update_offset(seq_len)
         
         # Process chunks for SSM combination if needed
         chunked_cache = None
         if use_chunked_cache:
             position_ids = self.create_position_ids_for_chunks(tokenized_inputs, 0, is_sequential=False)
-            chunked_cache, chunk_seq_len = self._process_chunked_inputs(tokenized_inputs, position_ids)
-            chunked_cache.update_offset(chunk_seq_len)
+            chunked_cache, _ = self._process_chunked_inputs(tokenized_inputs, position_ids)
             
             if strategy == 'fuse':
                 if chunked_cache._mamba_memory_dict:
@@ -424,7 +423,6 @@ class CacheComposerMixin:
         logger.debug(position_ids)
         
         chunked_cache, seq_len = self._process_chunked_inputs(tokenized_inputs, position_ids)
-        chunked_cache.update_offset(seq_len)
         
         if strategy == 'fuse':
             if chunked_cache._mamba_memory_dict:
@@ -435,7 +433,6 @@ class CacheComposerMixin:
 
         new_cache = HybridCache(self.model.config)
         effective_seq_len = prefix_masks.sum().item() if sequential_positions else seq_len
-        new_cache.update_offset(effective_seq_len)
         logger.debug(f'Original Input seqlen: {input_ids.shape[1]}')
         logger.debug(f'Post-padding seqlen: {effective_seq_len}')
 
@@ -450,7 +447,9 @@ class CacheComposerMixin:
                 kalmanet_combine_fn(chunked_cache, layer_idx, new_cache)
             else:
                 raise KeyError(f"Layer {layer_idx} not in cache")
-        
+        # The composed cache counts every token that composition read, even though the attention cache may keep fewer
+        new_cache.set_seq_length(effective_seq_len)
+
         kept_prefix_ids = (first_prefix_ids if keep_first_prefix 
                           else torch.empty((1, 0), dtype=input_ids.dtype, device=input_ids.device))
         
@@ -672,7 +671,7 @@ class CacheComposerMixin:
             logger.debug(f'Processing {tokens_to_process.shape[1]} query tokens')
             for i in range(tokens_to_process.shape[1]):
                 current_token = tokens_to_process[:, i:i+1]
-                current_position = past_key_values.seqlen_offset
+                current_position = past_key_values.get_seq_length()
                 batch_size = current_token.shape[0]
                 position_ids = torch.full(
                     (batch_size, 1), current_position, 
@@ -688,8 +687,6 @@ class CacheComposerMixin:
                 
                 outputs = self.model(**temp_inputs)
                 past_key_values = outputs.past_key_values
-                out_len = outputs[0].shape[1]
-                past_key_values.update_offset(out_len)
 
         return past_key_values
 
@@ -718,7 +715,7 @@ class CacheComposerMixin:
         
         logger.debug(
             f'SW: prefix={n_first_prefix}, gap={n_gap}, '
-            f'last_chunk={n_last_chunk}, total_cache={past_key_values.get_seq_length()}'
+            f'last_chunk={n_last_chunk}, total_cache={past_key_values.cached_attention_length()}'
         )
         
         return past_key_values
