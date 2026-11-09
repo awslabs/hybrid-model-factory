@@ -68,6 +68,7 @@ from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 if TYPE_CHECKING:
     from hmf.model.hybrid_zoo.models.cache import Mamba2Cache
 
+from ..mask_utils import padding_mask_for_new_tokens
 from ..sp_p2p_utils import reorder_for_ssm_p2p
 from .sequence_parallel.mamba2.mamba_mixer_cp_utils import state_passing_p2p
 
@@ -367,6 +368,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         seq_idx: Optional[Tensor] = None,
         cu_seqlens: Optional[Tensor] = None,
         past_key_values: Optional["Mamba2Cache"] = None,
+        attention_mask: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, None, "Mamba2Cache"]:
         """
@@ -401,6 +403,10 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 Shape [num_sequences + 1,] where cu_seqlens[i] is the start position of sequence i.
             past_key_values: Optional Mamba2Cache containing conv_state and ssm_state for inference.
                 Once this layer has processed tokens, the layer decodes incrementally via step().
+            attention_mask: Optional padding mask, 2D or the 4D mask of SDPA and eager. The padded tokens' inputs
+                are zeroed before and after the convolution, so that they don't enter the state, and a left-padded
+                row then gives the same outputs as on its own. Left padding only comes with a prefill, so a decoding
+                step needs no mask.
 
         Returns:
             Tuple of (output, None, past_key_values) where:
@@ -416,6 +422,15 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         else:
             batch_seqlen, dim = hidden_states.shape
             batch = batch_seqlen // seqlen
+
+        # [B, L, 1], 1 for real tokens and 0 for padding, or None without padding. Sequence parallelism and packed
+        # inputs pass no padding mask.
+        padding = padding_mask_for_new_tokens(attention_mask, seqlen)
+        if padding is not None:
+            assert self.sequence_parallel_group is None and cu_seqlens is None, (
+                "Mamba2 takes a padding mask without sequence parallelism or packed inputs only"
+            )
+            padding = padding[..., None]
 
         conv_state, ssm_state = None, None
         if past_key_values is not None:
@@ -484,6 +499,10 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             xBC, position_embeddings=position_embeddings
         )  # [B_sp, L_sp, Dxbc]
 
+        # The padded tokens give the convolution, and the conv state that the cache keeps, only zeros
+        if padding is not None:
+            xBC = xBC * padding.to(xBC.dtype)
+
         if conv_state is not None:
             assert (
                 self.sequence_parallel_group is None
@@ -523,6 +542,10 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             ).transpose(
                 1, 2
             )  # [B_sp, L_sp, Dxbc]
+
+        # The scan then gets no input from the padded tokens, so the state stays at 0 until the first real token
+        if padding is not None:
+            xBC = xBC * padding.to(xBC.dtype)
 
         if self.sequence_parallel_group is not None:
             # When SP is activated, we need to remove the first tokens since they were just needed for the conv operation.
@@ -684,6 +707,9 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                                        "h -> b l h", b=dt.shape[0], l=dt.shape[1]))
             
             log_dA = dt * A
+            # The padded tokens don't decay the state in the products that cache composition reads either
+            if padding is not None:
+                log_dA = log_dA * padding.to(log_dA.dtype)
             log_next_aprods = torch.sum(log_dA, dim=1)
             
             if past_key_values.seen_tokens(self.layer_idx) <= 0:

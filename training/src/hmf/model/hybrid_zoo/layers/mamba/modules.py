@@ -68,7 +68,8 @@ class Mamba2Layer(Mamba2):
 
         Args:
             hidden_states: Input tensor of shape [batch, seq_len, hidden_size]
-            attention_mask: Ignored, kept for consistency
+            attention_mask: Optional padding mask (2D, or the 4D mask of SDPA and eager), whose padding Mamba2 keeps
+                out of its state
             past_key_values: HybridCache object, extracts Mamba2-specific cache if present.
             use_cache: Ignored, kept for consistency
             output_attentions: Ignored, kept for consistency
@@ -91,4 +92,5 @@ class Mamba2Layer(Mamba2):
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             past_key_values=mamba_past_key_values,
+            attention_mask=attention_mask,
         )
