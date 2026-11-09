@@ -73,7 +73,7 @@ def read_args(args: dict[str, Any] | list[str] | None = None) -> dict[str, Any] 
 
 def _check_removed_args(args: dict[str, Any] | list[str]) -> None:
     r"""
-    Raises an error that says how to fix a config that sets warmup_ratio, which transformers 5.22.2 removed.
+    Raises an error that says how to fix a config that sets warmup_ratio, which newer versions of transformers removed.
     Otherwise, the parser would only report it as an unused key, or drop it silently under ALLOW_EXTRA_ARGS.
     """
     if isinstance(args, dict):
@@ -93,8 +93,8 @@ def _check_removed_args(args: dict[str, Any] | list[str]) -> None:
 
     fix = "remove warmup_ratio and keep warmup_steps" if has_steps else f"set warmup_steps: {ratio} instead"
     raise ValueError(
-        f"warmup_ratio was removed in transformers 5.22.2, so {fix}. Transformers reads a warmup_steps below 1 as a "
-        "ratio of the training steps."
+        f"Newer versions of transformers removed warmup_ratio, so {fix}. Transformers reads a warmup_steps below 1 "
+        "as a ratio of the training steps."
     )
 
 
