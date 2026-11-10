@@ -75,9 +75,13 @@ from ...layers.mamba.modules import Mamba2Layer
 from ..cache import HybridCache
 from ..utils import build_decoder_layer_registry, set_decoder_layers_from_pattern
 from .configuration_hybrid_gemma4 import HybridGemma4TextConfig
-from .sequence_parallel import sp_full_attention, sp_windowed_attention
+from .sequence_parallel import FLASH_ATTENTION_MAX_HEAD_DIM, sp_full_attention, sp_windowed_attention
 
 logger = logging.get_logger(__name__)
+
+# The suffix of the mask keys (see the layers' attention_type) of the attention layers that run SDPA in a model that
+# runs flash attention 2, whose masks SDPA's format must have
+SDPA_MASK_SUFFIX = ":sdpa"
 
 
 class Gemma4RMSNorm(nn.Module):
@@ -334,6 +338,20 @@ class Gemma4TextAttention(nn.Module):
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
 
+    @property
+    def runs_sdpa_for_flash_attention(self) -> bool:
+        """
+        Returns whether the layer runs SDPA in a model that runs flash attention 2, which supports heads of at most
+        FLASH_ATTENTION_MAX_HEAD_DIM. Gemma 4's full attention layers have heads of 512, so they run SDPA, while its
+        sliding window layers run flash attention 2, and an HMF SWA layer follows the layer that it replaces.
+        """
+        return (self.config._attn_implementation == "flash_attention_2"
+                and self.head_dim > FLASH_ATTENTION_MAX_HEAD_DIM)
+
+    def mask_key(self, kind: str) -> str:
+        """Returns the key of the layer's mask of the given kind, in SDPA's format if the layer runs SDPA."""
+        return kind + SDPA_MASK_SUFFIX if self.runs_sdpa_for_flash_attention else kind
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -394,7 +412,8 @@ class Gemma4TextAttention(nn.Module):
             attn_output, attn_weights = attn_output.transpose(1, 2), None
         else:
             attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-                self.config._attn_implementation, eager_attention_forward
+                "sdpa" if self.runs_sdpa_for_flash_attention else self.config._attn_implementation,
+                eager_attention_forward,
             )
 
             attn_output, attn_weights = attention_interface(
@@ -517,8 +536,10 @@ class Gemma4DecoderLayer(GradientCheckpointingLayer):
             self.per_layer_projection = nn.Linear(self.hidden_size_per_layer_input, self.hidden_size, bias=False)
             self.post_per_layer_input_norm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
-        # The mask of the base model's attention kind at this layer
-        self.attention_type = self.self_attn.layer_type
+    @property
+    def attention_type(self) -> str:
+        """Returns the key of the layer's mask, that of the base model's attention kind at this layer."""
+        return self.self_attn.mask_key(self.self_attn.layer_type)
 
     def forward(
         self,
@@ -651,8 +672,6 @@ class Gemma4HybridDecoderLayerBase(Gemma4DecoderLayerBody, GradientCheckpointing
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
-        # The full attention mask, whose padding the sequence mixers read
-        self.attention_type = "full_attention"
         self._init_body(config, layer_idx)
 
         # All Hybrid decoder layer subclasses must implement this
@@ -663,6 +682,11 @@ class Gemma4HybridDecoderLayerBase(Gemma4DecoderLayerBody, GradientCheckpointing
         self.source_kv = (
             Gemma4SourceKeysAndValues(config, layer_idx) if config.keeps_source_keys_and_values(layer_idx) else None
         )
+
+    @property
+    def attention_type(self) -> str:
+        """Returns the key of the layer's mask, the full attention mask, whose padding the sequence mixers read."""
+        return "full_attention"
 
     @property
     @abstractmethod
@@ -792,10 +816,13 @@ class Gemma4SWADecoderLayer(Gemma4HybridDecoderLayerBase):
 
     reads_shared_kv = True
 
-    def __init__(self, config: HybridGemma4TextConfig, layer_idx: int):
-        super().__init__(config, layer_idx)
-        # The model builds this mask with the window of swa_config, which may differ from Gemma 4's own window
-        self.attention_type = "swa"
+    @property
+    def attention_type(self) -> str:
+        """
+        Returns the key of the layer's mask, the mask with the window of swa_config, which may differ from Gemma 4's
+        own window.
+        """
+        return self.swa.mask_key("swa")
 
     def _init_seq_mixer(self, config: HybridGemma4TextConfig, layer_idx: int):
         self.swa = Gemma4SWAttention(config, layer_idx=layer_idx)
@@ -825,9 +852,16 @@ class Gemma4Stage1DecoderLayerBase(Gemma4DecoderLayerBody, GradientCheckpointing
         self.layer_idx = layer_idx
         self.self_attn = Gemma4TextAttention(config=config, layer_idx=layer_idx)
         self._init_body(config, layer_idx)
-        # The masks of the attention stream (the base model's attention kind at this layer) and the hybrid stream
-        self.attention_type = self.self_attn.layer_type
-        self.hybrid_attention_type = self.attention_type
+
+    @property
+    def attention_type(self) -> str:
+        """Returns the key of the attention stream's mask, that of the base model's attention kind at this layer."""
+        return self.self_attn.mask_key(self.self_attn.layer_type)
+
+    @property
+    def hybrid_attention_type(self) -> str:
+        """Returns the key of the hybrid stream's mask, which for '*DA' is the attention stream's."""
+        return self.attention_type
 
     def _attention_mixer(
         self, hidden_states, position_embeddings, attention_mask, shared_kv_states, position_ids, **kwargs
@@ -942,10 +976,13 @@ class Gemma4FusedAttHybridDecoderLayerBase(Gemma4Stage1DecoderLayerBase):
 
     def __init__(self, config: HybridGemma4TextConfig, layer_idx: int):
         super().__init__(config, layer_idx)
-        # The full attention mask, whose padding the sequence mixers read
-        self.hybrid_attention_type = "full_attention"
         self._init_seq_mixer(config, layer_idx)
         self.computes_source_kv = config.keeps_source_keys_and_values(layer_idx)
+
+    @property
+    def hybrid_attention_type(self) -> str:
+        """Returns the key of the hybrid stream's mask, the full attention mask, whose padding the mixers read."""
+        return "full_attention"
 
     @property
     @abstractmethod
@@ -1008,10 +1045,10 @@ class Gemma4FusedAttSWADecoderLayer(Gemma4FusedAttHybridDecoderLayerBase):
     _init_seq_mixer = Gemma4SWADecoderLayer._init_seq_mixer
     seq_mixer = Gemma4SWADecoderLayer.seq_mixer
 
-    def __init__(self, config: HybridGemma4TextConfig, layer_idx: int):
-        super().__init__(config, layer_idx)
-        # The model builds this mask with the window of swa_config, which may differ from Gemma 4's own window
-        self.hybrid_attention_type = "swa"
+    @property
+    def hybrid_attention_type(self) -> str:
+        """Returns the key of the hybrid stream's mask, the mask with the window of swa_config."""
+        return self.swa.mask_key("swa")
 
 
 class Gemma4TextScaledWordEmbedding(nn.Embedding):
@@ -1088,9 +1125,6 @@ class HybridGemma4TextModel(HybridGemma4PreTrainedModel):
         self.rotary_emb = Gemma4TextRotaryEmbedding(config)
         self.gradient_checkpointing = False
         self.unique_layer_types = set(self.config.base_layer_types)
-        # The masks that the layers ask for, including those of the hybrid streams of Stage 1's layers
-        self.mask_types = {getattr(layer, kind) for layer in self.layers
-                           for kind in ("attention_type", "hybrid_attention_type") if hasattr(layer, kind)}
         self.is_stage1 = any(isinstance(layer, Gemma4Stage1DecoderLayerBase) for layer in self.layers)
 
         # Per-Layer Embeddings (PLE): auxiliary embedding that feeds a residual signal
@@ -1133,18 +1167,40 @@ class HybridGemma4TextModel(HybridGemma4PreTrainedModel):
             return [Gemma4DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         return set_decoder_layers_from_pattern(config, HYBRID_GEMMA4_DECODER_LAYER_REGISTRY)
 
+    def _mask_keys(self) -> set[str]:
+        """
+        Returns the keys of the masks that the layers ask for (see each layer's attention_type), including those of the
+        hybrid streams of Stage 1's layers, and the full attention mask. They follow the model's attention
+        implementation, which may change after the model is built.
+        """
+        keys = {getattr(layer, kind) for layer in self.layers
+                for kind in ("attention_type", "hybrid_attention_type") if hasattr(layer, kind)}
+        if any(key.endswith(SDPA_MASK_SUFFIX) for key in keys):
+            logger.warning_once(
+                "Hybrid Gemma 4's attention layers with heads of more than "
+                f"{FLASH_ATTENTION_MAX_HEAD_DIM} (its full attention layers) run SDPA, which flash attention 2 "
+                "doesn't support, while its other attention layers run flash attention 2."
+            )
+        return keys | {"full_attention"}
+
     def _causal_masks(self, mask_kwargs: dict) -> dict:
         """
-        Returns the masks that the layers ask for (see each layer's attention_type): the full attention mask, Gemma
-        4's sliding window mask, and the mask with the window of swa_config for HMF's SWA layers.
+        Returns the masks that the layers ask for (see _mask_keys): the full attention mask, Gemma 4's sliding window
+        mask, and the mask with the window of swa_config for HMF's SWA layers, each in the format of the model's
+        attention implementation, or in SDPA's for the layers that run SDPA (keys ending in SDPA_MASK_SUFFIX).
         """
-        masks = {"full_attention": create_causal_mask(**mask_kwargs)}
-        if "sliding_attention" in self.mask_types:
-            masks["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
-        if "swa" in self.mask_types:
-            swa_config = copy.copy(self.config)
-            swa_config.sliding_window = self.config.swa_config["window_size"]
-            masks["swa"] = create_sliding_window_causal_mask(**{**mask_kwargs, "config": swa_config})
+        masks = {}
+        for key in self._mask_keys():
+            kind, sdpa = key.removesuffix(SDPA_MASK_SUFFIX), key.endswith(SDPA_MASK_SUFFIX)
+            config = self.config
+            if kind == "swa" or sdpa:
+                config = copy.copy(self.config)
+                if kind == "swa":
+                    config.sliding_window = self.config.swa_config["window_size"]
+                if sdpa:
+                    config._attn_implementation = "sdpa"
+            create_mask = create_causal_mask if kind == "full_attention" else create_sliding_window_causal_mask
+            masks[key] = create_mask(**{**mask_kwargs, "config": config})
         return masks
 
     @merge_with_config_defaults
@@ -1206,7 +1262,7 @@ class HybridGemma4TextModel(HybridGemma4PreTrainedModel):
             # When using sequence parallelism, set attention_mask to None.
             # Tested with flash attention only.
             if getattr(self, "sequence_parallel_group", None) is not None:
-                causal_mask_mapping = dict.fromkeys(self.mask_types | {"full_attention"})
+                causal_mask_mapping = dict.fromkeys(self._mask_keys())
             else:
                 causal_mask_mapping = self._causal_masks({
                     "config": self.config,
@@ -1278,7 +1334,7 @@ class HybridGemma4TextModel(HybridGemma4PreTrainedModel):
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
 
         if getattr(self, "sequence_parallel_group", None) is not None:
-            masks = dict.fromkeys(self.mask_types | {"full_attention"})
+            masks = dict.fromkeys(self._mask_keys())
         else:
             masks = self._causal_masks({
                 "config": self.config,
