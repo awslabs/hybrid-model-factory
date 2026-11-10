@@ -4,7 +4,56 @@ Hybrid Gemma 4 Model Construction Module
 This module converts a base Gemma 4 model into a text-only hybrid Gemma 4 model (HybridGemma4ForCausalLM), whose
 layers the hybrid override pattern chooses among Gemma 4's own attention, Mamba2, Gated DeltaNet, GKA, and SWA, or
 their Stage 1 layers ('*DA' and the fused 'X*'). The base checkpoints are multimodal (Gemma4ForConditionalGeneration),
-so the conversion takes their text model and language modeling head, and leaves out the vision and audio towers.
+so the conversion takes their text model and language modeling head, and leaves out the vision and audio components.
+
+Priming follows the other families (a hybrid layer starts from the attention that it replaces, and the rest of the
+model is copied), with these differences, which come from Gemma 4's architecture:
+
+Gemma 4 interleaves sliding window attention layers, whose heads have 256 dimensions and whose RoPE is the default
+one, with full attention layers (one in five in E2B and E4B), whose heads have 512 dimensions and whose RoPE rotates
+only a quarter of each head's dimensions, with a larger base. Its config therefore has no single head size
+(per_layer_config holds each layer's), and the hybrid config saves the base model's layout as base_layer_types,
+while layer_types gets transformers' names for the hybrid layers. Each hybrid layer takes the head size and RoPE of
+the base model's attention kind at its layer, so a hybrid layer at a full attention layer gets heads of 512. The
+settings of each hybrid layer type (such as GKA's solver) are built once, from the config of layer 0, and each layer
+recomputes its sizes from its own layer's config.
+
+Since GKA's kernels run heads of at most 128 dimensions and GDN's at most 256, priming splits larger heads into
+heads of the largest size that the kernel supports, with as many more heads, and reorders the weights so that
+grouped-query attention still pairs each query head with its key and value head (see split_attention_heads in
+hybrid_layer_init.py), while Mamba2 runs heads of 512 as they are.
+
+Besides its attention and MLP, a Gemma 4 decoder layer has four norms (before and after its attention and its MLP),
+a per-layer embedding block after its MLP, and a scalar that scales its output. A hybrid layer keeps all of them,
+copied from the base model with the MLP, so only its sequence mixer is new, and the model keeps Gemma 4's scaled
+token embeddings and the final softcapping of its logits.
+
+In E2B and E4B, the last layers have no key and value projections of their own, and read the keys and values of the
+last earlier layer of their kind, their source (in E2B, layers 15 to 34 read those of layers 13, which is sliding,
+and 14, which is full). Priming handles these layers and their sources by three rules:
+    - A GKA, GDN, or Mamba2 layer at a sharing layer gets key and value projections of its own, which start as
+      copies of its source's.
+    - An SWA layer at a sharing layer keeps reading its source's keys and values, and only limits them to its window.
+    - A GKA, GDN, or Mamba2 layer at a source keeps the source's key and value projections in a small module of its
+      decoder layer (Gemma4SourceKeysAndValues), which computes the keys and values that the later attention layers
+      of its kind still read. If no attention layer of its kind still reads them, the module is left out.
+
+Priming currently refuses B'MOJO, since its attention scales its scores by head_dim**-0.5, while Gemma 4's attention scales
+them by 1 (its queries and keys are normalized). It also refuses full attention layers whose keys double as values
+(attention_k_eq_v, as in Gemma 4 31B), since they have no value projection to start from.
+
+In Stage 1, a '*DA' layer runs Gemma 4's attention on both streams, and a fused 'X*' layer runs the hybrid mixer on
+the hybrid stream and Gemma 4's frozen attention on the attention stream. Each stream keeps its own shared keys and
+values, and a fused layer at a source computes the hybrid stream's keys and values with its frozen key and value
+projections, which unfusing (fused_to_standard.py) copies into the unfused layer's Gemma4SourceKeysAndValues.
+
+When a primed model is trained without sequence parallelism, it needs SDPA or eager attention if it keeps any of
+Gemma 4's full attention layers, since flash attention 2 supports heads of at most 256 (transformers issue 45201).
+Under sequence parallelism, Gemma 4's attention layers exchange keys and values between the GPUs themselves (see
+models/hybrid_gemma4/sequence_parallel.py): the sliding layers run flash attention 2 with their window, which needs
+each GPU's chunks of the sequence to be at least window - 1 tokens long, and the full layers run SDPA's
+memory-efficient kernel. Gradient checkpointing must be non-reentrant, since the shared keys and values pass between
+the layers outside their inputs and outputs, and prepare_model_for_training switches to it on its own.
 """
 
 import torch.nn as nn
