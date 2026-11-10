@@ -40,6 +40,8 @@ layers of Gemma 4 E2B and E4B reuse the keys and values of an earlier layer of t
 layer that replaces one of these sharing layers has key and value projections of its own, while an SWA layer there
 keeps reading the shared keys and values. A hybrid layer that replaces a source keeps the source's key and value
 projections, to compute the keys and values that later attention layers still read (Gemma4SourceKeysAndValues).
+Under sequence parallelism, the attention layers exchange keys and values between the ranks themselves, since ring
+attention supports neither heads of 512 nor sliding windows (see sequence_parallel.py).
 """
 
 import copy
@@ -73,6 +75,7 @@ from ...layers.mamba.modules import Mamba2Layer
 from ..cache import HybridCache
 from ..utils import build_decoder_layer_registry, set_decoder_layers_from_pattern
 from .configuration_hybrid_gemma4 import HybridGemma4TextConfig
+from .sequence_parallel import sp_full_attention, sp_windowed_attention
 
 logger = logging.get_logger(__name__)
 
@@ -340,11 +343,6 @@ class Gemma4TextAttention(nn.Module):
         past_key_values: Cache | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if self.is_sliding and self.sequence_parallel_group is not None:
-            raise NotImplementedError(
-                "The sliding window attention layers of hybrid Gemma 4 do not support sequence parallelism yet."
-            )
-
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -380,21 +378,36 @@ class Gemma4TextAttention(nn.Module):
         if self.store_full_length_kv:
             shared_kv_states[self.layer_type] = key_states, value_states
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
+        if self.sequence_parallel_group is not None:
+            # Under sequence parallelism, the layer exchanges keys and values between the ranks itself (see
+            # sequence_parallel.py), with whichever keys and values it has, its own or those that it shares
+            dropout = self.attention_dropout if self.training else 0.0
+            if self.sliding_window:
+                attn_output = sp_windowed_attention(
+                    query_states, key_states, value_states, self.sliding_window, self.scaling,
+                    self.sequence_parallel_group, dropout,
+                )
+            else:
+                attn_output = sp_full_attention(
+                    query_states, key_states, value_states, self.scaling, self.sequence_parallel_group, dropout
+                )
+            attn_output, attn_weights = attn_output.transpose(1, 2), None
+        else:
+            attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation, eager_attention_forward
+            )
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=self.attention_dropout if self.training else 0.0,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            **kwargs,
-        )
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=self.attention_dropout if self.training else 0.0,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
