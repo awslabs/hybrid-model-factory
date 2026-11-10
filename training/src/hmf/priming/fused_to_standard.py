@@ -11,6 +11,9 @@ from .hybridize_logger import get_logger
 from .utils import copy_auxiliary_files
 
 import hmf.model.hybrid_zoo.models.model_register  # Registers hybrid models and suppresses warnings. Must be first
+from hmf.model.hybrid_zoo.models.hybrid_gemma4.modeling_hybrid_gemma4 import (
+    HybridGemma4ForCausalLM,
+)
 from hmf.model.hybrid_zoo.models.hybrid_llama.modeling_hybrid_llama import (
     HybridLlamaForCausalLM,
 )
@@ -35,6 +38,7 @@ from hmf.model.hybrid_zoo.models.qwen3_5_moe_hmf.modeling_qwen3_5_moe_hmf import
 from hmf.model.hybrid_zoo.models.qwen3_5_hmf.modeling_qwen3_5_hmf import (
     Qwen3_5HMFForCausalLM,
 )
+from hmf.model.hybrid_zoo.models.hybrid_gemma4.configuration_hybrid_gemma4 import HybridGemma4TextConfig
 from hmf.model.hybrid_zoo.models.hybrid_llama.configuration_hybrid_llama import HybridLlamaConfig
 from hmf.model.hybrid_zoo.models.hybrid_qwen2.configuration_hybrid_qwen2 import HybridQwen2Config
 from hmf.model.hybrid_zoo.models.hybrid_qwen3.configuration_hybrid_qwen3 import HybridQwen3Config
@@ -100,7 +104,9 @@ def get_model_type(model: nn.Module) -> type:
         ValueError: If the model type is not supported.
     """
     model_type = _get_text_config(model.config).model_type
-    if "qwen2" in model_type:
+    if "gemma4" in model_type:
+        return HybridGemma4ForCausalLM
+    elif "qwen2" in model_type:
         return HybridQwen2ForCausalLM
     elif "qwen3_5_moe" in model_type:
         return Qwen3_5MoeHMFForCausalLM
@@ -199,8 +205,26 @@ def get_unfused_config(config: AutoConfig) -> AutoConfig:
     # base model's layer_types, which unfusing doesn't change, and the Ministral3 config has none.
     if isinstance(target_config, (HybridQwen2Config, HybridQwen3Config, HybridQwen3MoeConfig, HybridLlamaConfig)):
         target_config.layer_types = hybrid_layer_types(new_hybrid_pattern, target_config.layer_types)
+    # The hybrid Gemma 4 config keeps the base model's kinds in base_layer_types
+    elif isinstance(target_config, HybridGemma4TextConfig):
+        target_config.layer_types = hybrid_layer_types(new_hybrid_pattern, target_config.base_layer_types)
 
     return new_config
+
+
+def get_unfused_weights(fused_state_dict: dict, unfused_keys: set) -> Tuple[dict, set]:
+    """
+    Returns the weights of the unfused model that the fused model has, and the names of those that it lacks. The
+    weights keep their names, apart from those of a hybrid Gemma 4 layer that replaces a source whose keys and values
+    later layers still read: the unfused layer keeps the source's key and value projections and key norm in
+    source_kv, which the fused layer has in its attention (self_attn).
+    """
+    weights = {}
+    for name in unfused_keys:
+        fused_name = name.replace(".source_kv.", ".self_attn.")
+        if fused_name in fused_state_dict:
+            weights[name] = fused_state_dict[fused_name]
+    return weights, unfused_keys - weights.keys()
 
 
 def unfuse_model(model_dir: str, save_dir: str, save_max_shard_size: str = "5GB") -> None:
@@ -262,14 +286,12 @@ def unfuse_model(model_dir: str, save_dir: str, save_max_shard_size: str = "5GB"
     logger.info("Copying weights from fused model to unfused model")
     fused_model_state_dict = fused_model.state_dict()
 
-    # Build filtered state dict with only matching keys
-    unfused_keys = set(unfused_model.state_dict().keys())
-    fused_keys = set(fused_model_state_dict.keys())
+    # Build filtered state dict with only the weights that the fused model has
+    filtered_state_dict, missing_keys = get_unfused_weights(
+        fused_model_state_dict, set(unfused_model.state_dict().keys())
+    )
 
-    matching_keys = unfused_keys & fused_keys
-    missing_keys = unfused_keys - fused_keys
-
-    copied_params = len(matching_keys)
+    copied_params = len(filtered_state_dict)
     random_init_params = len(missing_keys)
 
     for param_name in missing_keys:
@@ -282,7 +304,6 @@ def unfuse_model(model_dir: str, save_dir: str, save_max_shard_size: str = "5GB"
     )
 
     # Load matching weights directly (much faster than manual copy loop)
-    filtered_state_dict = {k: v for k, v in fused_model_state_dict.items() if k in matching_keys}
     unfused_model.load_state_dict(filtered_state_dict, strict=False)
     unfused_model = unfused_model.to(torch.bfloat16)
 

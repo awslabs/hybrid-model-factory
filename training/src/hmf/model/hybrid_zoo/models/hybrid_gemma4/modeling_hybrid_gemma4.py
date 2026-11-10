@@ -30,6 +30,9 @@ Architecture:
     Each decoder layer is chosen by the hybrid override pattern in the model configuration, and can be either:
     - Standard Gemma 4 attention layer (Gemma4DecoderLayer), which keeps the base model's sliding or full attention
     - One of several hybrid layer types (subclasses of Gemma4HybridDecoderLayerBase)
+    - For Stage 1 of hybridization (layerwise distillation), a '*DA' or fused 'X*' layer (subclasses of
+      Gemma4Stage1DecoderLayerBase), which runs a hybrid stream and Gemma 4's own attention stream side by side,
+      through HybridGemma4TextModel.stage1_layer_outputs
 
 Each layer's head size, RoPE, and key and value sharing follow the base model's attention kind at that layer
 (config.base_layer_types), so a hybrid layer that replaces a full attention layer gets its larger heads. The last
@@ -43,7 +46,7 @@ import copy
 import sys
 from abc import ABC, abstractmethod
 from collections import UserDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 import torch
 from torch import nn
@@ -420,6 +423,25 @@ class Gemma4SWAttention(Gemma4TextAttention):
         return attn_output, attn_weights, None
 
 
+def project_keys_and_values(
+    module: nn.Module, hidden_states: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns the keys and values that Gemma 4's attention computes from the normalized hidden states, with the key
+    and value projections and norms of module (a Gemma4TextAttention, or a Gemma4SourceKeysAndValues), in the shape
+    (batch, num_key_value_heads, seq_len, head_dim).
+    """
+    hidden_shape = (*hidden_states.shape[:-1], -1, module.head_dim)
+    cos, sin = position_embeddings
+    key_states = module.k_proj(hidden_states).view(hidden_shape)
+    value_states = module.v_proj(hidden_states).view(hidden_shape) if module.v_proj is not None else key_states
+
+    key_states = module.k_norm(key_states)
+    key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
+    value_states = module.v_norm(value_states).transpose(1, 2)
+    return key_states, value_states
+
+
 class Gemma4SourceKeysAndValues(nn.Module):
     """
     The key and value projections of a source layer, whose keys and values later layers of its kind reuse, for a
@@ -455,15 +477,7 @@ class Gemma4SourceKeysAndValues(nn.Module):
         shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]],
         past_key_values: Cache | None = None,
     ) -> None:
-        hidden_shape = (*hidden_states.shape[:-1], -1, self.head_dim)
-        cos, sin = position_embeddings
-        key_states = self.k_proj(hidden_states).view(hidden_shape)
-        value_states = self.v_proj(hidden_states).view(hidden_shape) if self.v_proj is not None else key_states
-
-        key_states = self.k_norm(key_states)
-        key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
-        value_states = self.v_norm(value_states).transpose(1, 2)
-
+        key_states, value_states = project_keys_and_values(self, hidden_states, position_embeddings)
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
         shared_kv_states[self.layer_type] = key_states, value_states
@@ -538,7 +552,66 @@ class Gemma4DecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
-class Gemma4HybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
+class Gemma4DecoderLayerBody:
+    """
+    The parts of Gemma 4's decoder layer around its sequence mixer: the MLP, the four norms around the mixer and the
+    MLP, the per-layer embedding block after the MLP, and the layer's scalar, under the names that Gemma4DecoderLayer
+    gives them. The hybrid decoder layers and the Stage 1 decoder layers build them with _init_body and run them
+    around their sequence mixer with _body_forward.
+    """
+
+    def _init_body(self, config: HybridGemma4TextConfig, layer_idx: int):
+        self.mlp = Gemma4TextMLP(config, layer_idx)
+        self.input_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.pre_feedforward_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.post_feedforward_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.layer_scalar = nn.Buffer(torch.ones(1))
+
+        self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
+        if self.hidden_size_per_layer_input:
+            self.act_fn = ACT2FN[config.hidden_activation]
+            self.per_layer_input_gate = nn.Linear(self.hidden_size, self.hidden_size_per_layer_input, bias=False)
+            self.per_layer_projection = nn.Linear(self.hidden_size_per_layer_input, self.hidden_size, bias=False)
+            self.post_per_layer_input_norm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+
+    def _body_forward(
+        self,
+        hidden_states: torch.Tensor,
+        per_layer_input: torch.Tensor | None,
+        mixer: Callable[[torch.Tensor], torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Runs the decoder layer on hidden_states, with mixer, a function of the normalized hidden states, as its
+        sequence mixer.
+
+        Returns:
+            - hidden_states: the layer's output
+            - mixer_out: the sequence mixer's output as the layer adds it to the residual stream (after its norm)
+            - mlp_out: the MLP's output as the layer adds it to the residual stream (after its norm)
+        """
+        residual = hidden_states
+        mixer_out = self.post_attention_layernorm(mixer(self.input_layernorm(hidden_states)))
+        hidden_states = residual + mixer_out
+
+        residual = hidden_states
+        mlp_out = self.post_feedforward_layernorm(self.mlp(self.pre_feedforward_layernorm(hidden_states)))
+        hidden_states = residual + mlp_out
+
+        if self.hidden_size_per_layer_input:
+            residual = hidden_states
+            hidden_states = self.per_layer_input_gate(hidden_states)
+            hidden_states = self.act_fn(hidden_states)
+            hidden_states = hidden_states * per_layer_input
+            hidden_states = self.per_layer_projection(hidden_states)
+            hidden_states = self.post_per_layer_input_norm(hidden_states)
+            hidden_states = residual + hidden_states
+
+        hidden_states *= self.layer_scalar
+        return hidden_states, mixer_out, mlp_out
+
+
+class Gemma4HybridDecoderLayerBase(Gemma4DecoderLayerBody, GradientCheckpointingLayer, ABC):
     """
     Base class for hybrid decoder layers that replace Gemma 4's attention with alternative sequence mixers:
         - Mamba2
@@ -567,20 +640,7 @@ class Gemma4HybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
         self.layer_idx = layer_idx
         # The full attention mask, whose padding the sequence mixers read
         self.attention_type = "full_attention"
-
-        self.mlp = Gemma4TextMLP(config, layer_idx)
-        self.input_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.pre_feedforward_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.layer_scalar = nn.Buffer(torch.ones(1))
-
-        self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
-        if self.hidden_size_per_layer_input:
-            self.act_fn = ACT2FN[config.hidden_activation]
-            self.per_layer_input_gate = nn.Linear(self.hidden_size, self.hidden_size_per_layer_input, bias=False)
-            self.per_layer_projection = nn.Linear(self.hidden_size_per_layer_input, self.hidden_size, bias=False)
-            self.post_per_layer_input_norm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self._init_body(config, layer_idx)
 
         # All Hybrid decoder layer subclasses must implement this
         self._init_seq_mixer(config, layer_idx)
@@ -637,45 +697,27 @@ class Gemma4HybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
         Returns:
             The layer's output hidden states, of shape `(batch, seq_len, hidden_size)`
         """
-        residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
-        if self.source_kv is not None:
-            self.source_kv(hidden_states, position_embeddings, shared_kv_states, past_key_values)
+        def mixer(normed_hidden_states):
+            if self.source_kv is not None:
+                self.source_kv(normed_hidden_states, position_embeddings, shared_kv_states, past_key_values)
 
-        # Sequence mixing (Mamba2, B'MOJO, GDN, etc.). SWA reads or writes the shared keys and values as Gemma 4's
-        # attention does at its layer, while the other mixers neither read nor write them.
-        if self.reads_shared_kv:
-            kwargs["shared_kv_states"] = shared_kv_states
-        hidden_states, _, _ = self.seq_mixer(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
+            # Sequence mixing (Mamba2, B'MOJO, GDN, etc.). SWA reads or writes the shared keys and values as Gemma
+            # 4's attention does at its layer, while the other mixers neither read nor write them.
+            if self.reads_shared_kv:
+                kwargs["shared_kv_states"] = shared_kv_states
+            mixer_out, _, _ = self.seq_mixer(
+                hidden_states=normed_hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+            return mixer_out
 
-        residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-
-        if self.hidden_size_per_layer_input:
-            residual = hidden_states
-            hidden_states = self.per_layer_input_gate(hidden_states)
-            hidden_states = self.act_fn(hidden_states)
-            hidden_states = hidden_states * per_layer_input
-            hidden_states = self.per_layer_projection(hidden_states)
-            hidden_states = self.post_per_layer_input_norm(hidden_states)
-            hidden_states = residual + hidden_states
-
-        hidden_states *= self.layer_scalar
-        return hidden_states
+        return self._body_forward(hidden_states, per_layer_input, mixer)[0]
 
 
 class Gemma4Mamba2DecoderLayer(Gemma4HybridDecoderLayerBase):
@@ -750,6 +792,215 @@ class Gemma4SWADecoderLayer(Gemma4HybridDecoderLayerBase):
         return self.swa
 
 
+class Gemma4Stage1DecoderLayerBase(Gemma4DecoderLayerBody, GradientCheckpointingLayer, ABC):
+    """
+    Base class for the decoder layers of Stage 1 of hybridization (layerwise distillation), which take two streams
+    of hidden states: the hybrid stream, which becomes the hybrid model after unfusing, and the attention stream,
+    which is Gemma 4 itself and gives the targets. Both streams go through the layer's Gemma 4 attention (self_attn)
+    or its hybrid sequence mixer, and then through the same MLP, norms, per-layer embedding block, and scalar. Each
+    stream has its own shared keys and values, which its source layers compute from that stream. The attention
+    stream runs without gradients, since its parameters are frozen in Stage 1 and its outputs are only targets.
+
+    A model of these layers runs only through HybridGemma4TextModel.stage1_layer_outputs, which the HKD trainer
+    calls. Subclasses must implement `_hybrid_mixer`, the sequence mixer of the hybrid stream.
+    """
+
+    def __init__(self, config: HybridGemma4TextConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
+        self.self_attn = Gemma4TextAttention(config=config, layer_idx=layer_idx)
+        self._init_body(config, layer_idx)
+        # The masks of the attention stream (the base model's attention kind at this layer) and the hybrid stream
+        self.attention_type = self.self_attn.layer_type
+        self.hybrid_attention_type = self.attention_type
+
+    def _attention_mixer(
+        self, hidden_states, position_embeddings, attention_mask, shared_kv_states, position_ids, **kwargs
+    ) -> torch.Tensor:
+        """Runs the layer's Gemma 4 attention on the normalized hidden states of either stream."""
+        attn_output, _ = self.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            shared_kv_states=shared_kv_states,
+            position_ids=position_ids,
+            **kwargs,
+        )
+        return attn_output
+
+    @abstractmethod
+    def _hybrid_mixer(
+        self, hidden_states, position_embeddings, attention_mask, shared_kv_states, position_ids, **kwargs
+    ) -> torch.Tensor:
+        """Runs the sequence mixer of the hybrid stream on its normalized hidden states."""
+        pass
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_hidden_states: torch.Tensor,
+        per_layer_input: torch.Tensor | None = None,
+        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+        attention_shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        hybrid_attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Runs the hybrid stream through the layer with gradients, and the attention stream without them.
+
+        Args:
+            hidden_states (`torch.FloatTensor`): the hybrid stream's input, of shape `(batch, seq_len, hidden_size)`
+            attention_hidden_states (`torch.FloatTensor`): the attention stream's input, of the same shape
+            per_layer_input (`torch.FloatTensor`, *optional*): this layer's slice of the per-layer embeddings, which
+                both streams use
+            shared_kv_states (`dict`, *optional*): the shared keys and values of the hybrid stream
+            attention_shared_kv_states (`dict`, *optional*): the shared keys and values of the attention stream
+            position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*): the cosine and sine
+                positional embeddings of the base model's attention kind at this layer
+            attention_mask (`torch.FloatTensor`, *optional*): the attention stream's mask (see attention_type)
+            hybrid_attention_mask (`torch.FloatTensor`, *optional*): the hybrid stream's mask (see
+                hybrid_attention_type)
+            position_ids (`torch.LongTensor`, *optional*): Position IDs for the input
+            kwargs (`dict`, *optional*): Arbitrary kwargs to be ignored, used for FSDP and other methods that injects
+                code into the model
+
+        Returns:
+            - hybrid_out: the hybrid stream's output
+            - attn_out: the attention stream's output
+            - hybrid_mixer_out: the hybrid stream's sequence mixer output, as the layer adds it to the residual
+            - attn_mixer_out: the attention stream's attention output, as the layer adds it to the residual
+            - hybrid_mlp_out: the hybrid stream's MLP output, as the layer adds it to the residual
+            - attn_mlp_out: the attention stream's MLP output, as the layer adds it to the residual
+        """
+        hybrid_out, hybrid_mixer_out, hybrid_mlp_out = self._body_forward(
+            hidden_states,
+            per_layer_input,
+            lambda normed: self._hybrid_mixer(
+                normed, position_embeddings, hybrid_attention_mask, shared_kv_states, position_ids, **kwargs
+            ),
+        )
+        with torch.no_grad():
+            attn_out, attn_mixer_out, attn_mlp_out = self._body_forward(
+                attention_hidden_states,
+                per_layer_input,
+                lambda normed: self._attention_mixer(
+                    normed, position_embeddings, attention_mask, attention_shared_kv_states, position_ids, **kwargs
+                ),
+            )
+        return hybrid_out, attn_out, hybrid_mixer_out, attn_mixer_out, hybrid_mlp_out, attn_mlp_out
+
+
+class Gemma4DualAttDecoderLayer(Gemma4Stage1DecoderLayerBase):
+    """
+    The '*DA' layer of Stage 1: Gemma 4's attention on both streams, which becomes Gemma 4's attention ('*') after
+    unfusing. In the hybrid stream, a source stores the keys and values that it computes from the hybrid stream, and
+    a sharing layer reads those of the hybrid stream.
+    """
+
+    def _hybrid_mixer(self, hidden_states, position_embeddings, attention_mask, shared_kv_states, position_ids,
+                      **kwargs):
+        return self._attention_mixer(
+            hidden_states, position_embeddings, attention_mask, shared_kv_states, position_ids, **kwargs
+        )
+
+
+class Gemma4FusedAttHybridDecoderLayerBase(Gemma4Stage1DecoderLayerBase):
+    """
+    Base class for the fused layers of Stage 1 ('X*', such as 'GKA*'), which run a hybrid sequence mixer on the
+    hybrid stream and Gemma 4's frozen attention on the attention stream, and become the hybrid layer 'X' after
+    unfusing. The mixer gets the config of its layer, as in Gemma4HybridDecoderLayerBase.
+
+    At a source whose keys and values later layers of the hybrid stream still read (see
+    HybridGemma4TextConfig.keeps_source_keys_and_values), the layer also computes them from the hybrid stream with
+    the frozen key and value projections of its attention, as the unfused layer's Gemma4SourceKeysAndValues will.
+
+    Subclasses must implement:
+        - `_init_seq_mixer(config, layer_idx)`: Initialize the sequence mixer (e.g., self.gka = ...)
+        - `seq_mixer` property: Return the initialized sequence mixer instance
+    """
+
+    # Whether the sequence mixer takes the shared keys and values (SWA, which is Gemma 4's attention with a window)
+    reads_shared_kv = False
+
+    def __init__(self, config: HybridGemma4TextConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+        # The full attention mask, whose padding the sequence mixers read
+        self.hybrid_attention_type = "full_attention"
+        self._init_seq_mixer(config, layer_idx)
+        self.computes_source_kv = config.keeps_source_keys_and_values(layer_idx)
+
+    @property
+    @abstractmethod
+    def seq_mixer(self) -> nn.Module:
+        """Returns the instance of the decoder layer's sequence mixer."""
+        pass
+
+    @abstractmethod
+    def _init_seq_mixer(self, config: HybridGemma4TextConfig, layer_idx: int):
+        """Initializes the sequence mixer (such as Mamba2 or GKA)."""
+        pass
+
+    def _hybrid_mixer(self, hidden_states, position_embeddings, attention_mask, shared_kv_states, position_ids,
+                      **kwargs):
+        if self.computes_source_kv:
+            shared_kv_states[self.self_attn.layer_type] = project_keys_and_values(
+                self.self_attn, hidden_states, position_embeddings
+            )
+        if self.reads_shared_kv:
+            kwargs["shared_kv_states"] = shared_kv_states
+        mixer_out, _, _ = self.seq_mixer(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            use_cache=False,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        return mixer_out
+
+
+# The fused layers build their sequence mixers as the hybrid layers do, under the same names, so that unfusing keeps
+# the mixers' weights
+class Gemma4FusedAttMamba2DecoderLayer(Gemma4FusedAttHybridDecoderLayerBase):
+    """Stage 1's fused layer with Mamba2 as the hybrid stream's sequence mixer."""
+
+    _init_seq_mixer = Gemma4Mamba2DecoderLayer._init_seq_mixer
+    seq_mixer = Gemma4Mamba2DecoderLayer.seq_mixer
+
+
+class Gemma4FusedAttGDNDecoderLayer(Gemma4FusedAttHybridDecoderLayerBase):
+    """Stage 1's fused layer with Gated DeltaNet (GDN) as the hybrid stream's sequence mixer."""
+
+    _init_seq_mixer = Gemma4GDNDecoderLayer._init_seq_mixer
+    seq_mixer = Gemma4GDNDecoderLayer.seq_mixer
+
+
+class Gemma4FusedAttGKADecoderLayer(Gemma4FusedAttHybridDecoderLayerBase):
+    """Stage 1's fused layer with Gated KalmaNet (GKA) as the hybrid stream's sequence mixer."""
+
+    _init_seq_mixer = Gemma4GKADecoderLayer._init_seq_mixer
+    seq_mixer = Gemma4GKADecoderLayer.seq_mixer
+
+
+class Gemma4FusedAttSWADecoderLayer(Gemma4FusedAttHybridDecoderLayerBase):
+    """Stage 1's fused layer with Sliding Window Attention (SWA) as the hybrid stream's sequence mixer."""
+
+    reads_shared_kv = True
+    _init_seq_mixer = Gemma4SWADecoderLayer._init_seq_mixer
+    seq_mixer = Gemma4SWADecoderLayer.seq_mixer
+
+    def __init__(self, config: HybridGemma4TextConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+        # The model builds this mask with the window of swa_config, which may differ from Gemma 4's own window
+        self.hybrid_attention_type = "swa"
+
+
 class Gemma4TextScaledWordEmbedding(nn.Embedding):
     """
     This module overrides nn.Embeddings' forward by multiplying with embeddings scale.
@@ -801,7 +1052,7 @@ class HybridGemma4PreTrainedModel(PreTrainedModel):
                 init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
         elif isinstance(module, Gemma4TextScaledWordEmbedding):
             init.constant_(module.embed_scale, module.scalar_embed_scale)
-        elif isinstance(module, (Gemma4DecoderLayer, Gemma4HybridDecoderLayerBase)):
+        elif isinstance(module, (Gemma4DecoderLayer, Gemma4DecoderLayerBody)):
             init.ones_(module.layer_scalar)
 
 
@@ -824,7 +1075,10 @@ class HybridGemma4TextModel(HybridGemma4PreTrainedModel):
         self.rotary_emb = Gemma4TextRotaryEmbedding(config)
         self.gradient_checkpointing = False
         self.unique_layer_types = set(self.config.base_layer_types)
-        self.mask_types = {layer.attention_type for layer in self.layers}
+        # The masks that the layers ask for, including those of the hybrid streams of Stage 1's layers
+        self.mask_types = {getattr(layer, kind) for layer in self.layers
+                           for kind in ("attention_type", "hybrid_attention_type") if hasattr(layer, kind)}
+        self.is_stage1 = any(isinstance(layer, Gemma4Stage1DecoderLayerBase) for layer in self.layers)
 
         # Per-Layer Embeddings (PLE): auxiliary embedding that feeds a residual signal
         # into each decoder layer. See `get_per_layer_inputs()` and `project_per_layer_inputs()`
@@ -900,6 +1154,11 @@ class HybridGemma4TextModel(HybridGemma4PreTrainedModel):
             hidden_size_per_layer_input)`. When provided, these are used directly instead of being computed from
             `input_ids` via `get_per_layer_inputs()` in the text model.
         """
+        if self.is_stage1:
+            raise ValueError(
+                "This model has the fused and '*DA' layers of Stage 1, which run only through stage1_layer_outputs "
+                "(the HKD trainer). Unfuse it first (fused_to_standard.py) to run it as a model."
+            )
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -978,6 +1237,65 @@ class HybridGemma4TextModel(HybridGemma4PreTrainedModel):
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
         )
+
+    def stage1_layer_outputs(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+    ) -> Iterator[tuple[torch.Tensor, ...]]:
+        """
+        Runs the two streams of a Stage 1 model (whose layers are all fused or '*DA' layers) for layerwise
+        distillation, and yields each decoder layer's six outputs (see Gemma4Stage1DecoderLayerBase.forward). Both
+        streams start from the scaled token embeddings and use the same per-layer inputs, masks, and RoPE of each
+        attention kind, as forward does, while each keeps its own shared keys and values. The HKD trainer calls it
+        in place of its own loop over the layers, which builds one full mask and one RoPE, and has no per-layer
+        inputs or shared keys and values.
+        """
+        if not all(isinstance(layer, Gemma4Stage1DecoderLayerBase) for layer in self.layers):
+            raise ValueError("stage1_layer_outputs needs a model whose layers are all fused or '*DA' layers.")
+
+        inputs_embeds = self.embed_tokens(input_ids)
+        per_layer_inputs = None
+        if self.hidden_size_per_layer_input:
+            per_layer_inputs = self.project_per_layer_inputs(
+                inputs_embeds, self.get_per_layer_inputs(input_ids, inputs_embeds)
+            )
+        if position_ids is None:
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
+
+        if getattr(self, "sequence_parallel_group", None) is not None:
+            masks = dict.fromkeys(self.mask_types | {"full_attention"})
+        else:
+            masks = self._causal_masks({
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": None,
+                "position_ids": position_ids,
+            })
+        position_embeddings = {
+            layer_type: self.rotary_emb(inputs_embeds, position_ids, layer_type)
+            for layer_type in self.unique_layer_types
+        }
+
+        # UserDicts, as in forward, so that FSDP2 keeps them shared across the layers
+        shared_kv_states, attention_shared_kv_states = UserDict(), UserDict()
+        hidden_states = attention_hidden_states = inputs_embeds
+        for i, decoder_layer in enumerate(self.layers):
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_hidden_states,
+                per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None,
+                shared_kv_states=shared_kv_states,
+                attention_shared_kv_states=attention_shared_kv_states,
+                position_embeddings=position_embeddings[self.config.base_layer_types[i]],
+                attention_mask=masks[decoder_layer.attention_type],
+                hybrid_attention_mask=masks[decoder_layer.hybrid_attention_type],
+                position_ids=position_ids,
+            )
+            hidden_states, attention_hidden_states = layer_outputs[0], layer_outputs[1]
+            yield layer_outputs
 
     def get_per_layer_inputs(
         self, input_ids: torch.Tensor | None, inputs_embeds: torch.Tensor | None = None

@@ -18,6 +18,10 @@ from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
 
 from ..utils import hybrid_layer_types
 
+# The pattern entries whose layers read the shared keys and values of their kind at the layers that share them:
+# Gemma 4's attention, and SWA, which is Gemma 4's attention with a window, and their Stage 1 layers
+READS_SHARED_KV = ("*", "SWA", "*DA", "SWA*")
+
 
 @strict
 class HybridGemma4TextConfig(Gemma4TextConfig):
@@ -83,27 +87,29 @@ class HybridGemma4TextConfig(Gemma4TextConfig):
         """
         Returns the attention kinds whose shared keys and values a layer from first_kv_shared_layer on still reads.
         A '*' layer there reads them, and so does an SWA layer, which only limits them to its window, while a GKA,
-        GDN, or Mamba2 layer there has key and value projections of its own.
+        GDN, or Mamba2 layer there has key and value projections of its own. In a Stage 1 model, a '*DA' layer reads
+        them as a '*' layer does, and the hybrid stream of an 'SWA*' layer as an SWA layer does.
         """
         entries = (self.hybrid_override_pattern or "").split("-")
         return {
             self.base_layer_types[i]
             for i in range(self.first_kv_shared_layer, self.num_hidden_layers)
-            if self.hybrid_override_pattern is None or entries[i] in ("*", "SWA")
+            if self.hybrid_override_pattern is None or entries[i] in READS_SHARED_KV
         }
 
     def keeps_source_keys_and_values(self, layer_idx: int) -> bool:
         """
         Returns whether the layer at layer_idx is a hybrid sequence mixer (GKA, GDN, or Mamba2) at a source layer
         whose shared keys and values later layers still read (see kinds_read_from_sources). Such a layer keeps the
-        source's key and value projections to compute them, while its mixer computes its output.
+        source's key and value projections to compute them, while its mixer computes its output. In a Stage 1
+        model, a fused layer there ('GKA*', 'GDN*', or 'M2*') computes them for its hybrid stream.
         """
         if self.hybrid_override_pattern is None:
             return False
         entry = self.hybrid_override_pattern.split("-")[layer_idx]
         kind = self.base_layer_types[layer_idx]
         return (
-            entry not in ("*", "SWA")
+            entry not in READS_SHARED_KV
             and self.kv_sharing_sources().get(kind) == layer_idx
             and kind in self.kinds_read_from_sources()
         )

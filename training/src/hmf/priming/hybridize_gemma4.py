@@ -2,9 +2,9 @@
 Hybrid Gemma 4 Model Construction Module
 
 This module converts a base Gemma 4 model into a text-only hybrid Gemma 4 model (HybridGemma4ForCausalLM), whose
-layers the hybrid override pattern chooses among Gemma 4's own attention, Mamba2, Gated DeltaNet, GKA, and SWA. The
-base checkpoints are multimodal (Gemma4ForConditionalGeneration), so the conversion takes their text model and
-language modeling head, and leaves out the vision and audio towers.
+layers the hybrid override pattern chooses among Gemma 4's own attention, Mamba2, Gated DeltaNet, GKA, and SWA, or
+their Stage 1 layers ('*DA' and the fused 'X*'). The base checkpoints are multimodal (Gemma4ForConditionalGeneration),
+so the conversion takes their text model and language modeling head, and leaves out the vision and audio towers.
 """
 
 import torch.nn as nn
@@ -29,7 +29,7 @@ from .utils import add_hybrid_configs, copy_shared_weights
 logger = get_logger(__name__)
 
 # The pattern entries that priming supports for Gemma 4
-SUPPORTED_LAYER_TYPES = ("*", "M2", "GDN", "GKA", "SWA")
+SUPPORTED_LAYER_TYPES = ("*", "M2", "GDN", "GKA", "SWA", "*DA", "M2*", "GDN*", "GKA*", "SWA*")
 # The settings of each hybrid layer type that add_hybrid_configs writes into the config
 HYBRID_LAYER_CONFIGS = ("mamba2_config", "gdn_config", "gka_config", "swa_config")
 
@@ -58,7 +58,7 @@ def get_text_layers(base_model: nn.Module) -> nn.ModuleList:
 def check_supported(text_config: PretrainedConfig, hybrid_override_pattern: str) -> None:
     """
     Raises an error for what priming doesn't support for Gemma 4 yet: B'MOJO, whose attention scales its scores by
-    head_dim**-0.5 while Gemma 4's attention scales them by 1, the Stage 1 layers, and full attention layers whose
+    head_dim**-0.5 while Gemma 4's attention scales them by 1, and full attention layers whose
     keys double as values (attention_k_eq_v, as in Gemma 4 31B), which have no value projection to start from.
     """
     unsupported = sorted(set(hybrid_override_pattern.split("-")) - set(SUPPORTED_LAYER_TYPES))
@@ -142,11 +142,13 @@ def init_shared_swa(attn_weights: AttentionWeights, swa_layer: nn.Module) -> Non
 def init_hybrid_layers(base_layers: nn.ModuleList, hybrid_model: nn.Module, config: HybridGemma4TextConfig) -> None:
     """
     Initializes each hybrid layer from the Gemma 4 attention that it replaces, whose head size it has. The rest of
-    each decoder layer (its MLP, four norms, per-layer embedding block, and scalar) is copied by copy_shared_weights.
+    each decoder layer (its MLP, four norms, per-layer embedding block, and scalar) is copied by copy_shared_weights,
+    and so is the attention of Stage 1's layers ('*DA' and the fused 'X*'), whose mixers start as those of 'X' do.
     """
-    for layer_idx, layer_type in parse_override_pattern(config.hybrid_override_pattern).items():
-        if layer_type == "*":
+    for layer_idx, entry in parse_override_pattern(config.hybrid_override_pattern).items():
+        if entry in ("*", "*DA"):
             continue
+        layer_type = entry.removesuffix("*")
         attn_weights = attention_weights(base_layers, layer_idx, config)
         hybrid_layer = hybrid_model.model.layers[layer_idx]
         if getattr(hybrid_layer, "source_kv", None) is not None:
