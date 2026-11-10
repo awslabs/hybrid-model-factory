@@ -460,6 +460,55 @@ class ReasoningTemplate(Template):
 
 
 @dataclass
+class Gemma4Template(Template):
+    r"""
+    Gemma 4's chat template (the -it models' chat_template.jinja). It keeps the thinking of the last model turn only,
+    and writes no empty thought blocks where a turn has no thinking, unlike ReasoningTemplate. When the last turn's
+    thinking is kept, the system turn starts with <|think|>, as Gemma 4's template writes it with enable_thinking
+    (creating a system turn when there is none). With enable_thinking False, all thinking is removed. Tool calls and
+    responses, which Gemma 4 keeps inside the model turn and names after their tool, are not supported yet.
+    """
+
+    def _prepare(
+        self, messages: list[dict[str, str]], system: Optional[str], tools: Optional[str]
+    ) -> tuple[list[dict[str, str]], Optional[str]]:
+        if tools or any(message["role"] in (Role.FUNCTION, Role.OBSERVATION) for message in messages):
+            raise NotImplementedError("The gemma4 template does not support tool calls and responses yet.")
+
+        messages = deepcopy(messages)
+        last = len(messages) - 1
+        for i in range(1, len(messages), 2):
+            if i != last or self.enable_thinking is False:
+                messages[i]["content"] = self.remove_thought(messages[i]["content"])
+
+        if self.enable_thinking is not False and self.thought_words[0] in messages[last]["content"]:
+            system = "<|think|>\n" + (system or self.default_system)
+        return messages, system
+
+    @override
+    def encode_oneturn(
+        self,
+        tokenizer: "PreTrainedTokenizer",
+        messages: list[dict[str, str]],
+        system: Optional[str] = None,
+        tools: Optional[str] = None,
+    ) -> tuple[list[int], list[int]]:
+        messages, system = self._prepare(messages, system, tools)
+        return super().encode_oneturn(tokenizer, messages, system, tools)
+
+    @override
+    def encode_multiturn(
+        self,
+        tokenizer: "PreTrainedTokenizer",
+        messages: list[dict[str, str]],
+        system: Optional[str] = None,
+        tools: Optional[str] = None,
+    ) -> list[tuple[list[int], list[int]]]:
+        messages, system = self._prepare(messages, system, tools)
+        return super().encode_multiturn(tokenizer, messages, system, tools)
+
+
+@dataclass
 class LongReasoningTemplate(ReasoningTemplate):
     """A ReasoningTemplate that supports PT_SEPARATOR and PT_CONTENT roles."""
     format_pt_separator: "Formatter"
@@ -1083,6 +1132,20 @@ register_template(
     replace_eos=True,
     mm_plugin=get_mm_plugin("gemma3n", image_token="<image_soft_token>", audio_token="<audio_soft_token>"),
     template_class=Llama2Template,
+)
+
+
+# Gemma 4's chat template, as gemma-4-E4B-it's chat_template.jinja renders it (see Gemma4Template)
+register_template(
+    name="gemma4",
+    format_user=StringFormatter(slots=["<|turn>user\n{{content}}<turn|>\n<|turn>model\n"]),
+    format_assistant=StringFormatter(slots=["{{content}}<turn|>\n"]),
+    format_system=StringFormatter(slots=["<|turn>system\n{{content}}<turn|>\n"]),
+    format_prefix=EmptyFormatter(slots=[{"bos_token"}]),
+    stop_words=["<turn|>"],
+    thought_words=("<|channel>thought\n", "\n<channel|>"),
+    replace_eos=True,
+    template_class=Gemma4Template,
 )
 
 
