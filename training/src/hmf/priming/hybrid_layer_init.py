@@ -57,6 +57,8 @@ class AttentionWeights:
         o_bias: Optional output projection bias
         q_norm: Optional query normalization layer (for models with QK-norm like Qwen3)
         k_norm: Optional key normalization layer
+        head_dim: The size of the attention's heads, when the attention module records it, which tells whether a
+            target layer with smaller heads needs the attention's heads split (see split_attention_heads)
     """
     q_weight: torch.Tensor
     k_weight: torch.Tensor
@@ -68,6 +70,7 @@ class AttentionWeights:
     o_bias: Optional[torch.Tensor] = None
     q_norm: Optional[nn.Module] = None
     k_norm: Optional[nn.Module] = None
+    head_dim: Optional[int] = None
 
 
 def _to_float32_if_fp8(tensor: torch.Tensor) -> torch.Tensor:
@@ -164,6 +167,7 @@ def _extract_unfused(attn_layer: nn.Module) -> AttentionWeights:
         o_bias=attn_layer.o_proj.bias.data if hasattr(attn_layer.o_proj, "bias") and attn_layer.o_proj.bias is not None else None,
         q_norm=getattr(attn_layer, "q_norm", None),
         k_norm=getattr(attn_layer, "k_norm", None),
+        head_dim=getattr(attn_layer, "head_dim", None),
     )
 
 
@@ -208,7 +212,70 @@ def _extract_fused(
         o_bias=attn_layer.o_proj.bias.data if hasattr(attn_layer.o_proj, "bias") and attn_layer.o_proj.bias is not None else None,
         q_norm=getattr(attn_layer, "q_norm", None),
         k_norm=getattr(attn_layer, "k_norm", None),
+        head_dim=head_dim,
     )
+
+
+def split_attention_heads(attn_weights: AttentionWeights, target_head_dim: int) -> AttentionWeights:
+    """
+    Reorders attention weights for a target layer (GKA or GDN) whose heads are the attention's heads split into
+    s = head_dim / target_head_dim pieces of target_head_dim, as split_heads (layers/head_split.py) builds it for
+    attention heads larger than the target's kernels support.
+
+    Viewed with target_head_dim, piece c of query head h is head h*s + c, and piece c of key/value head m is head
+    m*s + c. GKA and GDN expand their key/value heads in "(h g)" order, so query head j reads key/value head j // G,
+    with G query heads per key/value head. For each piece of a query head to read the same piece of its own key/value
+    head, the query heads are reordered to give, for each key/value head m and each piece c, the pieces c of the
+    query heads of group m. The query rows (and bias) and the output projection's columns are reordered alike, since
+    target head j's output comes from its value piece, while the key and value weights keep their order. Each split
+    head's q·k is then one piece of an attention head's q·k, and the output projection of the values is unchanged.
+    """
+    head_dim = attn_weights.head_dim
+    split = head_dim // target_head_dim
+    hidden_size = attn_weights.q_weight.shape[1]
+    num_heads = attn_weights.q_weight.shape[0] // head_dim
+    num_kv_heads = attn_weights.k_weight.shape[0] // head_dim
+    group = num_heads // num_kv_heads
+
+    perm = torch.tensor(
+        [
+            h * split + c
+            for m in range(num_kv_heads)
+            for c in range(split)
+            for h in range(m * group, (m + 1) * group)
+        ],
+        device=attn_weights.q_weight.device,
+    )
+    q_weight = attn_weights.q_weight.view(num_heads * split, target_head_dim, hidden_size)[perm]
+    q_bias = attn_weights.q_bias
+    if q_bias is not None:
+        q_bias = q_bias.view(num_heads * split, target_head_dim)[perm].reshape(-1)
+    o_weight = attn_weights.o_weight.view(hidden_size, num_heads * split, target_head_dim)[:, perm]
+    return AttentionWeights(
+        q_weight=q_weight.reshape(-1, hidden_size),
+        k_weight=attn_weights.k_weight,
+        v_weight=attn_weights.v_weight,
+        o_weight=o_weight.reshape(hidden_size, -1),
+        q_bias=q_bias,
+        k_bias=attn_weights.k_bias,
+        v_bias=attn_weights.v_bias,
+        o_bias=attn_weights.o_bias,
+        head_dim=target_head_dim,
+    )
+
+
+def _match_head_size(attn_weights: AttentionWeights, layer: nn.Module, layer_idx: int) -> AttentionWeights:
+    """
+    Returns the attention weights reordered for a target layer whose heads are smaller than the attention's (see
+    split_attention_heads), or the weights as they are when the head sizes match or the attention's is unknown.
+    """
+    if attn_weights.head_dim is None or layer.head_dim >= attn_weights.head_dim:
+        return attn_weights
+    logger.info(
+        f"Layer {layer_idx}: splitting attention heads of {attn_weights.head_dim} into heads of {layer.head_dim}, "
+        f"which the {type(layer).__name__} kernels support"
+    )
+    return split_attention_heads(attn_weights, layer.head_dim)
 
 
 
@@ -495,6 +562,7 @@ def gated_deltanet_proj_init(
         gated_deltanet_layer: Target Gated DeltaNet layer
         layer_idx: Layer index for logging
     """
+    attn_weights = _match_head_size(attn_weights, gated_deltanet_layer, layer_idx)
     weight_sums = {}
 
     # Initialize Q, K, V, O projections
@@ -550,6 +618,7 @@ def gka_proj_init(
         gka_layer: Target GKA layer
         layer_idx: Layer index for logging
     """
+    attn_weights = _match_head_size(attn_weights, gka_layer, layer_idx)
     weight_sums = {}
 
     # Initialize Q, K, V, O projections

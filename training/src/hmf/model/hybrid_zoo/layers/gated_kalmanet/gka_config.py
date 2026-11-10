@@ -3,8 +3,16 @@ from typing import Optional, Union, TYPE_CHECKING
 
 from transformers.configuration_utils import PretrainedConfig
 
+from ..head_split import split_heads
+
 if TYPE_CHECKING:
     from ..hybrid_dataclasses import HybridGKAConfig
+
+# The largest head size that GKA's kernels support in training, as tested on H100 and H200 GPUs: larger heads need
+# more shared memory per block than these GPUs have (training runs out of it at 256, and hangs at 512). Larger
+# attention heads are split into heads of this size (see split_heads). Other GPUs may support larger heads, or only
+# smaller ones.
+GKA_MAX_HEAD_DIM = 128
 
 
 @dataclass
@@ -137,6 +145,7 @@ def _construct_from_transformer(
     num_heads = config.num_attention_heads
     num_kv_heads = config.num_key_value_heads
     head_dim = getattr(config, "head_dim", hidden_size // num_heads)
+    head_dim, num_heads, num_kv_heads = split_heads(head_dim, num_heads, num_kv_heads, GKA_MAX_HEAD_DIM)
 
     # Standard GQA: Q has more heads, K/V have fewer
     return GKAConfig(
