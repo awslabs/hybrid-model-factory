@@ -42,6 +42,7 @@ def new_flash_attn_forward(
     attention_mask: Optional[torch.Tensor],
     q_len: Optional[int] = None,
     dropout: float = 0.0,
+    softmax_scale: Optional[float] = None,
     deterministic: bool = False,
     sliding_window: Optional[int] = None,
     is_causal: bool = True,
@@ -59,6 +60,8 @@ def new_flash_attn_forward(
         attention_mask: Optional attention mask (unused in current implementations).
         q_len: Query sequence length (unused in current implementations). Defaults to None.
         dropout: Dropout probability. Defaults to 0.0.
+        softmax_scale: The scale of the attention scores, such as the attention's `scaling` (1 for Gemma 4, whose
+            queries and keys are normalized). Defaults to None, which gives 1/sqrt(head_dim).
         deterministic: Whether to use deterministic operations. Defaults to False.
         sliding_window: Sliding window size for local attention (unused in current implementations). Defaults to None.
         is_causal: Whether to apply causal masking. Defaults to True.
@@ -77,6 +80,7 @@ def new_flash_attn_forward(
             key_states,
             value_states,
             dropout,
+            softmax_scale=softmax_scale,
             deterministic=deterministic,
             causal=is_causal,
             group=group,
@@ -91,6 +95,7 @@ def new_flash_attn_forward(
             value_states,
             deterministic=deterministic,
             dropout_p=dropout,
+            softmax_scale=softmax_scale,
             causal=is_causal,
         )
     else:
