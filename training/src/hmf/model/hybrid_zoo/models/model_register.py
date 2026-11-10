@@ -24,6 +24,7 @@ from transformers.configuration_utils import PretrainedConfig
 try:
     from transformers.utils.auto_docstring import HARDCODED_CONFIG_FOR_MODELS
     HARDCODED_CONFIG_FOR_MODELS.update({
+        "hybrid-gemma4": "HybridGemma4TextConfig",
         "hybrid-llama": "HybridLlamaConfig",
         "hybrid-ministral3": "HybridMinistral3Config",
         "hybrid-qwen2": "HybridQwen2Config",
@@ -250,6 +251,11 @@ def register_hybrid_models():
     except ImportError:
         pass
     AutoModel.register(HybridQwen2_5_VLConfig, HybridQwen2_5_VLModel)
+
+    # Hybrid Gemma 4 (text only)
+    from .hybrid_gemma4.configuration_hybrid_gemma4 import HybridGemma4TextConfig
+    from .hybrid_gemma4.modeling_hybrid_gemma4 import HybridGemma4ForCausalLM, HybridGemma4TextModel
+    register_model_family(HybridGemma4TextConfig, [HybridGemma4ForCausalLM, HybridGemma4TextModel])
 
     # Decision models (any AutoModel backbone with a pointer head instead of an LM head)
     from .decision.configuration_decision import DecisionConfig
