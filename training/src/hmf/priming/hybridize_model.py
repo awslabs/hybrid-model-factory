@@ -21,6 +21,7 @@ import os
 from typing import Tuple, Optional
 
 import yaml
+from .hybridize_gemma4 import construct_hybrid_gemma4
 from .hybridize_llama import construct_hybrid_llama
 from .hybridize_ministral3 import construct_hybrid_ministral3
 from .hybridize_qwen import construct_hybrid_qwen
@@ -297,10 +298,18 @@ def hybridize_model(hybrid_config: HybridConfig) -> None:
             config=config,
             hybrid_config=hybrid_config,
         )
+    elif model_type in ("gemma4", "gemma4_text"):
+        # HMF's hybrid Gemma 4 is text-only, so a multimodal Gemma 4 checkpoint becomes a text-only hybrid model
+        hybrid_model = construct_hybrid_gemma4(
+            base_model=transformer_model,
+            config=config,
+            hybrid_config=hybrid_config,
+        )
     else:
         raise ValueError(
             f"Model type '{model_type}' is currently not supported for hybridization. "
-            f"Currently supported model types: qwen2, qwen3, qwen3_next, qwen3_5_moe_text, llama, ministral3."
+            f"Currently supported model types: qwen2, qwen3, qwen3_next, qwen3_5_moe_text, llama, ministral3, "
+            f"gemma4."
         )
 
     # Calculate parameter statistics
