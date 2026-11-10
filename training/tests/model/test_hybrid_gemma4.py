@@ -99,12 +99,24 @@ def test_saved_config_keeps_base_layer_types(tmp_path):
     assert config.layer_types[4] == "linear_attention" and config.per_layer_config[4].head_dim == 32
 
 
-@pytest.mark.parametrize("layer", [4, 5, 6, 9])
-def test_hybrid_layer_at_a_layer_that_shares_keys_and_values_raises(layer):
-    entries = ["*"] * 10
-    entries[layer] = "GKA"
-    with pytest.raises(NotImplementedError, match=f"Layers \\[{layer}\\] share keys and values"):
-        HybridGemma4TextConfig(**TINY, hybrid_override_pattern="-".join(entries))
+def test_sources_keep_their_keys_and_values_while_sharing_attention_layers_read_them():
+    # Layers 6 to 9 reuse the keys and values of layer 4 (full) and layer 5 (sliding)
+    config = HybridGemma4TextConfig(**TINY, hybrid_override_pattern="*-*-*-*-GKA-GKA-*-*-*-*")
+    assert config.kinds_read_from_sources() == {SLIDING, FULL}
+    assert config.keeps_source_keys_and_values(4) and config.keeps_source_keys_and_values(5)
+
+
+def test_source_drops_its_keys_and_values_once_no_layer_reads_them():
+    # Layer 9 is the only full attention layer that reads layer 4's keys and values, and SWA layers read them too
+    config = HybridGemma4TextConfig(**TINY, hybrid_override_pattern="*-*-*-*-GKA-GKA-SWA-*-*-GDN",
+                                    swa_config={"window_size": 3})
+    assert config.kinds_read_from_sources() == {SLIDING}
+    assert not config.keeps_source_keys_and_values(4) and config.keeps_source_keys_and_values(5)
+    model = HybridGemma4ForCausalLM(config)
+    assert model.model.layers[4].source_kv is None and model.model.layers[5].source_kv is not None
+    # A sharing layer converted to GDN has its own key and value projections, while an SWA layer there has none
+    assert model.model.layers[9].gdn.k_proj.weight.shape == (32, 64)
+    assert not hasattr(model.model.layers[6].swa, "k_proj")
 
 
 def test_hybrid_layers_get_the_head_size_of_the_attention_they_replace():
@@ -186,3 +198,23 @@ def test_gka_outputs_match_between_cached_decoding_and_the_full_forward():
     for full, *cached in outputs.values():
         cached = torch.cat(cached, dim=1)
         assert ((cached - full).abs().max() / full.abs().max()) < 0.05
+
+
+@needs_cuda
+@pytest.mark.parametrize(
+    "pattern",
+    ["*-*-*-*-GKA-GKA-*-*-*-*", "*-*-*-*-GKA-GKA-SWA-*-*-GDN", "*-*-*-*-*-*-GKA-*-*-GDN"],
+    ids=["sources_keep_their_keys_and_values", "full_source_drops_them", "sharing_layers_converted"],
+)
+def test_layers_that_share_keys_and_values_decode_from_the_cache_as_a_full_forward_does(pattern):
+    config = HybridGemma4TextConfig(**TINY, hybrid_override_pattern=pattern, swa_config={"window_size": 3})
+    config._attn_implementation = "sdpa"
+    torch.manual_seed(0)
+    model = HybridGemma4ForCausalLM(config).cuda().eval()
+    ids = _ids().cuda()
+    with torch.no_grad():
+        out = model.generate(ids, max_new_tokens=6, do_sample=False, pad_token_id=0, return_dict_in_generate=True,
+                             output_logits=True)
+        full = model(out.sequences).logits
+    steps = torch.stack(out.logits, dim=1)
+    assert ((steps - full[:, ids.shape[1] - 1 : -1]).abs().max() / full.abs().max()) < 0.05

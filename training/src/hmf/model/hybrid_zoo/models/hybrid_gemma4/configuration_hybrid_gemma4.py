@@ -61,7 +61,6 @@ class HybridGemma4TextConfig(Gemma4TextConfig):
 
         if self.hybrid_override_pattern is not None:
             self.layer_types = hybrid_layer_types(self.hybrid_override_pattern, self.base_layer_types)
-            self._check_kv_sharing()
 
     def kv_sharing_sources(self) -> dict[str, int]:
         """
@@ -80,26 +79,33 @@ class HybridGemma4TextConfig(Gemma4TextConfig):
         """Returns the first layer that reuses an earlier layer's keys and values, or num_hidden_layers if none do."""
         return self.num_hidden_layers - (self.num_kv_shared_layers or 0)
 
-    def _check_kv_sharing(self):
+    def kinds_read_from_sources(self) -> set[str]:
         """
-        Raises an error for a hybrid layer at a layer that reuses another layer's keys and values, or at a layer
-        whose keys and values others reuse. The layers from first_kv_shared_layer on have no key and value
-        projections of their own, and the source layers compute the keys and values that they reuse, so these
-        layers keep Gemma 4's attention for now.
+        Returns the attention kinds whose shared keys and values a layer from first_kv_shared_layer on still reads.
+        A '*' layer there reads them, and so does an SWA layer, which only limits them to its window, while a GKA,
+        GDN, or Mamba2 layer there has key and value projections of its own.
         """
-        sources = set(self.kv_sharing_sources().values())
-        entries = self.hybrid_override_pattern.split("-")
-        blocked = [
-            i
-            for i, entry in enumerate(entries)
-            if entry != "*" and (i >= self.first_kv_shared_layer or i in sources)
-        ]
-        if blocked:
-            raise NotImplementedError(
-                f"Layers {blocked} share keys and values (layers {self.first_kv_shared_layer} to "
-                f"{self.num_hidden_layers - 1} reuse those of layers {sorted(sources)}), so they must stay '*' in "
-                f"hybrid_override_pattern, got {[entries[i] for i in blocked]}."
-            )
+        entries = (self.hybrid_override_pattern or "").split("-")
+        return {
+            self.base_layer_types[i]
+            for i in range(self.first_kv_shared_layer, self.num_hidden_layers)
+            if self.hybrid_override_pattern is None or entries[i] in ("*", "SWA")
+        }
 
+    def keeps_source_keys_and_values(self, layer_idx: int) -> bool:
+        """
+        Returns whether the layer at layer_idx is a hybrid sequence mixer (GKA, GDN, or Mamba2) at a source layer
+        whose shared keys and values later layers still read (see kinds_read_from_sources). Such a layer keeps the
+        source's key and value projections to compute them, while its mixer computes its output.
+        """
+        if self.hybrid_override_pattern is None:
+            return False
+        entry = self.hybrid_override_pattern.split("-")[layer_idx]
+        kind = self.base_layer_types[layer_idx]
+        return (
+            entry not in ("*", "SWA")
+            and self.kv_sharing_sources().get(kind) == layer_idx
+            and kind in self.kinds_read_from_sources()
+        )
 
 __all__ = ["HybridGemma4TextConfig"]

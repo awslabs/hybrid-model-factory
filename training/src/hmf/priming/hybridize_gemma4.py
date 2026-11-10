@@ -16,6 +16,7 @@ from hmf.model.hybrid_zoo.models.hybrid_gemma4.modeling_hybrid_gemma4 import Hyb
 from hmf.model.hybrid_zoo.models.utils import parse_override_pattern
 
 from .hybrid_layer_init import (
+    AttentionWeights,
     extract_attention_weights,
     gated_deltanet_proj_init,
     gka_proj_init,
@@ -93,6 +94,51 @@ def build_hybrid_config(text_config: PretrainedConfig, hybrid_config: HybridConf
     return config
 
 
+def attention_weights(base_layers: nn.ModuleList, layer_idx: int, config: HybridGemma4TextConfig) -> AttentionWeights:
+    """
+    Returns the weights of the Gemma 4 attention at layer_idx. A layer that shares keys and values has no key and
+    value projections of its own, so its keys and values come from its source, the layer whose keys and values it
+    reads, which gives a hybrid layer there the same keys and values to start from.
+    """
+    attn = base_layers[layer_idx].self_attn
+    if not attn.is_kv_shared_layer:
+        return extract_attention_weights(attn)
+    source = base_layers[config.kv_sharing_sources()[config.base_layer_types[layer_idx]]].self_attn
+    return AttentionWeights(
+        q_weight=attn.q_proj.weight.data,
+        k_weight=source.k_proj.weight.data,
+        v_weight=(source.v_proj if source.v_proj is not None else source.k_proj).weight.data,
+        o_weight=attn.o_proj.weight.data,
+        q_norm=attn.q_norm,
+        k_norm=source.k_norm,
+        head_dim=attn.head_dim,
+    )
+
+
+def init_source_keys_and_values(base_layers: nn.ModuleList, hybrid_layer: nn.Module, layer_idx: int) -> None:
+    """
+    Copies a source layer's key and value projections and key norm into the hybrid layer that replaces it, which
+    keeps them to compute the keys and values that later attention layers read (Gemma4SourceKeysAndValues).
+    """
+    attn = base_layers[layer_idx].self_attn
+    source_kv = hybrid_layer.source_kv
+    source_kv.k_proj.weight.data.copy_(attn.k_proj.weight.data)
+    source_kv.k_norm.weight.data.copy_(attn.k_norm.weight.data)
+    if source_kv.v_proj is not None:
+        source_kv.v_proj.weight.data.copy_(attn.v_proj.weight.data)
+    logger.info(f"Layer {layer_idx}: kept the source's key and value projections for the layers that share them")
+
+
+def init_shared_swa(attn_weights: AttentionWeights, swa_layer: nn.Module) -> None:
+    """
+    Initializes an SWA layer at a layer that shares keys and values, which, like Gemma 4's attention there, has
+    only query and output projections, and reads the keys and values of its source.
+    """
+    swa_layer.q_proj.weight.data.copy_(attn_weights.q_weight)
+    swa_layer.o_proj.weight.data.copy_(attn_weights.o_weight)
+    swa_layer.q_norm.weight.data.copy_(attn_weights.q_norm.weight.data)
+
+
 def init_hybrid_layers(base_layers: nn.ModuleList, hybrid_model: nn.Module, config: HybridGemma4TextConfig) -> None:
     """
     Initializes each hybrid layer from the Gemma 4 attention that it replaces, whose head size it has. The rest of
@@ -101,9 +147,13 @@ def init_hybrid_layers(base_layers: nn.ModuleList, hybrid_model: nn.Module, conf
     for layer_idx, layer_type in parse_override_pattern(config.hybrid_override_pattern).items():
         if layer_type == "*":
             continue
-        attn_weights = extract_attention_weights(base_layers[layer_idx].self_attn)
+        attn_weights = attention_weights(base_layers, layer_idx, config)
         hybrid_layer = hybrid_model.model.layers[layer_idx]
-        if layer_type == "M2":
+        if getattr(hybrid_layer, "source_kv", None) is not None:
+            init_source_keys_and_values(base_layers, hybrid_layer, layer_idx)
+        if layer_type == "SWA" and hybrid_layer.swa.is_kv_shared_layer:
+            init_shared_swa(attn_weights, hybrid_layer.swa)
+        elif layer_type == "M2":
             mamba2_init(attn_weights, hybrid_layer.mamba, layer_idx)
         elif layer_type == "GDN":
             gated_deltanet_proj_init(attn_weights, hybrid_layer.gdn, layer_idx)

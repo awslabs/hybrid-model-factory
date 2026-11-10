@@ -92,14 +92,51 @@ def test_primed_model_reloads_as_a_hybrid_gemma4(base, tmp_path):
         assert torch.equal(reloaded(_ids()).logits, model(_ids()).logits)
 
 
-@pytest.mark.parametrize(
-    "pattern, match",
-    [("BMF" + "-*" * 14, "supports the layer types"), ("-".join(["*"] * 14) + "-GKA", "share keys and values")],
-    ids=["bmojo", "a_layer_that_shares_keys_and_values"],
-)
-def test_unsupported_pattern_raises(base, pattern, match):
-    with pytest.raises(NotImplementedError, match=match):
-        _prime(base, pattern)
+def test_bmojo_raises(base):
+    with pytest.raises(NotImplementedError, match="supports the layer types"):
+        _prime(base, "BMF" + "-*" * 14)
+
+
+def _pattern(at):
+    return "-".join(at.get(i, "*") for i in range(15))
+
+
+@pytest.mark.parametrize("at", [{14: "SWA"}, {9: "SWA"}, {9: "SWA", 14: "SWA"}],
+                         ids=["sharing_layer", "source", "source_and_sharing_layer"])
+def test_swa_at_full_layers_that_share_keys_and_values_gives_the_logits_of_the_base_model(base, at):
+    # Layers 10 to 14 reuse the keys and values of layers 8 (sliding) and 9 (full). At a full attention layer, a
+    # window wider than the input changes nothing (at a sliding layer, it would widen the layer's own window of 4)
+    model = _prime(base, _pattern(at), swa=HybridSWAConfig(window_size=64))
+    with torch.no_grad():
+        assert torch.equal(model(_ids()).logits, base(input_ids=_ids()).logits)
+
+
+def test_sharing_layer_converted_to_gka_starts_from_the_keys_and_values_of_its_source(base):
+    model = _prime(base, _pattern({14: "GKA"}))
+    gka = model.model.layers[14].gka
+    source, sharing = _base_layer(base, 9).self_attn, _base_layer(base, 14).self_attn
+    for name, attention in (("k_proj", source), ("v_proj", source), ("q_proj", sharing), ("o_proj", sharing)):
+        assert torch.equal(getattr(gka, name).weight, getattr(attention, name).weight), name
+
+
+@pytest.mark.parametrize("source", [8, 9], ids=["sliding", "full"])
+def test_source_converted_to_gka_still_gives_the_sharing_layers_their_keys_and_values(base, monkeypatch, source):
+    from collections import UserDict
+
+    model = _prime(base, _pattern({source: "GKA"}))
+    source_kv = model.model.layers[source].source_kv
+    assert torch.equal(source_kv.k_proj.weight, _base_layer(base, source).self_attn.k_proj.weight)
+    # GKA's kernels need CUDA, so its output is replaced by zeros, which leaves the keys and values that the source
+    # computes from the layer's input, the same input as in the base model
+    gka = model.model.layers[source].gka
+    monkeypatch.setattr(gka, "forward", lambda hidden_states, **kwargs: (torch.zeros_like(hidden_states), None, None))
+    shared, base_shared = UserDict(), UserDict()
+    with torch.no_grad():
+        model.model(input_ids=_ids(), shared_kv_states=shared, use_cache=False)
+        base.model.language_model(input_ids=_ids(), shared_kv_states=base_shared, use_cache=False)
+    # Only the source's own kind matches, since the zeros change the input of the layers after it, such as layer 9
+    kind = base.config.text_config.layer_types[source]
+    assert all(torch.equal(a, b) for a, b in zip(shared[kind], base_shared[kind]))
 
 
 def test_heads_above_the_gka_limit_are_split_at_priming(base, monkeypatch):

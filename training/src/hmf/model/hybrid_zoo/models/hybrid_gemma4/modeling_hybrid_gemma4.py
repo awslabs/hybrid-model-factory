@@ -32,9 +32,11 @@ Architecture:
     - One of several hybrid layer types (subclasses of Gemma4HybridDecoderLayerBase)
 
 Each layer's head size, RoPE, and key and value sharing follow the base model's attention kind at that layer
-(config.base_layer_types), so a hybrid layer that replaces a full attention layer gets its larger heads. The
-layers that share keys and values, and the layers whose keys and values they share, stay standard attention
-layers for now (see HybridGemma4TextConfig).
+(config.base_layer_types), so a hybrid layer that replaces a full attention layer gets its larger heads. The last
+layers of Gemma 4 E2B and E4B reuse the keys and values of an earlier layer of their kind, their source. A hybrid
+layer that replaces one of these sharing layers has key and value projections of its own, while an SWA layer there
+keeps reading the shared keys and values. A hybrid layer that replaces a source keeps the source's key and value
+projections, to compute the keys and values that later attention layers still read (Gemma4SourceKeysAndValues).
 """
 
 import copy
@@ -418,6 +420,55 @@ class Gemma4SWAttention(Gemma4TextAttention):
         return attn_output, attn_weights, None
 
 
+class Gemma4SourceKeysAndValues(nn.Module):
+    """
+    The key and value projections of a source layer, whose keys and values later layers of its kind reuse, for a
+    hybrid layer that replaces the source (see HybridGemma4TextConfig.keeps_source_keys_and_values). It computes the
+    keys and values from the layer's normalized input as the source's attention does, caches them under the layer's
+    index, and stores them for the later layers, while the hybrid layer's sequence mixer computes its output.
+    """
+
+    def __init__(self, config: HybridGemma4TextConfig, layer_idx: int):
+        super().__init__()
+        self.layer_type = config.base_layer_types[layer_idx]
+        self.layer_idx = layer_idx
+        layer_config = config.per_layer_config[layer_idx]
+        self.head_dim = layer_config.head_dim
+        self.k_norm = Gemma4RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
+        self.v_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
+        self.k_proj = nn.Linear(
+            config.hidden_size, layer_config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        use_alternative_attention = config.attention_k_eq_v and self.layer_type != "sliding_attention"
+        self.v_proj = (
+            None
+            if use_alternative_attention
+            else nn.Linear(
+                config.hidden_size, layer_config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            )
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        past_key_values: Cache | None = None,
+    ) -> None:
+        hidden_shape = (*hidden_states.shape[:-1], -1, self.head_dim)
+        cos, sin = position_embeddings
+        key_states = self.k_proj(hidden_states).view(hidden_shape)
+        value_states = self.v_proj(hidden_states).view(hidden_shape) if self.v_proj is not None else key_states
+
+        key_states = self.k_norm(key_states)
+        key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
+        value_states = self.v_norm(value_states).transpose(1, 2)
+
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+        shared_kv_states[self.layer_type] = key_states, value_states
+
+
 class Gemma4DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: HybridGemma4TextConfig, layer_idx: int):
         super().__init__()
@@ -506,6 +557,9 @@ class Gemma4HybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
         - `seq_mixer` property: Return the initialized sequence mixer instance
     """
 
+    # Whether the sequence mixer takes the shared keys and values (SWA, which is Gemma 4's attention with a window)
+    reads_shared_kv = False
+
     def __init__(self, config: HybridGemma4TextConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -530,6 +584,12 @@ class Gemma4HybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
 
         # All Hybrid decoder layer subclasses must implement this
         self._init_seq_mixer(config, layer_idx)
+
+        # At a source whose keys and values later attention layers still read, the source's key and value
+        # projections stay to compute them
+        self.source_kv = (
+            Gemma4SourceKeysAndValues(config, layer_idx) if config.keeps_source_keys_and_values(layer_idx) else None
+        )
 
     @property
     @abstractmethod
@@ -563,7 +623,7 @@ class Gemma4HybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
             per_layer_input (`torch.FloatTensor`, *optional*): this layer's slice of the per-layer embeddings, of
                 shape `(batch, seq_len, hidden_size_per_layer_input)`
             shared_kv_states (`dict`, *optional*): the keys and values that the attention layers share, which a
-                hybrid layer neither reads nor writes
+                hybrid layer writes only when it replaces a source (see Gemma4SourceKeysAndValues)
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*): the cosine and sine
                 positional embeddings of the base model's attention kind at this layer
             attention_mask (`torch.FloatTensor`, *optional*): the full attention mask, whose padding the sequence
@@ -580,8 +640,13 @@ class Gemma4HybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
+        if self.source_kv is not None:
+            self.source_kv(hidden_states, position_embeddings, shared_kv_states, past_key_values)
 
-        # Sequence mixing (Mamba2, B'MOJO, GDN, etc.)
+        # Sequence mixing (Mamba2, B'MOJO, GDN, etc.). SWA reads or writes the shared keys and values as Gemma 4's
+        # attention does at its layer, while the other mixers neither read nor write them.
+        if self.reads_shared_kv:
+            kwargs["shared_kv_states"] = shared_kv_states
         hidden_states, _, _ = self.seq_mixer(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -669,6 +734,8 @@ class Gemma4GKADecoderLayer(Gemma4HybridDecoderLayerBase):
 
 class Gemma4SWADecoderLayer(Gemma4HybridDecoderLayerBase):
     """Decoder layer with Sliding Window Attention (SWA) as the sequence mixer."""
+
+    reads_shared_kv = True
 
     def __init__(self, config: HybridGemma4TextConfig, layer_idx: int):
         super().__init__(config, layer_idx)
