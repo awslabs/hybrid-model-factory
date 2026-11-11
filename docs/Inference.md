@@ -242,6 +242,8 @@ All architectures run on the vLLM V1 engine with prefix caching and chunked pref
 | `HybridQwen3ForCausalLM` | Qwen-3 | Dense |
 | `HybridQwen3MoeForCausalLM` | Qwen-3 MoE | Sparse MoE with expert parallelism |
 
+Hybrid Gemma 4 (`HybridGemma4ForCausalLM`) is not registered with the plugin yet, so it runs with [HuggingFace Transformers](#huggingface-transformers-inference) only.
+
 ### Supported Layer Types
 
 Each model can use an arbitrary per-layer mix of the following layer types, configured via the `hybrid_override_pattern` in the model's `config.json`:
@@ -461,6 +463,8 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ```
 
 Requires the training package to be installed (`cd training && pip install -e .`).
+
+Hybrid Gemma 4 loads the same way, with `attn_implementation="sdpa"` or `attn_implementation="flash_attention_2"`. Under flash attention 2, its sliding window layers run flash attention 2, and its full attention layers, whose heads of 512 flash attention 2 does not support, run SDPA. Code that applies the language model head itself must also apply Gemma 4's final logit softcapping (`config.final_logit_softcapping`), as the model's forward does.
 
 ---
 

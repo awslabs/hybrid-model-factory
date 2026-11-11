@@ -232,6 +232,14 @@ hmf train-multinode examples/priming/stage2/hqwen3_8b_gka_long_ctx.yaml 10.0.0.1
 hmf train-multinode examples/priming/stage2/hqwen3_8b_gka_long_ctx.yaml 10.0.0.1 4 3
 ```
 
+### Hybrid Gemma 4
+
+Hybrid Gemma 4 models train as the other families do, with three differences:
+
+- **Attention kernel.** With `flash_attn: fa2`, the sliding window layers, whose heads have 256 dimensions, run flash attention 2, and the full attention layers, whose heads of 512 are beyond flash attention's limit of 256, run SDPA. This trains a GKA-primed E2B 2.2 times faster than SDPA throughout at 32K tokens. Without `fa2`, every layer runs SDPA.
+- **Gradient checkpointing.** Gemma 4's later layers reuse the keys and values of an earlier layer, and reentrant checkpointing, HMF's default, drops the gradients that flow through them. HMF therefore sets `use_reentrant_gc: false` for these models with a warning, which setting it yourself avoids, and stops with an error if `use_unsloth_gc` is true.
+- **Chat template.** Use `template: gemma4` for SFT, on the base models as well as the instruction-tuned ones (such as gemma-4-E4B-it). It matches their own chat template for text and thinking, but it doesn't support tool calls yet. For pretraining and Stage 1, use `template: empty`; HMF adds Gemma 4's `<bos>` token to each packed block itself.
+
 ---
 
 ## Post-Training Checkpoint Configuration
