@@ -9,6 +9,7 @@ tests/decision/data/test_decision_label.py.
 import json
 import math
 import os
+import random
 from types import SimpleNamespace
 
 import numpy as np
@@ -135,6 +136,268 @@ def test_sampler_without_shuffle():
     sampler = DecisionAugmentationSampler([0, 1] * 5, batch_size=2, seed=0, shuffle=False)
     sampler.set_epoch(1)
     assert list(sampler) == [1, 3, 5, 7, 9]  # augmentation 1, in dataset order
+
+
+def _order_before_steps(sampler):
+    """The order of grouping by length before steps were taken into account, which shuffled single batches."""
+    rng = random.Random(sampler.seed * 1_000_003 + sampler.epoch)
+    rows = list(sampler._epoch_rows())
+    rng.shuffle(rows)
+    group_size = sampler.batch_size * sampler.sort_window
+    batches = []
+    for start in range(0, len(rows), group_size):
+        group = sorted(rows[start : start + group_size], key=lambda i: -sampler.lengths[i])
+        batches += [group[i : i + sampler.batch_size] for i in range(0, len(group), sampler.batch_size)]
+    last = batches.pop() if len(batches[-1]) < sampler.batch_size else None
+    longest = max(range(len(batches)), key=lambda b: sampler.lengths[batches[b][0]]) if batches else None
+    first = [batches.pop(longest)] if longest is not None else []
+    rng.shuffle(batches)
+    order = first + batches + ([last] if last is not None else [])
+    return [i for batch in order for i in batch]
+
+
+def _steps(order, batch_size, data_parallel_size):
+    """The rows of each training step, as the devices take consecutive batches of the order in turn."""
+    batches = [order[i : i + batch_size] for i in range(0, len(order), batch_size)]
+    return [batches[i : i + data_parallel_size] for i in range(0, len(batches), data_parallel_size)]
+
+
+def _waiting(order, lengths, batch_size, data_parallel_size):
+    """The rows' worth of time spent per epoch, as each step lasts as long as its longest row."""
+    steps = _steps(order, batch_size, data_parallel_size)
+    return sum(max(lengths[i] for batch in step for i in batch) for step in steps)
+
+
+def _sampler(num_rows, batch_size, data_parallel_size, sort_window, seed=0, num_augmentations=1):
+    lengths = np.random.default_rng(seed).integers(10, 4000, size=num_rows * num_augmentations).tolist()
+    augmentations = [a for _ in range(num_rows) for a in range(num_augmentations)]
+    sampler = DecisionAugmentationSampler(augmentations, batch_size=batch_size, seed=seed, lengths=lengths,
+                                          sort_window=sort_window, data_parallel_size=data_parallel_size)
+    return sampler, lengths
+
+
+SAMPLER_GRID = [
+    # (rows, batch size, data parallel size, sort window): even and uneven row counts, a data parallel size that
+    # does and does not divide the sort window, one above it, and more devices than batches
+    (240, 4, 8, 50), (241, 4, 8, 50), (1000, 8, 8, 10), (997, 4, 3, 10), (500, 2, 16, 5), (77, 4, 2, 3),
+    (30, 4, 16, 50), (5, 4, 8, 50), (3, 4, 2, 50), (1, 1, 1, 1),
+]
+
+
+@pytest.mark.parametrize("num_rows, batch_size, data_parallel_size, sort_window", SAMPLER_GRID)
+def test_sampler_in_steps_serves_every_row_of_each_epoch_once(num_rows, batch_size, data_parallel_size, sort_window):
+    sampler, _ = _sampler(num_rows, batch_size, data_parallel_size, sort_window, num_augmentations=2)
+    for epoch in range(4):
+        sampler.set_epoch(epoch)
+        order = list(sampler)
+        assert len(order) == len(sampler) == num_rows
+        assert sorted(order) == list(range(epoch % 2, 2 * num_rows, 2))
+
+
+@pytest.mark.parametrize("seed", range(5))
+@pytest.mark.parametrize("num_rows, batch_size, sort_window", [(240, 4, 50), (241, 4, 7), (77, 2, 3), (3, 4, 50)])
+def test_sampler_with_one_device_keeps_the_order_of_shuffling_single_batches(seed, num_rows, batch_size, sort_window):
+    sampler, _ = _sampler(num_rows, batch_size, 1, sort_window, seed=seed, num_augmentations=2)
+    for epoch in range(3):
+        sampler.set_epoch(epoch)
+        assert list(sampler) == _order_before_steps(sampler)
+
+
+@pytest.mark.parametrize("num_rows, batch_size, data_parallel_size, sort_window", SAMPLER_GRID)
+def test_sampler_gives_each_step_consecutive_batches_of_one_sorted_group(num_rows, batch_size, data_parallel_size,
+                                                                        sort_window):
+    sampler, lengths = _sampler(num_rows, batch_size, data_parallel_size, sort_window)
+    steps = _steps(list(sampler), batch_size, data_parallel_size)
+    for step in steps:
+        rows = [i for batch in step for i in batch]
+        full = len(step) == data_parallel_size and all(len(batch) == batch_size for batch in step)
+        if full:
+            # The batches of a full step are consecutive in their group's order, from the longest row
+            assert all(lengths[rows[k]] >= lengths[rows[k + 1]] for k in range(len(rows) - 1))
+    # Every step but the last is full
+    assert all(len(step) == data_parallel_size and all(len(b) == batch_size for b in step) for step in steps[:-1])
+
+
+# A step lasts as long as its longest row, which is its block's first, so with several blocks per sorted group,
+# steps wait less than steps of batches from different groups. With 1 device the two orders are the same, and with
+# few devices today's steps are short already, so only a strict improvement is checked in general.
+@pytest.mark.parametrize("seed", range(5))
+@pytest.mark.parametrize("batch_size, data_parallel_size, sort_window",
+                         [(4, 8, 50), (8, 2, 10), (4, 3, 10), (2, 4, 50), (4, 16, 64), (1, 32, 128)])
+def test_sampler_in_steps_waits_less_than_shuffling_single_batches(seed, batch_size, data_parallel_size, sort_window):
+    assert -(-sort_window // data_parallel_size) >= 4  # several blocks per group
+    sampler, lengths = _sampler(2000, batch_size, data_parallel_size, sort_window, seed=seed)
+    in_steps = _waiting(list(sampler), lengths, batch_size, data_parallel_size)
+    single_batches = _waiting(_order_before_steps(sampler), lengths, batch_size, data_parallel_size)
+    assert in_steps < single_batches
+
+
+# For 8 devices and the default sort window, a group holds 7 blocks. With lengths drawn uniformly, a step's longest
+# row is then on average about (7 + 1) / (2 * 7) = 0.57 of its group's longest, while a step of 8 batches from
+# different groups nearly always holds a row close to it, so waiting should drop to about 0.6, below the bound of 0.8.
+@pytest.mark.parametrize("seed", range(5))
+def test_sampler_in_steps_waits_much_less_with_8_devices_and_the_default_window(seed):
+    sampler, lengths = _sampler(2000, 4, 8, 50, seed=seed)
+    in_steps = _waiting(list(sampler), lengths, 4, 8)
+    single_batches = _waiting(_order_before_steps(sampler), lengths, 4, 8)
+    assert in_steps < 0.8 * single_batches
+
+
+@pytest.mark.parametrize("num_rows, batch_size, data_parallel_size, sort_window", SAMPLER_GRID)
+def test_sampler_puts_the_longest_row_of_the_full_steps_first(num_rows, batch_size, data_parallel_size, sort_window):
+    sampler, lengths = _sampler(num_rows, batch_size, data_parallel_size, sort_window)
+    steps = _steps(list(sampler), batch_size, data_parallel_size)
+    full = [step for step in steps if len(step) == data_parallel_size and all(len(b) == batch_size for b in step)]
+    if full:
+        assert steps[0] == full[0]
+        assert max(lengths[i] for b in full[0] for i in b) == max(lengths[i] for s in full for b in s for i in b)
+
+
+def test_sampler_in_steps_shuffles_its_steps_across_epochs_and_seeds():
+    sampler, _ = _sampler(2000, 4, 8, 50, num_augmentations=2)
+    orders = []
+    for epoch in range(4):
+        sampler.set_epoch(epoch)
+        orders.append(list(sampler))
+    assert orders[0] != orders[2]  # the same augmentation, reshuffled
+    sampler.set_epoch(2)
+    assert list(sampler) == orders[2]  # reproducible
+    other, _ = _sampler(2000, 4, 8, 50, num_augmentations=2)
+    other.seed = 1
+    assert list(other) != orders[0]
+
+
+def test_sampler_keeps_the_partial_block_and_the_short_last_batch_last():
+    # 241 rows in batches of 4 on 8 devices: a first group of 56 batches (7 blocks), and a last group of 17 rows,
+    # that is, 4 batches (a partial block) and a short batch of 1
+    sampler, _ = _sampler(241, 4, 8, 50)
+    order = list(sampler)
+    batches = [order[i : i + 4] for i in range(0, len(order), 4)]
+    assert [len(b) for b in batches] == [4] * 60 + [1]
+    rows = list(range(241))
+    random.Random(sampler.seed * 1_000_003 + sampler.epoch).shuffle(rows)  # the sampler's own shuffle
+    last_group = set(rows[224:])
+    assert {i for batch in batches[-5:] for i in batch} == last_group
+
+
+def test_sampler_without_lengths_ignores_the_data_parallel_size():
+    one = DecisionAugmentationSampler([0] * 50, batch_size=4, seed=3)
+    eight = DecisionAugmentationSampler([0] * 50, batch_size=4, seed=3, data_parallel_size=8)
+    assert list(one) == list(eight)
+
+
+def test_sampler_rejects_a_data_parallel_size_below_one():
+    with pytest.raises(ValueError, match="data_parallel_size"):
+        DecisionAugmentationSampler([0, 0], batch_size=1, seed=0, data_parallel_size=0)
+
+
+@pytest.mark.parametrize("sort_window", [1, 50])
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("num_rows", [1, 5, 63, 64, 1001])
+@pytest.mark.parametrize("sp_size", [1, 2])
+@pytest.mark.parametrize("data_parallel_size", [1, 2, 3, 4, 7, 8, 16, 32, 64])
+def test_sampler_serves_every_row_and_its_length_for_any_number_of_devices(data_parallel_size, sp_size, num_rows,
+                                                                           batch_size, sort_window):
+    lengths = np.random.default_rng(num_rows).integers(10, 4000, size=num_rows).tolist()
+    sampler = DecisionAugmentationSampler([0] * num_rows, batch_size=batch_size, seed=0, lengths=lengths,
+                                          sort_window=sort_window, repeat=sp_size,
+                                          data_parallel_size=data_parallel_size)
+    order = sampler._order()
+    assert sorted(order) == list(range(num_rows))
+    served = list(sampler)
+    assert len(served) == len(sampler)
+    assert set(served) == set(range(num_rows))
+    # Under sequence parallelism, each batch comes sp_size times in a row, one copy per rank of the group
+    batches = [served[i : i + batch_size] for i in range(0, len(served), batch_size)]
+    for start in range(0, len(batches), sp_size):
+        assert batches[start : start + sp_size] == [batches[start]] * sp_size
+
+
+@pytest.mark.parametrize("num_rows", [1, 5, 63, 1001])
+@pytest.mark.parametrize("sp_size, data_parallel_size", [(1, 1), (1, 3), (1, 8), (2, 4), (1, 16), (4, 4), (1, 64)])
+def test_every_rank_gets_whole_batches_and_all_rows_are_trained(sp_size, data_parallel_size, num_rows):
+    batch_size = 4
+    lengths = np.random.default_rng(num_rows).integers(10, 4000, size=num_rows).tolist()
+    sampler = DecisionAugmentationSampler([0] * num_rows, batch_size=batch_size, seed=0, lengths=lengths,
+                                          repeat=sp_size, data_parallel_size=data_parallel_size)
+    num_processes = sp_size * data_parallel_size
+    by_rank = _batches_by_rank(sampler, batch_size, num_processes)
+    # accelerate gives every rank the same number of whole batches, so no rank waits at a step that the others
+    # skip. With one rank nothing waits, and the last batch can be short
+    assert len({len(batches) for batches in by_rank}) == 1
+    whole = [batch for batches in by_rank for batch in (batches if num_processes > 1 else batches[:-1])]
+    assert all(len(batch) == batch_size for batch in whole)
+    assert {i for batches in by_rank for batch in batches for i in batch} == set(range(num_rows))
+
+
+def _batches_by_rank(sampler, batch_size, num_processes):
+    """The batches of each rank, as HF's Trainer builds the training data loader and accelerate shards it."""
+    from accelerate.data_loader import prepare_data_loader
+    from torch.utils.data import DataLoader
+
+    dataset = list(range(len(sampler.lengths) if sampler.lengths is not None else len(sampler)))
+    by_rank = []
+    for rank in range(num_processes):
+        loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+        sharded = prepare_data_loader(loader, num_processes=num_processes, process_index=rank, put_on_device=False)
+        by_rank.append([batch.tolist() for batch in sharded])
+    return by_rank
+
+
+@pytest.mark.parametrize("batch_size, data_parallel_size, sort_window", [(4, 8, 50), (4, 3, 10), (2, 4, 5)])
+def test_accelerate_gives_the_devices_of_a_step_the_batches_of_one_block(batch_size, data_parallel_size, sort_window):
+    sampler, lengths = _sampler(400, batch_size, data_parallel_size, sort_window)
+    expected = _steps(list(sampler), batch_size, data_parallel_size)
+    by_rank = _batches_by_rank(sampler, batch_size, data_parallel_size)
+    full = [s for s in expected if len(s) == data_parallel_size and all(len(b) == batch_size for b in s)]
+    for number, step in enumerate(full):
+        assert [by_rank[rank][number] for rank in range(data_parallel_size)] == step
+
+
+@pytest.mark.parametrize("sp_size, data_parallel_size", [(2, 2), (2, 4), (4, 2)])
+def test_sequence_parallel_ranks_share_a_batch_and_a_step_trains_one_block(sp_size, data_parallel_size):
+    batch_size = 2
+    lengths = np.random.default_rng(0).integers(10, 4000, size=200).tolist()
+    sampler = DecisionAugmentationSampler([0] * 200, batch_size=batch_size, seed=0, lengths=lengths, sort_window=6,
+                                          repeat=sp_size, data_parallel_size=data_parallel_size)
+    blocks = _steps(sampler._order(), batch_size, data_parallel_size)
+    by_rank = _batches_by_rank(sampler, batch_size, sp_size * data_parallel_size)
+    full = [s for s in blocks if len(s) == data_parallel_size and all(len(b) == batch_size for b in s)]
+    for number, block in enumerate(full):
+        batches = [by_rank[rank][number] for rank in range(sp_size * data_parallel_size)]
+        # Ranks 0 to sp_size - 1 form the first sequence parallel group, and so on
+        groups = [batches[g * sp_size : (g + 1) * sp_size] for g in range(data_parallel_size)]
+        assert all(group == [group[0]] * sp_size for group in groups)
+        assert [group[0] for group in groups] == block
+
+
+@pytest.mark.parametrize("gradient_accumulation_steps", [1, 2, 4])
+def test_each_micro_step_of_gradient_accumulation_trains_one_block(gradient_accumulation_steps):
+    # The data loader serves micro-batches in order whatever gradient_accumulation_steps is, so each micro-step's
+    # batches are one block of data_parallel_size batches
+    batch_size, data_parallel_size = 4, 4
+    sampler, _ = _sampler(400, batch_size, data_parallel_size, 10)
+    blocks = _steps(list(sampler), batch_size, data_parallel_size)
+    by_rank = _batches_by_rank(sampler, batch_size, data_parallel_size)
+    micro_steps = list(zip(*by_rank))
+    for step in range(len(micro_steps) // gradient_accumulation_steps):
+        for micro in range(gradient_accumulation_steps):
+            number = step * gradient_accumulation_steps + micro
+            if len(blocks[number]) == data_parallel_size and all(len(b) == batch_size for b in blocks[number]):
+                assert list(micro_steps[number]) == blocks[number]
+
+
+@pytest.mark.parametrize("world_size, sp_size, expected", [(1, 1, 1), (8, 1, 8), (8, 2, 4), (8, 8, 1), (16, 4, 4)])
+def test_trainer_gives_the_sampler_the_data_parallel_size(world_size, sp_size, expected):
+    trainer = SimpleNamespace(
+        train_dataset={"augmentation": [0] * 8, "input_ids": [[1, 2]] * 8},
+        args=SimpleNamespace(train_sampling_strategy="random", per_device_train_batch_size=2, data_seed=None, seed=0,
+                             world_size=world_size),
+        finetuning_args=SimpleNamespace(disable_shuffling=False),
+        _sequence_parallel_size=lambda: sp_size,
+    )
+    sampler = DecisionTrainer._get_train_sampler(trainer)
+    assert sampler.data_parallel_size == expected and sampler.repeat == sp_size
 
 
 # Loss

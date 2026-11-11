@@ -223,10 +223,18 @@ class DecisionAugmentationSampler(Sampler[int]):
 
     With lengths, rows of similar length are batched together, to reduce padding. The shuffled rows
     are taken in groups of sort_window batches' worth; each group is sorted by length and cut into
-    batches, and all the batches are then shuffled. Sorting within groups, rather than over all
-    rows, keeps batches random across training. The batch with the longest row goes first, so one
-    that does not fit in memory fails at the first step. Each epoch still sees every row of its
-    augmentation once.
+    batches. Sorting within groups, rather than over all rows, keeps batches random across training.
+
+    A training step gives one batch to each of the data_parallel_size devices, which take consecutive
+    batches. So the batches are shuffled in blocks of data_parallel_size consecutive batches of a
+    group, and the batches of a step have similar lengths, so that no device waits for a much longer
+    batch on another. Groups hold a whole number of blocks, so only the last group can end with a
+    partial block, which goes last with the short last batch. The gain needs several blocks per
+    group, that is, a sort_window several times data_parallel_size (with the default and 8 devices, a
+    group holds 7 blocks).
+
+    The block with the longest row goes first, so one that does not fit in memory fails at the first
+    step. Each epoch still sees every row of its augmentation once.
 
     Args:
         augmentations: The augmentation of each row of the dataset.
@@ -236,10 +244,13 @@ class DecisionAugmentationSampler(Sampler[int]):
         lengths: The length of each row, to group rows of similar length. Defaults to None (no
             grouping).
         sort_window: The number of batches whose rows are sorted by length together, when grouping
-            by length. Defaults to 50.
+            by length, rounded up to a multiple of data_parallel_size. Defaults to 50.
         shuffle: Whether to shuffle the rows of each augmentation. Defaults to True.
         repeat: The number of times each batch is served, which is the sequence parallel size (see
             repeat_batches). Defaults to 1.
+        data_parallel_size: The number of different batches that one training step trains, one per
+            device, which is the number of devices divided by the sequence parallel size (the ranks of
+            a sequence parallel group share their batch). Defaults to 1.
     """
 
     def __init__(
@@ -251,7 +262,10 @@ class DecisionAugmentationSampler(Sampler[int]):
         sort_window: int = 50,
         shuffle: bool = True,
         repeat: int = 1,
+        data_parallel_size: int = 1,
     ):
+        if data_parallel_size < 1:
+            raise ValueError(f"data_parallel_size must be at least 1, got {data_parallel_size}.")
         self.rows: Dict[int, List[int]] = {}
         for index, augmentation in enumerate(augmentations):
             self.rows.setdefault(augmentation, []).append(index)
@@ -265,6 +279,7 @@ class DecisionAugmentationSampler(Sampler[int]):
         self.sort_window = sort_window
         self.shuffle = shuffle
         self.repeat = repeat
+        self.data_parallel_size = data_parallel_size
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -282,7 +297,8 @@ class DecisionAugmentationSampler(Sampler[int]):
         if self.lengths is None or not rows:
             return rows
 
-        group_size = self.batch_size * self.sort_window
+        step = self.data_parallel_size
+        group_size = self.batch_size * -(-self.sort_window // step) * step
         batches = []
         for start in range(0, len(rows), group_size):
             group = sorted(rows[start : start + group_size], key=lambda i: -self.lengths[i])
@@ -291,10 +307,16 @@ class DecisionAugmentationSampler(Sampler[int]):
         # Only the last batch can be short; keep it last so every other batch stays aligned with
         # the devices' batch boundaries
         last = batches.pop() if len(batches[-1]) < self.batch_size else None
-        longest = max(range(len(batches)), key=lambda b: self.lengths[batches[b][0]]) if batches else None
-        first = [batches.pop(longest)] if longest is not None else []
-        rng.shuffle(batches)
-        order = first + batches + ([last] if last is not None else [])
+        # Every group but the last holds a whole number of blocks, so cutting all the batches into
+        # blocks keeps each block within one group, and only the last block can be partial
+        blocks = [batches[i : i + step] for i in range(0, len(batches), step)]
+        partial = blocks.pop() if blocks and len(blocks[-1]) < step else []
+        # A block's first batch holds its longest row, as each group is sorted from the longest row
+        longest = max(range(len(blocks)), key=lambda b: self.lengths[blocks[b][0][0]]) if blocks else None
+        first = [blocks.pop(longest)] if longest is not None else []
+        rng.shuffle(blocks)
+        order = [batch for block in first + blocks for batch in block] + partial
+        order += [last] if last is not None else []
         return [i for batch in order for i in batch]
 
     def __iter__(self):
@@ -439,6 +461,7 @@ class DecisionTrainer(SaveShardMixin, Trainer):
             lengths=row_lengths(dataset) if strategy == "group_by_length" and not sequential else None,
             shuffle=not sequential,
             repeat=self._sequence_parallel_size(),
+            data_parallel_size=max(1, self.args.world_size // self._sequence_parallel_size()),
         )
 
     @override
