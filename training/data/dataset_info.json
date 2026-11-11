@@ -715,5 +715,37 @@
   "strands_adequacy_gen_eval": {
     "file_name": "strands-decider/adequacy_gen_eval.jsonl",
     "formatting": "decision"
+  },
+  "strands_generated_v16p": {
+    "file_name": "strands-decider/generated_v16p.jsonl",
+    "formatting": "decision"
+  },
+  "strands_generated_v18p": {
+    "file_name": "strands-decider/generated_v18p.jsonl",
+    "formatting": "decision"
+  },
+  "strands_catchall_v20": {
+    "file_name": "strands-decider/catchall_v20.jsonl",
+    "formatting": "decision"
+  },
+  "strands_flips_v20": {
+    "file_name": "strands-decider/flips_v20.jsonl",
+    "formatting": "decision"
+  },
+  "strands_catchall_v20_eval": {
+    "file_name": "strands-decider/catchall_v20_eval.jsonl",
+    "formatting": "decision"
+  },
+  "strands_flips_v20_eval": {
+    "file_name": "strands-decider/flips_v20_eval.jsonl",
+    "formatting": "decision"
+  },
+  "strands_para_pairs_v16_eval": {
+    "file_name": "strands-decider/para_pairs_v16_eval.jsonl",
+    "formatting": "decision"
+  },
+  "strands_para_pairs_v18_eval": {
+    "file_name": "strands-decider/para_pairs_v18_eval.jsonl",
+    "formatting": "decision"
   }
 }

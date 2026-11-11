@@ -1,7 +1,8 @@
 """
 Tests for calibrating and evaluating a trained decision model end to end (hmf/eval/decision/), with a
 tiny decision model and a LoRA adapter, on the CPU: where the calibration is saved, that the
-predictor applies it, and the evaluation report. The model and the data are conftest.py's.
+predictor applies it, the evaluation report, and the evaluation of a pair file. The model and the data are
+conftest.py's.
 """
 
 import json
@@ -167,3 +168,49 @@ def test_bad_gate_settings_fail_before_the_model_runs(trained):
     with pytest.raises(ValueError, match="Unknown gate rule"):
         calibrate(trained["model_dir"], trained["data"], trained["adapter_dir"], gate={"rule": "x", "target": 1},
                   predictor=Unused())
+
+
+def _pair_file(trained, path):
+    """
+    A pair file of 11 pairs, whose sixth pair has a second row too long for a max_len of 200. Leaving out
+    single rows instead of whole pairs would pair the rows after it wrongly.
+    """
+    rows = [trained["row"](i) for i in range(22)]
+    rows[11] = {**rows[11], "state": "state " * 300}
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    return rows
+
+
+def test_pair_file_leaves_out_a_pair_with_a_long_row_and_scores_the_others_as_pairs(trained, tmp_path):
+    rows = _pair_file(trained, tmp_path / "pairs.jsonl")
+    predictor = _predictor(trained, max_len=200)
+
+    report = evaluate(trained["model_dir"], str(tmp_path / "pairs.jsonl"), trained["adapter_dir"], raw=True,
+                      pairs=True, predictor=predictor)
+
+    assert report["split"] == "all" and report["limit"] == 0  # the defaults for a pair file
+    assert report["num_rows"] == 22 and report["num_skipped"] == 2 and report["overall"]["n"] == 20
+    # The pair metrics, computed from the model's answers to the ten whole pairs
+    kept = rows[:10] + rows[12:]
+    answers = [max(range(len(p)), key=p.__getitem__) for p in predictor.probabilities(kept, calibrated=False)]
+    first, second = list(zip(kept[0::2], answers[0::2])), list(zip(kept[1::2], answers[1::2]))
+    assert report["pairs"] == pytest.approx({
+        "pairs": 10,
+        "acc_first": sum(a == row["label"] for row, a in first) / 10,
+        "acc_second": sum(a == row["label"] for row, a in second) / 10,
+        "same_answer": sum(a == b for (_, a), (_, b) in zip(first, second)) / 10,
+        "both_right": sum(a == r["label"] and b == q["label"] for (r, a), (q, b) in zip(first, second)) / 10,
+        "num_pairs_skipped": 1,
+    })
+
+
+def test_pair_file_refuses_a_split_a_limit_and_an_odd_number_of_rows(trained, tmp_path):
+    _pair_file(trained, tmp_path / "pairs.jsonl")
+    for options in ({"split": "test"}, {"limit": 100}):
+        with pytest.raises(ValueError, match="scored whole"):
+            evaluate(trained["model_dir"], str(tmp_path / "pairs.jsonl"), trained["adapter_dir"], pairs=True,
+                     **options)
+    odd = tmp_path / "odd.jsonl"
+    odd.write_text("".join(json.dumps(trained["row"](i)) + "\n" for i in range(3)))
+    with pytest.raises(ValueError, match="odd number of rows"):
+        evaluate(trained["model_dir"], str(odd), trained["adapter_dir"], pairs=True)

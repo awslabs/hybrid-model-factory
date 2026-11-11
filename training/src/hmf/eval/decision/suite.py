@@ -14,7 +14,8 @@ Values on the command line (key=value, e.g. jevbench.max_len=3072) override the 
     calibration: {dataset or data, split, limit, method, gate}: fitted first, and used by everything after;
         gate, optional, holds the gate settings (rule, target, params, take_options, min_count,
         use_weights; see gate.py), and the benchmarks then report what the gate takes
-    benchmarks: [{name, dataset or data, split, limit}, ...]: each evaluated in turn
+    benchmarks: [{name, dataset or data, split, limit, pairs}, ...]: each evaluated in turn; pairs: true for a
+        pair file (see evaluate.py), which is scored whole
     jevbench: {dir, commit, max_len, port, compare: [{name, results, run}, ...]}: JevBench on a server the
         run starts and stops
 
@@ -217,6 +218,21 @@ def _summary_table(results: Dict[str, Any]) -> str:
                 f"{o['nll']:.3f} | {tasks} |"
             )
         lines.append("")
+        paired = {name: report["pairs"] for name, report in results["benchmarks"].items() if report.get("pairs")}
+        if paired:
+            lines += [
+                "| benchmark | pairs | pairs left out | same answer | both right | accuracy of first / second |",
+                "| --- | --- | --- | --- | --- | --- |",
+            ]
+            for name, p in paired.items():
+                if not p["pairs"]:
+                    lines.append(f"| {name} | 0 | {p['num_pairs_skipped']} | - | - | - |")
+                    continue
+                lines.append(
+                    f"| {name} | {p['pairs']:,} | {p['num_pairs_skipped']} | {p['same_answer']:.3f} | "
+                    f"{p['both_right']:.3f} | {p['acc_first']:.3f} / {p['acc_second']:.3f} |"
+                )
+            lines.append("")
         gated = {name: report["gate"] for name, report in results["benchmarks"].items() if report.get("gate")}
         if gated:
             lines += ["| benchmark | taken by the gate | accuracy of the taken answers |", "| --- | --- | --- |"]
@@ -289,8 +305,8 @@ def run_suite(path: str, *overrides: str) -> Dict[str, Any]:
     results["benchmarks"] = {}
     for name, (section, data) in benchmarks.items():
         results["benchmarks"][name] = evaluate(
-            model, data, adapter, split=section.get("split", "test"), limit=section.get("limit", 4000), seed=seed,
-            out=os.path.join(output_dir, f"{name}.json"), predictor=predictor,
+            model, data, adapter, split=section.get("split"), limit=section.get("limit"), seed=seed,
+            out=os.path.join(output_dir, f"{name}.json"), predictor=predictor, pairs=section.get("pairs", False),
         )
     if jevbench:
         results["jevbench"] = run_jevbench(jevbench, predictor, output_dir)

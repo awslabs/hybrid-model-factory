@@ -31,9 +31,11 @@ Once Strands Decider's data is built and linked ([Before You Start](#before-you-
 
   ```bash
   git clone https://github.com/strands-labs/strands-decider path/to/strands-decider
-  (cd path/to/strands-decider && training/recipe.sh build fetch multistep generated adequacy)
+  (cd path/to/strands-decider && PYTHONPATH=src training/recipe.sh build fetch multistep generated adequacy catchall)
   ln -s path/to/strands-decider/data data/strands-decider
   ```
+
+  `PYTHONPATH=src` lets the build import Strands Decider's own package without installing it, since installing it into HMF's environment could replace the versions of torch and transformers that HMF needs.
 
   The files are registered in `data/dataset_info.json` under names starting with `strands_`.
 - **JevBench**, which [step 7](#7-run-jevbench) sets up.

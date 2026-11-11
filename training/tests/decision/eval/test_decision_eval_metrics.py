@@ -13,6 +13,7 @@ from hmf.eval.decision.metrics import (
     choice_confidence,
     confidence,
     format_summary,
+    pair_metrics,
     predictions,
     score_confidence,
     summarize,
@@ -125,3 +126,26 @@ def test_empty_groups_and_format():
     assert summarize([])["overall"] == {}
     text = format_summary(summary, title="toy")
     assert text.startswith("toy") and "by_kind" in text and "by_confidence_band" in text
+
+
+def test_pair_metrics_on_four_pairs_computed_by_hand():
+    def noul(label, p_true):
+        return Prediction("noul", "a", label, [1 - p_true, p_true])
+
+    preds = [
+        noul(1, 0.8), noul(1, 0.7),  # both right, the same answer
+        noul(0, 0.6), noul(1, 0.9),  # the first wrong, the same answer
+        noul(1, 0.9), noul(0, 0.2),  # both right, different answers, as in a flip pair
+        noul(1, 0.1), noul(0, 0.7),  # both wrong, different answers
+    ]
+    assert pair_metrics(preds) == {
+        "pairs": 4, "acc_first": 0.5, "acc_second": 0.75, "same_answer": 0.5, "both_right": 0.5,
+    }
+
+
+def test_pair_metrics_of_no_pairs_and_of_an_odd_number_of_answers():
+    assert pair_metrics([]) == {
+        "pairs": 0, "acc_first": None, "acc_second": None, "same_answer": None, "both_right": None,
+    }
+    with pytest.raises(ValueError, match="even number"):
+        pair_metrics([Prediction("noul", "a", 1, [0.2, 0.8])])
