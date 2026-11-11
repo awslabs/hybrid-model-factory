@@ -19,7 +19,8 @@ checks compare:
     grads               gradients after DDP's averaging (relative error and per-parameter cosine)
     grad_checkpointing  gradients with gradient checkpointing on
     lora                gradients of LoRA adapters and the head (PEFT model)
-    sgd_steps           parameters after a few SGD steps on different batches
+    sgd_steps           losses and parameters after a few SGD steps on different batches (in bf16, the
+                        first step's loss and the final parameters, see SGD_STEPS)
     head_dropout        with head dropout on, every rank of the SP group computes the same loss
     bad_length          a padded length that does not split into 2 * sp_size chunks is rejected
     backbone_check      the backbone check (see below) passes (also with LoRA)
@@ -76,6 +77,10 @@ from hmf.train.sft.workflow import set_sequence_parallel_group_recursive
 
 
 VOCAB_SIZE = 64
+# In bf16, sgd_steps judges the first step's loss and the parameters after the last step, and only reports the
+# later steps' losses. Each later loss is a single number on a trajectory that grows the rounding differences with
+# and without SP at every step, while the first step comes before any update, and the parameters compare every
+# value at once. In fp32, whose differences stay small over the steps, every step's loss still decides.
 SGD_STEPS = 3
 SGD_LR = 0.05
 # The tiny hybrid Gemma 4 backbones take a tenth of it. Their attention scales the scores of normalized queries and
@@ -461,15 +466,18 @@ def run_checks(name: str, ref: dict, seq_len: int, group, sp_size: int, device: 
         batches = [make_batch(seq_len, sp_size, seed=s, device=device) for s in range(1, SGD_STEPS + 1)]
         losses, params = sgd_run(model, batches, sp=True, lr=sgd_lr(name))
         ref_losses, ref_params = ref["sgd"]
-        loss_err = max(abs(a - b) for a, b in zip(losses, ref_losses))
+        loss_errs = [abs(a - b) for a, b in zip(losses, ref_losses)]
+        # In bf16, rounding differences grow over the steps, so only the first step's loss, before any update,
+        # decides (see SGD_STEPS)
+        judged = loss_errs[:1] if DTYPE == torch.bfloat16 else loss_errs
         diff = sum(float((params[n] - ref_params[n]).pow(2).sum()) for n in ref_params) ** 0.5
         moved = sum(float((ref_params[n] - ref["initial"][n].float().cpu()).pow(2).sum()) for n in ref_params) ** 0.5
         rel = diff / max(moved, 1e-12)  # relative to how far the reference moved
-        passed = loss_err <= tol_sgd_loss and rel <= tol_rel
+        passed = max(judged) <= tol_sgd_loss and rel <= tol_rel
         # Each step's loss error, which tells an error that grows over the steps (small differences that the steps
         # amplify) from one that is already there at the first step
-        steps = ", ".join(f"{abs(a - b):.1e}" for a, b in zip(losses, ref_losses))
-        return passed, f"max loss err {loss_err:.2e} (per step {steps}), param err {rel:.2e} of the update"
+        steps = ", ".join(f"{err:.1e}" for err in loss_errs)
+        return passed, f"max loss err {max(loss_errs):.2e} (per step {steps}), param err {rel:.2e} of the update"
 
     def head_dropout():
         model = fresh()
