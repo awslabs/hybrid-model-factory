@@ -39,10 +39,12 @@ Each question is rendered with the model's prompt format, its options in the ord
 them, and answered at the model's calibrated temperatures (see calibrate.py), or at temperature 1
 with --raw. The questions of a request are answered in one forward pass.
 
-A prompt longer than the window (--max_len) is shortened as Strands Decider's server shortens it,
-unless --strict_window is set. The question and its options keep all their tokens (up to 3/4 of the
-window), and the state is cut to fit, from its end. Without truncation, a prompt is tokenized exactly
-as in training.
+A prompt longer than the window (--max_len) is shortened, unless --strict_window is set. With the strands
+prompt format, it is shortened as Strands Decider's server shortens it: the question and its options keep all
+their tokens (up to 3/4 of the window), and the state is cut to fit, from its end. With the other formats, whose
+prompts do not start with the state alone (question_first, read_twice), the prompt is rendered again with the state
+cut from its end, at a token boundary, to the longest that fits, and the question and its options keep all their
+tokens. Without truncation, a prompt is tokenized exactly as in training.
 """
 
 import ipaddress
@@ -216,13 +218,14 @@ class DecisionServer:
             "device": self.predictor.device,
         }
 
-    def _render(self, row: Dict[str, Any]) -> Tuple[RenderedPrompt, str]:
+    def _render(self, row: Dict[str, Any]) -> Tuple[RenderedPrompt, Dict[str, Any]]:
+        """A question's prompt, and its row (state, instructions, kind, and options), for shortening it if needed."""
         flat = flatten_decision_row(row)
-        options = [tuple(option) for option in flat["options"] or []]
-        rendered = self.prompt.prompt_format.render(flat["state"], flat["instructions"], flat["kind"], options)
-        return rendered, flat["state"]
+        flat["options"] = [tuple(option) for option in flat["options"] or []]
+        rendered = self.prompt.prompt_format.render(flat["state"], flat["instructions"], flat["kind"], flat["options"])
+        return rendered, flat
 
-    def _encode(self, rendered: List[RenderedPrompt], states: List[str]) -> List[EncodedPrompt]:
+    def _encode(self, rendered: List[RenderedPrompt], rows: List[Dict[str, Any]]) -> List[EncodedPrompt]:
         """The questions' prompts as model inputs, shortened to the window if they do not fit."""
         encoded = [encode_decision_prompt(self.tokenizer, r, force_bos=self.prompt.force_bos) for r in rendered]
         if self.max_len is None or all(len(e.input_ids) <= self.max_len for e in encoded):
@@ -230,7 +233,35 @@ class DecisionServer:
         if self.strict_window:
             longest = max(len(e.input_ids) for e in encoded)
             raise WindowError(f"prompt of {longest} tokens exceeds the context window of {self.max_len} tokens")
-        return self._truncate(rendered, states)
+        if self.prompt.prompt_format.STATE_FIRST:
+            return self._truncate(rendered, [row["state"] for row in rows])
+        return [self._shorten_state(row) for row in rows]
+
+    def _shorten_state(self, row: Dict[str, Any]) -> EncodedPrompt:
+        """
+        The prompt of a row rendered with its state cut from its end, at a token boundary, to the longest state with
+        which the whole prompt fits the window. The question and its options are kept whole.
+        """
+        state = render_content(row["state"])
+        offsets = self.tokenizer(state, add_special_tokens=False, return_offsets_mapping=True)["offset_mapping"]
+
+        def encode(num_tokens: int) -> EncodedPrompt:
+            cut = state[: offsets[num_tokens - 1][1]] if num_tokens > 0 else ""
+            rendered = self.prompt.prompt_format.render(cut, row["instructions"], row["kind"], row["options"])
+            return encode_decision_prompt(self.tokenizer, rendered, force_bos=self.prompt.force_bos)
+
+        best = encode(0)
+        if len(best.input_ids) > self.max_len:
+            raise WindowError("the question and its options do not fit the context window")
+        low, high = 0, len(offsets)  # the longest state that fits has between low and high tokens
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = encode(middle)
+            if len(candidate.input_ids) <= self.max_len:
+                low, best = middle, candidate
+            else:
+                high = middle - 1
+        return best
 
     def _truncate(self, rendered: List[RenderedPrompt], states: List[str]) -> List[EncodedPrompt]:
         """
@@ -276,8 +307,8 @@ class DecisionServer:
         """The reply to a request."""
         names = list(request.questions)
         questions = [request.questions[name] for name in names]
-        rendered, states = zip(*(self._render(question_row(request.state, q)) for q in questions))
-        encoded = self._encode(list(rendered), list(states))
+        rendered, rows = zip(*(self._render(question_row(request.state, q)) for q in questions))
+        encoded = self._encode(list(rendered), list(rows))
 
         seq_len = max(len(e.input_ids) for e in encoded)
         num_options = max(len(e.opt_idx) for e in encoded)

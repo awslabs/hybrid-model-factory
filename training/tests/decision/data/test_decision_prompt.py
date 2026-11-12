@@ -14,6 +14,8 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from hmf.data.decision_prompt import (
     DECISION_PROMPT_FORMATS,
+    QuestionFirstPromptFormat,
+    ReadTwicePromptFormat,
     StrandsPromptFormat,
     adds_bos_token,
     encode_decision_prompt,
@@ -84,9 +86,60 @@ def test_strands_rejects_invalid_rows(kind, options, order):
         StrandsPromptFormat.render("s", "q", kind, options, option_order=order)
 
 
+ROWS = [
+    ("noul", [("false", "no"), ("true", "yes")], None),
+    ("choice", [("a", "first"), ("b", None), ("c", "third")], [2, 0, 1]),
+    ("score", [("0", "low"), ("1", "mid"), ("2", "high")], [2, 1, 0]),
+]
+
+
+@pytest.mark.parametrize("kind, options, order", ROWS)
+def test_question_first_puts_the_question_before_the_state(kind, options, order):
+    strands = StrandsPromptFormat.render("the state", "question", kind, options, option_order=order)
+    rendered = QuestionFirstPromptFormat.render("the state", "question", kind, options, option_order=order)
+    state_block = "<state>\nthe state\n</state>\n"
+
+    assert rendered.text.startswith('<question type="') and state_block in rendered.text
+    assert rendered.text.index("</question>") < rendered.text.index(state_block)
+    assert sorted(rendered.text) == sorted(strands.text)  # the same characters, rearranged
+    # The options' lines and the answer marker are those of the strands prompt
+    lines = [strands.text[a:b] for a, b in strands.option_spans]
+    assert [rendered.text[a:b] for a, b in rendered.option_spans] == lines
+    assert rendered.text[slice(*rendered.answer_span)] == StrandsPromptFormat.ANSWER_MARKER
+    assert rendered.answer_span[1] == len(rendered.text)
+
+
+@pytest.mark.parametrize("kind, options, order", ROWS)
+def test_read_twice_repeats_the_prompt_and_reads_the_second_copy(kind, options, order):
+    strands = StrandsPromptFormat.render("the state", "question", kind, options, option_order=order)
+    rendered = ReadTwicePromptFormat.render("the state", "question", kind, options, option_order=order)
+    body = strands.text[: -len(StrandsPromptFormat.ANSWER_MARKER)]
+
+    assert rendered.text == body + body + StrandsPromptFormat.ANSWER_MARKER
+    lines = [strands.text[a:b] for a, b in strands.option_spans]
+    assert [rendered.text[a:b] for a, b in rendered.option_spans] == lines
+    assert all(start >= len(body) for start, _ in rendered.option_spans)  # in the second copy
+    assert rendered.answer_span == (len(rendered.text) - len(StrandsPromptFormat.ANSWER_MARKER), len(rendered.text))
+
+
+@pytest.mark.parametrize("prompt_format", [QuestionFirstPromptFormat, ReadTwicePromptFormat])
+def test_question_first_and_read_twice_reject_invalid_rows(prompt_format):
+    with pytest.raises(ValueError):
+        prompt_format.render("s", "q", "choice", [("a", None), ("a", None)])
+    with pytest.raises(ValueError):
+        prompt_format.render("s", "q", "choice", [("a", None), ("b", None)], option_order=[0, 0])
+
+
+def test_only_strands_starts_with_the_state_alone():
+    assert StrandsPromptFormat.STATE_FIRST
+    assert not QuestionFirstPromptFormat.STATE_FIRST and not ReadTwicePromptFormat.STATE_FIRST
+
+
 def test_get_prompt_format():
     assert get_prompt_format("strands") is StrandsPromptFormat
-    assert set(DECISION_PROMPT_FORMATS) == {"strands"}
+    assert get_prompt_format("question_first") is QuestionFirstPromptFormat
+    assert get_prompt_format("read_twice") is ReadTwicePromptFormat
+    assert set(DECISION_PROMPT_FORMATS) == {"strands", "question_first", "read_twice"}
     with pytest.raises(ValueError, match="decision_prompt_format"):
         get_prompt_format("unknown")
 
@@ -116,6 +169,20 @@ def _rendered_examples():
         StrandsPromptFormat.render("The meeting moved to Thursday.", "It is on Tuesday.", "noul", []),
         StrandsPromptFormat.render({"ticket": 7}, "Rate it.", "score", [("0", "bad"), ("1", "fine"), ("2", "great")]),
     ]
+
+
+@pytest.mark.parametrize("prompt_format", [QuestionFirstPromptFormat, ReadTwicePromptFormat])
+def test_encode_reads_question_first_and_read_twice_at_their_options_and_answer(prompt_format):
+    tokenizer = _tiny_tokenizer()
+    options = [("refund", "return it"), ("ignore", None), ("escalate", None)]
+    rendered = prompt_format.render("The order was charged twice.", "What next?", "choice", options,
+                                    option_order=[1, 2, 0])
+    encoded = encode_decision_prompt(tokenizer, rendered)
+    assert encoded.answer_idx == len(encoded.input_ids) - 1
+    _assert_positions(tokenizer, rendered, encoded)
+    if prompt_format is ReadTwicePromptFormat:  # the positions read are those of the second copy
+        half = len(tokenizer(rendered.text[: rendered.text.index("<state>", 1)])["input_ids"])
+        assert min(encoded.opt_idx) >= half
 
 
 def test_encode_tiny_tokenizer():

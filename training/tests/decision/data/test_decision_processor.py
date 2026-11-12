@@ -10,7 +10,7 @@ import pytest
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
-from hmf.data.decision_prompt import StrandsPromptFormat, encode_decision_prompt
+from hmf.data.decision_prompt import StrandsPromptFormat, encode_decision_prompt, get_prompt_format
 from hmf.data.processor.decision import DecisionDatasetProcessor
 
 
@@ -134,13 +134,15 @@ def test_label_follows_its_option():
         assert row["option_order"][row["label"]] == source_row["_label"]
 
 
-def test_matches_direct_encoding():
+@pytest.mark.parametrize("prompt_format", ["strands", "question_first", "read_twice"])
+def test_matches_direct_encoding(prompt_format):
     # The output is exactly the prompt format's rendered prompt, encoded, under the recorded option order
     tokenizer = _tiny_tokenizer()
-    processor = _processor(tokenizer=tokenizer, decision_num_augmentations=5, decision_vary_instructions=False)
+    processor = _processor(tokenizer=tokenizer, decision_num_augmentations=5, decision_vary_instructions=False,
+                           decision_prompt_format=prompt_format)
     for row in _rows(processor.preprocess_dataset(_batch())):
         source_row = ROWS[row["row_index"]]
-        rendered = StrandsPromptFormat.render(
+        rendered = get_prompt_format(prompt_format).render(
             source_row["_state"], source_row["_instructions"], source_row["_kind"],
             source_row["_options"], option_order=row["option_order"],
         )

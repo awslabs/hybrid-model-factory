@@ -529,7 +529,7 @@ Tokenize decision data with `hmf preprocess` and `stage: decision` (see [example
 
 | argument | default | description |
 | --- | --- | --- |
-| `decision_prompt_format` | `strands` | The prompt format rows are rendered with. |
+| `decision_prompt_format` | `strands` | The prompt format rows are rendered with: `strands` (the state, then the question and its options, then the answer marker), `question_first` (the question and its options before the state, so that the state is read with the question in view, though the options' lines are then read without the state), or `read_twice` (the state and the question twice in a row, with the options read in the second copy, whose tokens see the whole first copy; the prompt is about twice as long). Evaluation and serving must use the format the model was trained with. |
 | `decision_num_augmentations` | 1 | Augmentations of each training row. An augmentation is one augmented copy of a row, rendered with its options in one order (shuffled for `noul` and `choice`, possibly reversed for `score`) and one phrasing of its question. Epoch e trains on augmentation e (modulo the number of augmentations). |
 | `decision_shuffle_options` | true | Shuffle the options of `noul` and `choice` rows. |
 | `decision_reverse_score_prob` | 0.5 | Probability of reversing a `score` row's rubric (and its label). `score` options are otherwise never shuffled. |

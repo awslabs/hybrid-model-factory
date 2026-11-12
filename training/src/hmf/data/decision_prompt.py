@@ -90,6 +90,9 @@ class DecisionPromptFormat(ABC):
     LM can answer with right after the answer marker (see data/decision_teachers.py).
     """
 
+    # Whether the prompt starts with the state block and nothing else of the state follows (see StrandsPromptFormat)
+    STATE_FIRST = False
+
     @classmethod
     def option_label(cls, position: int) -> str:
         """
@@ -182,6 +185,59 @@ class StrandsPromptFormat(DecisionPromptFormat):
 
         raise ValueError(f"Unknown decision kind '{kind}'. Supported kinds: {DECISION_KINDS}")
 
+    # Whether the prompt starts with the state block and nothing else of the state follows, so that the server can
+    # shorten a long state with Strands Decider's own rule (see eval/decision/server.py)
+    STATE_FIRST = True
+
+    @classmethod
+    def blocks(
+        cls,
+        state: Any,
+        instructions: Any,
+        kind: str,
+        options: Sequence[Tuple[str, Optional[str]]],
+        option_order: Optional[Sequence[int]] = None,
+    ) -> Tuple[str, str, Tuple[Tuple[int, int], ...]]:
+        """
+        The state block, the question block (with its options), and each option line's span within the question
+        block, which the formats of this family arrange in different orders.
+        """
+        pairs = cls._option_pairs(kind, options)
+        if option_order is not None:
+            if sorted(option_order) != list(range(len(pairs))):
+                raise ValueError(f"option_order must be a permutation of range({len(pairs)}), got {option_order}")
+            pairs = [pairs[i] for i in option_order]
+
+        state_block = f"<state>\n{render_content(state)}\n</state>\n"
+        question = f'<question type="{kind}">\n{cls.HEADERS[kind]}\n{render_content(instructions)}\n<options>\n'
+
+        # One line per option, numbered from 1. Descriptions are collapsed to a single line so each
+        # option's span is exactly one line.
+        option_spans = []
+        for i, (name, desc) in enumerate(pairs):
+            desc = " ".join(desc.split())
+            line = f"{cls.option_label(i)}. {name}" + (f" — {desc}" if desc else "")
+            if i > 0:
+                question += "\n"
+            option_spans.append((len(question), len(question) + len(line)))
+            question += line
+        question += "\n</options>\n</question>\n"
+        return state_block, question, tuple(option_spans)
+
+    @classmethod
+    def assemble(cls, parts: Sequence[str], options_part: int, option_spans) -> RenderedPrompt:
+        """
+        Joins parts into a prompt and adds the answer marker, with the option spans of the part at index options_part
+        moved to where that part is in the prompt.
+        """
+        offset = sum(len(part) for part in parts[:options_part])
+        text = "".join(parts) + cls.ANSWER_MARKER
+        return RenderedPrompt(
+            text=text,
+            option_spans=tuple((offset + start, offset + end) for start, end in option_spans),
+            answer_span=(len(text) - len(cls.ANSWER_MARKER), len(text)),
+        )
+
     @classmethod
     def render(
         cls,
@@ -191,39 +247,66 @@ class StrandsPromptFormat(DecisionPromptFormat):
         options: Sequence[Tuple[str, Optional[str]]],
         option_order: Optional[Sequence[int]] = None,
     ) -> RenderedPrompt:
-        pairs = cls._option_pairs(kind, options)
-        if option_order is not None:
-            if sorted(option_order) != list(range(len(pairs))):
-                raise ValueError(f"option_order must be a permutation of range({len(pairs)}), got {option_order}")
-            pairs = [pairs[i] for i in option_order]
+        state_block, question, spans = cls.blocks(state, instructions, kind, options, option_order)
+        return cls.assemble([state_block, question], 1, spans)
 
-        text = (
-            f"<state>\n{render_content(state)}\n</state>\n"
-            f'<question type="{kind}">\n{cls.HEADERS[kind]}\n{render_content(instructions)}\n<options>\n'
-        )
 
-        # One line per option, numbered from 1. Descriptions are collapsed to a single line so each
-        # option's span is exactly one line.
-        option_spans = []
-        for i, (name, desc) in enumerate(pairs):
-            desc = " ".join(desc.split())
-            line = f"{cls.option_label(i)}. {name}" + (f" — {desc}" if desc else "")
-            if i > 0:
-                text += "\n"
-            option_spans.append((len(text), len(text) + len(line)))
-            text += line
+class QuestionFirstPromptFormat(StrandsPromptFormat):
+    """
+    The strands format with the question and its options before the state:
 
-        text += "\n</options>\n</question>\n" + cls.ANSWER_MARKER
-        return RenderedPrompt(
-            text=text,
-            option_spans=tuple(option_spans),
-            answer_span=(len(text) - len(cls.ANSWER_MARKER), len(text)),
-        )
+        <question type="{kind}"> ... </question>
+        <state> ... </state>
+        <answer>
+
+    Under causal attention, the state is then read with the question already in view, but the question and the
+    options' lines are read without the state, so of the positions the decision model reads, only the answer
+    marker has seen the state.
+    """
+
+    STATE_FIRST = False
+
+    @classmethod
+    def render(
+        cls,
+        state: Any,
+        instructions: Any,
+        kind: str,
+        options: Sequence[Tuple[str, Optional[str]]],
+        option_order: Optional[Sequence[int]] = None,
+    ) -> RenderedPrompt:
+        state_block, question, spans = cls.blocks(state, instructions, kind, options, option_order)
+        return cls.assemble([question, state_block], 0, spans)
+
+
+class ReadTwicePromptFormat(StrandsPromptFormat):
+    """
+    The strands format read twice: the state and the question (with its options) twice in a row, then the answer
+    marker. The decision model reads the options' lines in the second copy, whose tokens attend to the whole of
+    the first, so that, under causal attention, the state and the options are read with the question and the
+    other options in view. The prompt is about twice as long.
+    """
+
+    STATE_FIRST = False
+
+    @classmethod
+    def render(
+        cls,
+        state: Any,
+        instructions: Any,
+        kind: str,
+        options: Sequence[Tuple[str, Optional[str]]],
+        option_order: Optional[Sequence[int]] = None,
+    ) -> RenderedPrompt:
+        state_block, question, spans = cls.blocks(state, instructions, kind, options, option_order)
+        return cls.assemble([state_block, question, state_block, question], 3, spans)
 
 
 # Prompt formats, selected by decision_prompt_format
 DECISION_PROMPT_FORMATS: Dict[str, Type[DecisionPromptFormat]] = {
     "strands": StrandsPromptFormat,
+    "question_first": QuestionFirstPromptFormat,
+    "read_twice": ReadTwicePromptFormat,
 }
 
 

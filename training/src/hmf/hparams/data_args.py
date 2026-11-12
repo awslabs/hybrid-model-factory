@@ -169,7 +169,13 @@ class DataArguments:
     )
     decision_prompt_format: str = field(
         default="strands",
-        metadata={"help": "Prompt format used to render decision rows (stage `decision`)."},
+        metadata={
+            "help": (
+                "Prompt format used to render decision rows (stage `decision`): `strands`, `question_first` (the "
+                "question and options before the state), or `read_twice` (the state and question twice, read in "
+                "the second copy)."
+            )
+        },
     )
     decision_num_augmentations: int = field(
         default=1,

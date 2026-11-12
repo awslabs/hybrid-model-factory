@@ -103,7 +103,7 @@ Each run is a `results.jsonl` from JevBench, or a CSV with the columns `run`, `t
 | `--raw` | off | answer at temperature 1, ignoring any calibration |
 | `--max_len` | `4096` | the context window, which is the most tokens a prompt may have |
 | `--strict_window` | off | refuse a prompt longer than `--max_len` with status 422, instead of shortening it. Without it, the question and its options keep all their tokens (up to 3/4 of the window) and the state is cut from its end to fit, as Strands Decider's server does. Use it for benchmarks that forbid shortening their prompts. |
-| `--prompt_format` | `strands` | the prompt format the model was trained with (`decision_prompt_format`) |
+| `--prompt_format` | `strands` | the prompt format the model was trained with (`decision_prompt_format`): `strands`, `question_first`, or `read_twice`. A prompt longer than the window is shortened by cutting its state from its end: with `strands` as Strands Decider's server does, and with the other formats by rendering the prompt again with the longest state that fits |
 | `--force_bos` | off | start prompts with the BOS token, if the model was trained with `decision_force_bos: true` |
 | `--model_name` | the adapter's folder name, else the model's | the name the replies give as their model |
 | `--device` | the first GPU, else the CPU | where to run the model |
