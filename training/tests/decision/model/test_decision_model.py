@@ -285,11 +285,40 @@ def _tiny_qwen3_5_multimodal():
     return model_cls(config)
 
 
+def _tiny_gemma4_multimodal():
+    """
+    A Gemma 4 checkpoint as Google releases it, multimodal (here without its vision and audio towers), with
+    sliding window and full attention layers of different head sizes, shared keys and values, and per-layer
+    embeddings, as in E2B. Its last five layers share the keys and values of the last layer of their kind before
+    them, layer 3 (sliding) or 4 (full).
+    """
+    config_cls, model_cls = _require("Gemma4Config", "Gemma4ForConditionalGeneration")
+    text_config = dict(
+        vocab_size=VOCAB_SIZE,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=128,
+        num_hidden_layers=10,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=16,
+        global_head_dim=32,
+        layer_types=(["sliding_attention"] * 4 + ["full_attention"]) * 2,
+        sliding_window=4,
+        num_kv_shared_layers=5,
+        hidden_size_per_layer_input=8,
+        vocab_size_per_layer_input=VOCAB_SIZE,
+        max_position_embeddings=256,
+        pad_token_id=1,
+    )
+    return model_cls(config_cls(text_config=text_config, vision_config=None, audio_config=None))
+
+
 SOURCES = {
     "qwen3_tied": lambda: transformers.Qwen3ForCausalLM(_tiny_qwen3_config(tie_word_embeddings=True)),
     "qwen3_untied": lambda: transformers.Qwen3ForCausalLM(_tiny_qwen3_config(tie_word_embeddings=False)),
     "qwen3_5_text": _tiny_qwen3_5_text,
     "qwen3_5_multimodal": _tiny_qwen3_5_multimodal,
+    "gemma4_multimodal": _tiny_gemma4_multimodal,
 }
 
 
@@ -376,8 +405,15 @@ def test_config(converted):
 
 def test_backbone_matches_source(converted):
     decision = AutoModel.from_pretrained(converted["output_dir"], dtype=torch.bfloat16)
-    source = transformers.AutoModelForCausalLM.from_pretrained(converted["source_dir"], dtype=torch.bfloat16)
-    source_backbone = source.base_model
+    if converted["name"].startswith("gemma4"):
+        # Gemma 4's text weights load only through the multimodal class, whose text decoder is the backbone
+        source = transformers.Gemma4ForConditionalGeneration.from_pretrained(
+            converted["source_dir"], dtype=torch.bfloat16
+        )
+        source_backbone = source.model.language_model
+    else:
+        source = transformers.AutoModelForCausalLM.from_pretrained(converted["source_dir"], dtype=torch.bfloat16)
+        source_backbone = source.base_model
 
     assert isinstance(decision, DecisionModel)
     assert type(decision.model) is type(source_backbone)

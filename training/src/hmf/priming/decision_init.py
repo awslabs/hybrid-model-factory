@@ -14,16 +14,20 @@ or in Python:
     init_decision_model(config)
 
 The source model is any causal LM that loads with AutoModelForCausalLM, either a stock Transformer
-or one of our Hybrid models. For multimodal checkpoints such as Qwen3.5, only the text decoder is kept.
+or one of our Hybrid models. For multimodal checkpoints such as Qwen3.5 and Gemma 4, only the text
+decoder is kept. Gemma 4's checkpoints are loaded with their multimodal class instead, since the causal
+LM class does not load their text weights.
 """
 
 import os
 from dataclasses import dataclass, fields
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
+import torch.nn as nn
+import transformers
 import yaml
-from transformers import PreTrainedModel
+from transformers import AutoConfig, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer
 
 import hmf.model.hybrid_zoo.models.model_register  # Registers hybrid models and suppresses warnings. Must be first
 from hmf.model.hybrid_zoo.models.decision.configuration_decision import DecisionConfig
@@ -35,6 +39,14 @@ from .utils import copy_auxiliary_files
 
 
 logger = get_logger(__name__)
+
+# Gemma 4's model types, and the multimodal class that loads each one's text weights. The 12B is
+# gemma4_unified, a class of its own with the same layout, and the 26B-A4B is gemma4 with a mixture of
+# experts in every layer.
+GEMMA4_CLASSES = {
+    "gemma4": "Gemma4ForConditionalGeneration",
+    "gemma4_unified": "Gemma4UnifiedForConditionalGeneration",
+}
 
 
 @dataclass
@@ -125,6 +137,34 @@ def _head_kwargs(config: DecisionInitConfig) -> dict:
     }
 
 
+def _load_source_model(
+    source_path: str, dtype: torch.dtype
+) -> Tuple[PreTrainedModel, nn.Module, PreTrainedTokenizer]:
+    """
+    Loads the source model, and returns it with its backbone and its tokenizer. The backbone is the
+    causal LM without its LM head. Gemma 4's checkpoints are multimodal, and the causal LM class leaves
+    their text weights randomly initialized, so they are loaded with their multimodal class, whose
+    text decoder is the backbone. Their vision and audio encoders are not kept.
+
+    Arguments:
+        source_path: The source model's folder.
+        dtype: The dtype to load it in.
+    """
+    model_type = AutoConfig.from_pretrained(source_path).model_type
+    if model_type not in GEMMA4_CLASSES:
+        causal_lm, tokenizer, _ = load_pretrained_model(source_path, dtype=dtype)
+        return causal_lm, causal_lm.base_model, tokenizer
+
+    class_name = GEMMA4_CLASSES[model_type]
+    if not hasattr(transformers, class_name):
+        raise ValueError(
+            f"{source_path} is a {model_type} model, which needs transformers' {class_name}, and transformers "
+            f"{transformers.__version__} does not have it."
+        )
+    model = getattr(transformers, class_name).from_pretrained(source_path, dtype=dtype)
+    return model, model.model.language_model, AutoTokenizer.from_pretrained(source_path)
+
+
 def init_decision_model(config: DecisionInitConfig) -> None:
     """
     Converts the causal LM specified in config into a decision model and saves it in the directory
@@ -161,14 +201,11 @@ def init_decision_model(config: DecisionInitConfig) -> None:
     dtype = config.dtype or torch.bfloat16
     logger.info(f"Loading source model from: {model_name_or_path}")
     logger.info(f"Target dtype: {dtype}")
-    causal_lm, tokenizer, _ = load_pretrained_model(source_path, dtype=dtype)
+    causal_lm, backbone, tokenizer = _load_source_model(source_path, dtype)
 
     source_num_params = sum(p.numel() for p in causal_lm.parameters())
     logger.info(f"Source model loaded: {source_num_params:,} parameters")
     logger.info(f"Model type: {causal_lm.config.model_type}")
-
-    # The backbone is the causal LM without its LM head
-    backbone = causal_lm.base_model
     text_config = backbone.config
 
     # Weights are dequantized when loading, so the saved backbone is no longer quantized
