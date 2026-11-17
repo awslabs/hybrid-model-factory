@@ -1,10 +1,48 @@
-# Evaluating Decision Models
+# Evaluating and Serving Decision Models
 
-This package evaluates decision models trained with `stage: decision`. It calibrates a model, and then measures its accuracy and calibration on a set of benchmarks.
+This package evaluates and serves decision models trained with `stage: decision`. It calibrates a model, measures its accuracy and calibration on a set of benchmarks, and answers questions with it over HTTP ([serving a model](#serving-a-model)).
 
 - **The split of held-out data, the definition of confidence, and the metrics are defined as in [Strands Decider](https://github.com/strands-labs/strands-decider)'s evaluation,** and so is the calibration with `--method strands_decider`, so that results can be compared with the numbers it publishes. By default, the calibration instead fits the probabilities themselves ([how calibration, the gate, and the metrics work](#how-calibration-the-gate-and-the-metrics-work)).
 - **The benchmarks listed below are built by Strands Decider,** from public datasets and from its own generated data. Any data file in the decision format can be evaluated in the same way.
 - **JevBench is an external benchmark,** which HMF runs against a server for the model.
+
+## Serving a Model
+
+A trained decision model answers questions over HTTP, using the same request format as Strands Decider's server, in three steps.
+
+**1. Start the server** from `training/`, with the model's folder:
+
+```bash
+hmf decision-serve path/to/decision-model
+```
+
+It reads the model's prompt format (e.g., `strands` or `read_twice`, see [Decision Prompt Formats](../../../../data/README.md#decision-prompt-formats)) and calibration from `decision_prompt.json` and `decision_calibration.json` in the model's folder (or in its adapter's folder, for a model trained with LoRA), and listens on `127.0.0.1:8099`. The server builds each prompt in the model's format, so requests are the same whatever format the model was trained with. For a model trained with LoRA, also pass its adapter with `--adapter_name_or_path path/to/adapter`. To reach the server from another machine, forward its port over SSH with `ssh -N -L 8099:127.0.0.1:8099 <server machine>`.
+
+**2. Send it a state and one or more named questions:**
+
+```bash
+curl -s http://127.0.0.1:8099/v1/systemone -H 'Content-Type: application/json' -d '{
+  "state": "Order 1182 was charged twice. The customer asked for the duplicate charge to be removed.",
+  "questions": {
+    "next_step": {"type": "choice", "instructions": "What should support do next?",
+                  "criteria": {"refund": "return the duplicate payment", "ignore": "take no action",
+                               "escalate": "send the case to a human agent"}},
+    "is_duplicate": {"type": "noul", "instructions": "The customer was charged more than once."}
+  }
+}'
+```
+
+**3. Read the answers.** Each question gets one answer in the reply, under the name you gave it in the request (`next_step` and `is_duplicate` below). A yes/no question (`noul`) gets the probability that its statement is true, a choice gets its most probable option and a probability for every option, and a rating (`score`) gets its expected level and a probability for every level. For the request above, a model's answer may look like:
+
+```json
+{"model": "my-decision-model",
+ "answers": {"next_step": {"type": "choice", "choice": "refund",
+                           "probabilities": {"refund": 0.9548, "ignore": 0.0175, "escalate": 0.0277}, "confidence": 0.9323},
+             "is_duplicate": {"type": "noul", "noul": 0.9972}},
+ "usage": {"input_tokens": 192, "output_tokens": 2}, "latency_ms": 30.0}
+```
+
+Expect the first request to take a second or two, since the GPU kernels are compiled when they are first used, and the next ones to be much faster. `GET /health` shows the model being served and its settings, and [the server's options and fields](#serving-options) are listed below.
 
 ## Benchmarks
 
@@ -92,7 +130,7 @@ hmf decision-eval compare reports/jevbench/results.jsonl path/to/other/results.j
 
 Each run is a `results.jsonl` from JevBench, or a CSV with the columns `run`, `task_id`, and `correct` with `--b_run <name>` (the layout of Strands Decider's `research/data/jevbench_results.csv`, which holds its published runs, v19's included). Two training runs of the same recipe differ by about 3 tasks, so a difference of under about 10 tasks between two single runs can be noise.
 
-**The server takes these options** (`hmf decision-serve MODEL [options]`):
+<a id="serving-options"></a>**The server takes these options** (`hmf decision-serve MODEL [options]`):
 
 | option | default | meaning |
 | --- | --- | --- |
