@@ -9,9 +9,10 @@ A decision row is a state, a question (instructions), a list of options, and the
 
 A prompt format renders a row into text, and records where each option's line and the answer
 marker are. Formats are registered in DECISION_PROMPT_FORMATS and selected with
-decision_prompt_format. The decision model reads the hidden state at the last token of each
-option's line and at the answer marker (see model/hybrid_zoo/models/decision/), so
-encode_decision_prompt maps those character spans to token positions.
+decision_prompt_format, and data/README.md ("Decision Prompt Formats") compares their layouts.
+The decision model reads the hidden state at the last token of each option's line and at the
+answer marker (see model/hybrid_zoo/models/decision/), so encode_decision_prompt maps those
+character spans to token positions.
 
 Training and inference must use the same format, so both go through this module.
 """

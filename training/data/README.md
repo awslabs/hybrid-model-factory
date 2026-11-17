@@ -529,7 +529,7 @@ Tokenize decision data with `hmf preprocess` and `stage: decision` (see [example
 
 | argument | default | description |
 | --- | --- | --- |
-| `decision_prompt_format` | `strands` | The prompt format rows are rendered with: `strands` (the state, then the question and its options, then the answer marker), `question_first` (the question and its options before the state, so that the state is read with the question in view, though the options' lines are then read without the state), or `read_twice` (the state and the question twice in a row, with the options read in the second copy, whose tokens see the whole first copy; the prompt is about twice as long). Evaluation and serving must use the format the model was trained with. |
+| `decision_prompt_format` | `strands` | The prompt format that rows are rendered in, which is `strands`, `question_first`, or `read_twice` (see [Decision Prompt Formats](#decision-prompt-formats) below). Evaluation and serving must use the format the model was trained with. |
 | `decision_num_augmentations` | 1 | Augmentations of each training row. An augmentation is one augmented copy of a row, rendered with its options in one order (shuffled for `noul` and `choice`, possibly reversed for `score`) and one phrasing of its question. Epoch e trains on augmentation e (modulo the number of augmentations). |
 | `decision_shuffle_options` | true | Shuffle the options of `noul` and `choice` rows. |
 | `decision_reverse_score_prob` | 0.5 | Probability of reversing a `score` row's rubric (and its label). `score` options are otherwise never shuffled. |
@@ -540,6 +540,18 @@ Tokenize decision data with `hmf preprocess` and `stage: decision` (see [example
 With `val_size`, the validation split is held out per task and rendered once, without augmentation. Prompts longer than `cutoff_len` are dropped. `seed` sets both the validation split and the augmentations.
 
 The Strands Decider training data is registered as `strands_*` datasets, read from `strands-decider/` in this directory, which should be a link to the `data/` folder of a [strands-decider](https://github.com/strands-labs/strands-decider) checkout in which the data has been built.
+
+### Decision Prompt Formats
+
+Decision rows can be rendered in three prompt formats, `strands`, `question_first`, and `read_twice`, chosen with `decision_prompt_format`, which differ in where the state goes relative to the question. The decision model reads the hidden state at the last token of each option's line and at the answer marker, so the order decides what those tokens have seen, under causal attention:
+
+| `decision_prompt_format` | layout | what each option's line sees | length |
+| --- | --- | --- | --- |
+| `strands` (Strands Decider's) | `<state>…</state>` `<question>…<options>1. … 2. …</options></question>` `<answer>` | the state and the question | 1× |
+| `question_first` | `<question>…<options>1. … 2. …</options></question>` `<state>…</state>` `<answer>` | the question only, since the state comes after it | 1× |
+| `read_twice` | the `strands` prompt twice in a row, then `<answer>` | the whole first copy, and the state and question again | about 2× |
+
+In `read_twice`, the decision model reads the option lines of the second copy. Its prompt is about twice as long, so it costs about twice as much to train and to run. With `decision_attention: bidirectional` (set in the `hmf decision-init` config), every token sees the whole prompt in the full attention layers, so the column on what each option's line sees holds for causal attention only. Training saves the format in `decision_prompt.json`, which evaluation and serving then use by default (see [src/hmf/eval/decision/README.md](../src/hmf/eval/decision/README.md)).
 
 ### Decision Labels
 
@@ -601,7 +613,7 @@ Training uses the targets through two weights, which default to 0 (cross-entropy
 | `decision_anchor_kl_weight` | KL(anchor ‖ model), averaged over the rows of each batch that have an anchor |
 | `decision_teacher_kl_weight` | KL(teacher ‖ model), averaged over the rows of each batch that have a teacher |
 
-The loss is the cross-entropy plus each weighted term. Row weights apply to the cross-entropy only, and a batch without rows that have a target adds nothing for that term. Training stops with an error if a weight is above 0 without `decision_label_folder`, or if the label set has no rows with that target. The training logs show `ce_loss`, `anchor_kl` and `teacher_kl` (unweighted) beside the loss. Validation rows have no label set, so `eval_loss` is the cross-entropy alone.
+Training minimizes the cross-entropy plus each weighted term. Row weights apply to the cross-entropy only, and a batch without rows that have a target adds nothing for that term. Training stops with an error if a weight is above 0 without `decision_label_folder`, or if the label set has no rows with that target. The training logs show `ce_loss`, `anchor_kl` and `teacher_kl` (unweighted) beside the loss. Validation rows have no label set, so `eval_loss` is the cross-entropy alone.
 
 #### Teacher Models
 
