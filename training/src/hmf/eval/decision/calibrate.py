@@ -44,7 +44,7 @@ from ...train.decision.metric import NUM_ECE_BINS, expected_calibration_error
 from .data import partition_rows, read_rows, sample_rows
 from .gate import check_gate_settings, fit_gate, format_gate
 from .metrics import DEFAULT_ORDINAL_SMOOTHING, apply_temperature, predictions, summarize
-from .predictor import DecisionPredictor, calibration_path
+from .predictor import AUTO, DecisionPredictor, calibration_path
 
 
 logger = logging.get_logger(__name__)
@@ -173,9 +173,9 @@ def calibrate(
     min_rows_per_kind: int = MIN_ROWS_PER_KIND,
     method: str = "nll",
     gate: Optional[Union[Dict[str, Any], str]] = None,
-    prompt_format: str = "strands",
-    force_bos: bool = False,
-    max_len: Optional[int] = 4096,
+    prompt_format: str = AUTO,
+    force_bos: Union[bool, str] = AUTO,
+    max_len: Union[int, None, str] = AUTO,
     device: Optional[str] = None,
     predictor: Optional[DecisionPredictor] = None,
 ) -> Dict[str, Any]:
@@ -202,9 +202,12 @@ def calibrate(
         gate: Gate settings (rule, target, params, take_options, min_count, use_weights; see gate.py),
             as a mapping, YAML text, or a YAML file's path, to also fit a gate on the calibrated
             probabilities. Defaults to None, no gate.
-        prompt_format: The prompt format of training (decision_prompt_format). Defaults to "strands".
-        force_bos: Whether prompts start with the BOS token (decision_force_bos). Defaults to False.
-        max_len: The longest prompt, in tokens; longer rows are skipped. Defaults to 4096.
+        prompt_format: The prompt format of training (decision_prompt_format). Defaults to "auto",
+            the model's decision_prompt.json, else "strands" (see predictor.py).
+        force_bos: Whether prompts start with the BOS token (decision_force_bos). Defaults to "auto",
+            the model's, else False.
+        max_len: The longest prompt, in tokens, beyond which rows are skipped. Defaults to "auto",
+            the model's, else 4096.
         device: Where to run the model. Defaults to the first GPU if there is one, else the CPU.
         predictor: A DecisionPredictor to use instead of loading the model. Defaults to None.
 
@@ -223,7 +226,7 @@ def calibrate(
     log_probs = predictor.log_probs(rows)
     kept = [(row, lp) for row, lp in zip(rows, log_probs) if lp is not None]
     if not kept:
-        raise ValueError(f"No row of {data} ({split}) fits in max_len {max_len}.")
+        raise ValueError(f"No row of {data} ({split}) fits in max_len {predictor.max_len}.")
     kinds = [row["kind"] for row, _ in kept]
     tasks = [row.get("task", "unknown") for row, _ in kept]
     labels = [int(row["label"]) for row, _ in kept]

@@ -236,6 +236,15 @@ def run_decision(
         _warn_if_augmentations_reused(trainer, training_args, model_args.sequence_parallel_size)
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
         trainer.save_model()
+        if trainer.is_world_process_zero():
+            # Saves the prompt settings the model was trained with, which evaluation and serving then use by default
+            from ...eval.decision.predictor import save_prompt_settings
+
+            path = save_prompt_settings(
+                training_args.output_dir, data_args.decision_prompt_format, data_args.decision_force_bos,
+                data_args.cutoff_len,
+            )
+            logger.info_rank0(f"Prompt settings saved to {path}.")
         if finetuning_args.decision_save_optimizer:
             trainer.save_optimizer_state(training_args.output_dir)
         trainer.log_metrics("train", train_result.metrics)

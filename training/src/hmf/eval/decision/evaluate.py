@@ -25,12 +25,12 @@ of a pair, and a pair with a row longer than max_len is left out whole.
 
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from .data import partition_rows, read_rows, sample_rows
 from .gate import evaluate_gate, format_gate
 from .metrics import DEFAULT_ORDINAL_SMOOTHING, format_summary, pair_metrics, predictions, summarize
-from .predictor import DecisionPredictor
+from .predictor import AUTO, DecisionPredictor
 
 
 def evaluate(
@@ -44,9 +44,9 @@ def evaluate(
     calibration: Optional[str] = "auto",
     out: Optional[str] = None,
     ordinal_smoothing: Optional[float] = None,
-    prompt_format: str = "strands",
-    force_bos: bool = False,
-    max_len: Optional[int] = 4096,
+    prompt_format: str = AUTO,
+    force_bos: Union[bool, str] = AUTO,
+    max_len: Union[int, None, str] = AUTO,
     device: Optional[str] = None,
     predictor: Optional[DecisionPredictor] = None,
     pairs: bool = False,
@@ -69,9 +69,12 @@ def evaluate(
         out: A JSON file to write the report to. Defaults to None.
         ordinal_smoothing: The floor of score confidence (see metrics.py). Defaults to the
             calibration's, else 0.1.
-        prompt_format: The prompt format of training (decision_prompt_format). Defaults to "strands".
-        force_bos: Whether prompts start with the BOS token (decision_force_bos). Defaults to False.
-        max_len: The longest prompt, in tokens; longer rows are skipped. Defaults to 4096.
+        prompt_format: The prompt format of training (decision_prompt_format). Defaults to "auto",
+            the model's decision_prompt.json, else "strands" (see predictor.py).
+        force_bos: Whether prompts start with the BOS token (decision_force_bos). Defaults to "auto",
+            the model's, else False.
+        max_len: The longest prompt, in tokens, beyond which rows are skipped. Defaults to "auto",
+            the model's, else 4096.
         device: Where to run the model. Defaults to the first GPU if there is one, else the CPU.
         predictor: A DecisionPredictor to use instead of loading the model. Defaults to None.
         pairs: Whether the file's rows come in adjacent pairs, which adds the pair metrics. Defaults to False.

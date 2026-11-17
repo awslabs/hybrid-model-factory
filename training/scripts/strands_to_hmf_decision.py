@@ -34,7 +34,8 @@ The converted model is the same model as the checkpoint. Its LoRA weights are re
 decoder (base_model.model.<layer>) to the decision model's backbone (base_model.model.model.<layer>),
 and the head's weights are copied unchanged. The checkpoint's calibration, if it has one, is written as
 decision_calibration.json, next to the adapter or in the merged model's folder (see
-src/hmf/eval/decision/README.md).
+src/hmf/eval/decision/README.md), and its prompt settings (strands format, its BOS setting and window) as
+decision_prompt.json in the same folder, which evaluation and serving then use by default.
 
 To keep training the converted adapter, set adapter_name_or_path to <output_dir>/adapter in a training
 config with stage decision. The adapter keeps its own rank, alpha, and target modules, whatever
@@ -385,6 +386,12 @@ def convert(
         else:
             model, adapter = decision_model, adapter_dir
         calibration = _write_calibration(adapter or model, config, checkpoint)
+        from hmf.eval.decision.predictor import save_prompt_settings
+
+        # Strands Decider's prompt is HMF's strands format, and saving its settings lets evaluation and serving use
+        # them by default
+        prompt = save_prompt_settings(adapter or model, "strands", bool(config.get("force_bos", False)),
+                                      config.get("max_length", 4096))
     finally:
         if work_dir is not None:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -395,6 +402,7 @@ def convert(
     if adapter is not None:
         print(f"  adapter:        {adapter}")
     print(f"  calibration:    {calibration or 'none (the checkpoint is uncalibrated)'}")
+    print(f"  prompt:         {prompt}")
     print(
         "Configs that train or evaluate it must match the checkpoint's settings:\n"
         "  decision_prompt_format: strands\n"

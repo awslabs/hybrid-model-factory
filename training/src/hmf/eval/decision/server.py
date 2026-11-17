@@ -68,7 +68,7 @@ from ...data.decision_prompt import (
 )
 from ...extras import logging
 from .metrics import DEFAULT_ORDINAL_SMOOTHING, apply_temperature, choice_confidence, score_confidence
-from .predictor import DecisionPredictor
+from .predictor import AUTO, DecisionPredictor
 
 
 logger = logging.get_logger(__name__)
@@ -418,9 +418,9 @@ def serve(
     raw: bool = False,
     calibration: Optional[str] = "auto",
     strict_window: bool = False,
-    max_len: int = 4096,
-    prompt_format: str = "strands",
-    force_bos: bool = False,
+    max_len: Union[int, str] = AUTO,
+    prompt_format: str = AUTO,
+    force_bos: Union[bool, str] = AUTO,
     model_name: Optional[str] = None,
     device: Optional[str] = None,
 ) -> None:
@@ -441,10 +441,12 @@ def serve(
         strict_window: Whether to refuse (status 422) a prompt longer than max_len, instead of cutting
             its state to fit. Benchmarks that forbid shortening their prompts need it. Defaults to
             False.
-        max_len: The context window, in tokens: the longest prompt answered. Defaults to 4096.
-        prompt_format: The prompt format of training (decision_prompt_format). Defaults to "strands".
+        max_len: The context window, in tokens, which is the longest prompt answered. Defaults to
+            "auto", the model's decision_prompt.json (see predictor.py), else 4096.
+        prompt_format: The prompt format of training (decision_prompt_format). Defaults to "auto",
+            the model's, else "strands".
         force_bos: Whether prompts start with the BOS token (decision_force_bos in training).
-            Defaults to False.
+            Defaults to "auto", the model's, else False.
         model_name: The name replies give as their model. Defaults to the adapter's folder name, else
             the model's.
         device: Where to run the model. Defaults to the first GPU if there is one, else the CPU.

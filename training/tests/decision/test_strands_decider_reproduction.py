@@ -432,6 +432,9 @@ def test_strands_checkpoint_converts_to_an_adapter(trained, tmp_path):
 
     assert sorted(os.listdir(output_dir)) == ["adapter", "model"]
     assert not (output_dir / "adapter" / "decision_calibration.json").exists()  # The checkpoint is uncalibrated
+    # Its prompt settings are Strands Decider's strands format, with the checkpoint's BOS setting and window
+    settings = json.loads((output_dir / "adapter" / "decision_prompt.json").read_text())
+    assert settings == {"prompt_format": "strands", "force_bos": False, "max_len": 4096}
     with open(output_dir / "adapter" / "adapter_config.json") as f:
         adapter_config = json.load(f)
     assert adapter_config["base_model_name_or_path"] == str(output_dir / "model")
@@ -482,6 +485,7 @@ def test_strands_checkpoint_converts_to_a_merged_model(trained, tmp_path):
     assert not any("lora_" in key or "modules_to_save" in key for key in weights)
     assert {dtype for key, dtype in weights.items() if key.startswith("decision_head.")} == {"F32"}
     assert not (output_dir / "adapter_config.json").exists()
+    assert json.loads((output_dir / "decision_prompt.json").read_text())["prompt_format"] == "strands"
     assert not [name for name in os.listdir(tmp_path) if name.startswith(".strands_to_hmf_decision-")]  # Steps deleted
     torch.testing.assert_close(
         _decision_logits(output_dir), _decision_logits(trained["decision_dir"], trained["adapter_dir"]),

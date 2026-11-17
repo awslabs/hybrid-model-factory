@@ -45,7 +45,7 @@ from .calibrate import calibrate
 from .evaluate import evaluate
 from .gate import check_gate_settings
 from .jevbench import compare, load_results
-from .predictor import DecisionPredictor, calibration_path, load_calibration
+from .predictor import AUTO, DecisionPredictor, calibration_path, load_calibration
 
 
 logger = logging.get_logger(__name__)
@@ -271,11 +271,8 @@ def run_suite(path: str, *overrides: str) -> Dict[str, Any]:
     suite = load_suite(path, overrides)
     model, adapter, output_dir = suite["model_name_or_path"], suite.get("adapter_name_or_path"), suite["output_dir"]
     dataset_dir = suite.get("dataset_dir", "data")
-    options = {
-        "prompt_format": suite.get("prompt_format", "strands"),
-        "force_bos": suite.get("force_bos", False),
-        "max_len": suite.get("max_len", 4096),
-    }
+    # Settings the suite leaves out come from the model's decision_prompt.json, else the defaults (see predictor.py)
+    options = {key: suite.get(key, AUTO) for key in ("prompt_format", "force_bos", "max_len")}
     jevbench = suite.get("jevbench")
     # Every check before the first model is loaded
     calibration_data = resolve_data(suite["calibration"], dataset_dir) if suite.get("calibration") else None
