@@ -185,6 +185,8 @@ def test_decision_config_validation():
         DecisionConfig(decision_head_dim=0)
     with pytest.raises(ValueError):
         DecisionConfig(decision_head_dropout=1.0)
+    with pytest.raises(ValueError, match="decision_attention"):
+        DecisionConfig(decision_attention="non_causal")
 
 
 def test_decision_config_round_trip(tmp_path):
@@ -207,6 +209,7 @@ def test_decision_config_round_trip(tmp_path):
     assert loaded.decision_head_dropout == 0.1
     assert loaded.decision_head_init == "random"
     assert loaded.source_model_name_or_path == "some/model"
+    assert loaded.decision_attention == "causal"
     assert loaded.tie_word_embeddings is False
 
 
@@ -503,3 +506,85 @@ def test_load_with_sdpa(converted):
     decision = AutoModel.from_pretrained(converted["output_dir"], attn_implementation="sdpa")
 
     assert decision.model.config._attn_implementation == "sdpa"
+
+
+# Bidirectional attention (decision_attention)
+
+
+ATTENTION_BACKBONES = {
+    "qwen3": lambda: _tiny_qwen3_config(),
+    "qwen3_5_text": lambda: _require("Qwen3_5TextConfig")[0](**_qwen3_5_text_kwargs()),
+}
+
+
+def _decision_models(name: str):
+    """
+    A causal and a bidirectional decision model with the same weights, in float32, on the GPU if there is one.
+    Qwen3.5's Gated DeltaNet kernels run on the GPU only.
+    """
+    if name.startswith("qwen3_5") and DEVICE != "cuda":
+        pytest.skip("Qwen3.5's Gated DeltaNet kernels need a GPU")
+    torch.manual_seed(SEED)
+    causal = DecisionModel(DecisionConfig(text_config=ATTENTION_BACKBONES[name](), decision_head_dim=HEAD_DIM)).eval()
+    config = DecisionConfig(text_config=causal.config.text_config, decision_head_dim=HEAD_DIM,
+                            decision_attention="bidirectional")
+    bidirectional = DecisionModel(config).eval()
+    bidirectional.load_state_dict(causal.state_dict())
+    return causal.to(DEVICE), bidirectional.to(DEVICE)
+
+
+def _hidden_states(model: DecisionModel, input_ids, attention_mask) -> torch.Tensor:
+    input_ids, attention_mask = input_ids.to(DEVICE), attention_mask.to(DEVICE)
+    with torch.no_grad():
+        if model.config.decision_attention == "bidirectional":
+            out = model._bidirectional_backbone(input_ids, attention_mask, None)
+        else:
+            out = model.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+    return out.last_hidden_state
+
+
+@pytest.mark.parametrize("name", list(ATTENTION_BACKBONES))
+def test_bidirectional_attention_sees_later_tokens(name):
+    causal, bidirectional = _decision_models(name)
+    input_ids = torch.randint(2, VOCAB_SIZE, (1, 10), generator=torch.Generator().manual_seed(SEED))
+    changed = input_ids.clone()
+    changed[0, -1] = (changed[0, -1] + 1) % VOCAB_SIZE
+    mask = torch.ones_like(input_ids)
+
+    # A causal model's early states ignore a change to the last token, but a bidirectional model's do not
+    torch.testing.assert_close(
+        _hidden_states(causal, input_ids, mask)[:, :9],
+        _hidden_states(causal, changed, mask)[:, :9],
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    assert not torch.allclose(_hidden_states(bidirectional, input_ids, mask)[:, 0],
+                              _hidden_states(bidirectional, changed, mask)[:, 0])
+
+
+@pytest.mark.parametrize("name", list(ATTENTION_BACKBONES))
+def test_bidirectional_attention_ignores_padding(name):
+    _, bidirectional = _decision_models(name)
+    input_ids = torch.randint(2, VOCAB_SIZE, (1, 8), generator=torch.Generator().manual_seed(SEED))
+    padded = torch.cat([input_ids, torch.full((1, 4), 1)], dim=1)
+    padded_mask = torch.cat([torch.ones(1, 8, dtype=torch.long), torch.zeros(1, 4, dtype=torch.long)], dim=1)
+
+    # The real tokens' states are the same with and without right padding, up to the GPU kernels, which split
+    # prompts of different lengths differently
+    torch.testing.assert_close(
+        _hidden_states(bidirectional, padded, padded_mask)[:, :8],
+        _hidden_states(bidirectional, input_ids, torch.ones_like(input_ids)),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+def test_bidirectional_forward_and_saved_setting(tmp_path):
+    _, bidirectional = _decision_models("qwen3")
+    batch = _batch(DEVICE)
+    with torch.no_grad():
+        out = bidirectional(**batch)
+    assert torch.isfinite(out.log_probs[batch["opt_idx"] >= 0]).all()
+
+    bidirectional.save_pretrained(tmp_path)
+    assert AutoConfig.from_pretrained(tmp_path).decision_attention == "bidirectional"

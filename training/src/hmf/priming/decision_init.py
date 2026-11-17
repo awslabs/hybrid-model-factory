@@ -68,6 +68,8 @@ class DecisionInitConfig:
         decision_head_dropout: Dropout on the pointer head's inputs. 0 disables it. Defaults to 0.05.
         decision_head_init: How to initialize the pointer head. "random" uses PyTorch's default
             initialization. Defaults to "random".
+        decision_attention: How the backbone attends over the prompt, "causal" or "bidirectional"
+            (see DecisionConfig). Defaults to "causal".
         seed: Seed for the head's initialization. If None, the initialization is not seeded and
             differs between runs. Defaults to None.
         copy_auxiliary_files: Whether to copy auxiliary files (e.g., system prompts, tokenizer
@@ -82,6 +84,7 @@ class DecisionInitConfig:
     decision_head_norm: bool = True
     decision_head_dropout: float = 0.05
     decision_head_init: str = "random"
+    decision_attention: str = "causal"
     seed: Optional[int] = None
     copy_auxiliary_files: bool = False
 
@@ -129,11 +132,13 @@ HEAD_INIT_FNS: Dict[str, Callable[[DecisionModel, PreTrainedModel], None]] = {
 
 
 def _head_kwargs(config: DecisionInitConfig) -> dict:
+    """The DecisionConfig settings that decision-init takes from its config, which are the head's and the attention."""
     return {
         "decision_head_dim": config.decision_head_dim,
         "decision_head_norm": config.decision_head_norm,
         "decision_head_dropout": config.decision_head_dropout,
         "decision_head_init": config.decision_head_init,
+        "decision_attention": config.decision_attention,
     }
 
 

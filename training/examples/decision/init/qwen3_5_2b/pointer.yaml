@@ -7,5 +7,6 @@ decision_head_dim: 256          # Width of the query and key projections
 decision_head_norm: true        # LayerNorm before the projections
 decision_head_dropout: 0.05     # 0 disables dropout
 decision_head_init: random      # PyTorch's default initialization
+decision_attention: causal      # Or bidirectional, where the full attention layers see the whole prompt
 seed: null                      # Set to seed the head's initialization (e.g. one per soup member)
 output_dir: ./models/Qwen3.5-2B-Base-Decision

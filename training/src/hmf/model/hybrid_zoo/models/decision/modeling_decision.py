@@ -26,7 +26,7 @@ checks this against the same models without sequence parallelism.
 
 import contextlib
 from dataclasses import dataclass
-from typing import Generator, Optional
+from typing import Any, Generator, Optional
 
 import torch
 import torch.distributed as dist
@@ -234,10 +234,80 @@ class DecisionModel(PreTrainedModel):
         # Device placement (e.g. device_map="auto") should not split the backbone's layers
         self._no_split_modules = getattr(self.model, "_no_split_modules", None)
         self.pass_attention_mask = uses_padding_mask(self.model)
+        if config.decision_attention == "bidirectional" and not self.pass_attention_mask:
+            raise ValueError(
+                f"decision_attention='bidirectional' needs a stock Hugging Face backbone, whose attention takes a "
+                f"4D mask, and {type(self.model).__name__} is one of HMF's hybrid backbones."
+            )
         # Set by the training workflow when sequence parallelism is enabled
         self.sequence_parallel_group = None
 
         self.post_init()
+
+    def _bidirectional_backbone(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.LongTensor],
+        **kwargs,
+    ) -> Any:
+        """
+        Runs the backbone with bidirectional attention over the prompt (decision_attention). Its
+        attention layers get a 4D mask in which every real token attends to every real token and no
+        token attends to padding. On a hybrid backbone with recurrent layers (layer type
+        linear_attention, as Qwen3.5's Gated DeltaNet layers), only the full attention layers get
+        it, and the recurrent layers, which are causal by construction, get the padding mask of the
+        causal path.
+
+        Args:
+            input_ids: Token ids of shape [batch, seq_len], right-padded.
+            attention_mask: Attention mask of shape [batch, seq_len], or None if nothing is padded.
+            position_ids: Optional position ids of shape [batch, seq_len].
+            kwargs: Passed to the backbone.
+
+        Returns:
+            The backbone's output.
+        """
+        from transformers.masking_utils import create_bidirectional_mask
+
+        inputs_embeds = self.model.get_input_embeddings()(input_ids)
+        if attention_mask is None:
+            attention_mask = torch.ones(input_ids.shape, dtype=torch.long, device=input_ids.device)
+        mask = create_bidirectional_mask(
+            config=self.model.config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            # A skipped (None) mask would let SDPA fall back to its causal mask, so the mask is always built
+            allow_is_bidirectional_skip=False,
+        )
+        layer_types = getattr(self.model.config, "layer_types", None) or []
+        if "linear_attention" in layer_types:
+            from transformers.masking_utils import create_recurrent_attention_mask
+
+            unknown = set(layer_types) - {"full_attention", "linear_attention"}
+            if unknown:
+                raise ValueError(f"decision_attention='bidirectional' does not support layer types {sorted(unknown)}.")
+            mask = {
+                "full_attention": mask,
+                "linear_attention": create_recurrent_attention_mask(
+                    config=self.model.config,
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    past_key_values=None,
+                    position_ids=position_ids,
+                ),
+            }
+        if getattr(self.model.config, "_attn_implementation", None) == "flash_attention_2":
+            # Flash attention ignores the mask's shape and needs to be told not to be causal
+            kwargs["is_causal"] = False
+        return self.model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=mask,
+            position_ids=position_ids,
+            use_cache=False,
+            return_dict=True,
+            **kwargs,
+        )
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.get_input_embeddings()
@@ -311,14 +381,19 @@ class DecisionModel(PreTrainedModel):
             position_ids = zigzag_local(position_ids, sp_rank, sp_size)
             attention_mask = None
 
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=False,
-            return_dict=True,
-            **kwargs,
-        )
+        if self.config.decision_attention == "bidirectional":
+            if group is not None:
+                raise ValueError("decision_attention='bidirectional' does not support sequence parallelism.")
+            outputs = self._bidirectional_backbone(input_ids, attention_mask, position_ids, **kwargs)
+        else:
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                return_dict=True,
+                **kwargs,
+            )
         hidden_states = outputs.last_hidden_state  # [batch, seq_len, hidden_size]
         if group is not None:
             # Every rank gathers the hidden states of the whole prompts, which answer_idx and opt_idx index

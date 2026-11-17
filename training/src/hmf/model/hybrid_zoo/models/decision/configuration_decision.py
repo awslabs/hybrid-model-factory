@@ -16,6 +16,10 @@ from transformers.configuration_utils import PreTrainedConfig
 from transformers.models.auto import CONFIG_MAPPING, AutoConfig
 
 
+# How the backbone can attend over the prompt (decision_attention)
+DECISION_ATTENTION = ("causal", "bidirectional")
+
+
 class DecisionConfig(PreTrainedConfig):
     """
     Configuration class for a DecisionModel. It holds the backbone's configuration and the
@@ -34,6 +38,12 @@ class DecisionConfig(PreTrainedConfig):
         source_model_name_or_path: The causal LM the backbone was taken from. Recorded for
             provenance, e.g. to reattach the vision tower of a multimodal source model.
             Defaults to None.
+        decision_attention: How the backbone attends over the prompt, which is "causal", as it was
+            pretrained, or "bidirectional", where every token attends to every token of the prompt
+            (padding stays masked). On a hybrid backbone such as Qwen3.5, only the full attention
+            layers become bidirectional, and the recurrent layers stay causal. Bidirectional
+            attention needs a stock Hugging Face backbone and no sequence parallelism. Defaults to
+            "causal".
     """
 
     model_type = "hmf_decision"
@@ -47,6 +57,7 @@ class DecisionConfig(PreTrainedConfig):
         decision_head_dropout: float = 0.05,
         decision_head_init: str = "random",
         source_model_name_or_path: Optional[str] = None,
+        decision_attention: str = "causal",
         **kwargs,
     ):
         if isinstance(text_config, dict):
@@ -59,12 +70,15 @@ class DecisionConfig(PreTrainedConfig):
             raise ValueError(f"`decision_head_dim` must be positive, got {decision_head_dim}.")
         if not 0.0 <= decision_head_dropout < 1.0:
             raise ValueError(f"`decision_head_dropout` must be in [0, 1), got {decision_head_dropout}.")
+        if decision_attention not in DECISION_ATTENTION:
+            raise ValueError(f"`decision_attention` must be one of {DECISION_ATTENTION}, got {decision_attention!r}.")
 
         self.decision_head_dim = decision_head_dim
         self.decision_head_norm = decision_head_norm
         self.decision_head_dropout = decision_head_dropout
         self.decision_head_init = decision_head_init
         self.source_model_name_or_path = source_model_name_or_path
+        self.decision_attention = decision_attention
 
         # The decision model has no LM head, so there is nothing to tie
         kwargs["tie_word_embeddings"] = False
