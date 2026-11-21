@@ -718,7 +718,8 @@ def test_keeping_topk_weights_at_the_trained_k_changes_nothing_in_bfloat16():
     hidden = torch.randn(5, HIDDEN_SIZE, generator=torch.Generator().manual_seed(SEED)).to(torch.bfloat16)
     expected, got = _routers(plain)[0](hidden), _routers(kept)[0](hidden)
     assert got[1].dtype == expected[1].dtype
-    assert torch.equal(got[1], expected[1]) and torch.equal(got[2], expected[2])
+    # All three outputs match transformers' router: the logits (which its auxiliary loss reads), weights and indices
+    assert all(torch.equal(g, e) for g, e in zip(got, expected))
     batch = {k: v.cpu() for k, v in _batch("cpu").items()}
     with torch.no_grad():
         torch.testing.assert_close(kept(**batch).log_probs, plain(**batch).log_probs, rtol=0, atol=0)
@@ -728,13 +729,13 @@ def test_fewer_active_experts_keep_their_weights_at_the_trained_k():
     model = _moe_decision_model(num_experts_per_tok=2, moe_topk_renormalize=False, moe_topk_norm_k=4)
     router = _routers(model)[0]
     hidden = torch.randn(5, HIDDEN_SIZE, generator=torch.Generator().manual_seed(SEED))
-    probs, weights, indices = router(hidden)
+    logits, weights, indices = router(hidden)
     top4, top4_indices = torch.topk(torch.softmax(hidden @ router.weight.T, dim=-1), 4, dim=-1)
     # The two experts kept get the weights they have among the top four, which sum to less than 1
     torch.testing.assert_close(weights, top4[:, :2] / top4.sum(dim=-1, keepdim=True))
     assert torch.equal(indices, top4_indices[:, :2])
     assert (weights.sum(dim=-1) < 1).all() and weights.dtype == torch.float32
-    assert probs.shape == (5, 8)
+    torch.testing.assert_close(logits, hidden @ router.weight.T)
 
 
 def test_transformers_renormalizes_fewer_active_experts_by_default():

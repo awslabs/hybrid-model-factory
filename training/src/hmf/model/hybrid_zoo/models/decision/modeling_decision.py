@@ -124,17 +124,18 @@ def _router_forward_keeping_topk_weights(self: nn.Module, hidden_states: torch.T
     """
     The forward pass of a transformers TopK router (e.g., Qwen3.5's) that weights its top_k experts by their
     probabilities divided by the sum of the top norm_k probabilities, rather than by the sum of the top_k ones (see
-    keep_topk_weights). It returns what the router returns, which is every expert's probability, the top_k weights,
-    and their indices. The weights are computed in float32 and returned in the dtype of the router's input, as
-    transformers' router returns them, since the experts multiply their outputs by them, and float32 weights would
-    make that product, on every token's every expert, run in float32.
+    keep_topk_weights). It returns what the router returns, which is every expert's logit (which transformers records
+    for the router's auxiliary loss), the top_k weights, and their indices. The weights are computed in float32 and
+    returned in the dtype of the router's input, as transformers' router returns them, since the experts multiply
+    their outputs by them, and float32 weights would make that product, on every token's every expert, run in
+    float32.
     """
     hidden_states = hidden_states.reshape(-1, self.hidden_dim)
     logits = F.linear(hidden_states, self.weight)
     probs = F.softmax(logits, dtype=torch.float, dim=-1)
     top_probs, top_indices = torch.topk(probs, max(self.top_k, self.norm_k), dim=-1)
     weights = top_probs[:, : self.top_k] / top_probs[:, : self.norm_k].sum(dim=-1, keepdim=True)
-    return probs, weights.to(logits.dtype), top_indices[:, : self.top_k]
+    return logits, weights.to(logits.dtype), top_indices[:, : self.top_k]
 
 
 def keep_topk_weights(backbone: nn.Module, norm_k: int) -> int:
