@@ -588,3 +588,173 @@ def test_bidirectional_forward_and_saved_setting(tmp_path):
 
     bidirectional.save_pretrained(tmp_path)
     assert AutoConfig.from_pretrained(tmp_path).decision_attention == "bidirectional"
+
+
+# Running from prompt lengths (seq_lens)
+
+def _flash_attention_models(name: str):
+    """
+    A causal and a bidirectional decision model with the same weights, in bfloat16, with flash attention, on
+    the GPU. Skipped without a GPU or without the flash_attn package.
+    """
+    if DEVICE != "cuda":
+        pytest.skip("flash attention needs a GPU")
+    pytest.importorskip("flash_attn")
+    torch.manual_seed(SEED)
+    text_config = ATTENTION_BACKBONES[name]()
+    causal = DecisionModel(DecisionConfig(text_config=text_config, decision_head_dim=HEAD_DIM)).eval()
+    bidirectional = DecisionModel(DecisionConfig(text_config=text_config, decision_head_dim=HEAD_DIM,
+                                                 decision_attention="bidirectional")).eval()
+    bidirectional.load_state_dict(causal.state_dict())
+    models = [model.to(DEVICE, torch.bfloat16) for model in (causal, bidirectional)]
+    # Set on the backbone once it is on the GPU in bfloat16: DecisionConfig rebuilds the text config it is
+    # given, which drops an attention implementation set on it
+    for model in models:
+        model.model.set_attn_implementation("flash_attention_2")
+    return models
+
+
+def _padded_batch(lengths, seq_len: int) -> dict:
+    """Right-padded prompts of the given lengths, each with three options and its answer marker last."""
+    generator = torch.Generator().manual_seed(SEED)
+    input_ids = torch.ones(len(lengths), seq_len, dtype=torch.long)
+    attention_mask = torch.zeros(len(lengths), seq_len, dtype=torch.long)
+    for row, length in enumerate(lengths):
+        input_ids[row, :length] = torch.randint(2, VOCAB_SIZE, (length,), generator=generator)
+        attention_mask[row, :length] = 1
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "opt_idx": torch.tensor([[length - 4, length - 3, length - 2] for length in lengths]),
+        "answer_idx": torch.tensor([length - 1 for length in lengths]),
+        "seq_lens": torch.tensor(lengths, dtype=torch.int32),
+    }
+    return {k: v.to(DEVICE) for k, v in batch.items()}
+
+
+def _log_probs(model: DecisionModel, batch: dict, varlen: bool) -> torch.Tensor:
+    inputs = dict(batch) if varlen else {k: v for k, v in batch.items() if k != "seq_lens"}
+    with torch.no_grad():
+        return model(**inputs).log_probs
+
+
+@pytest.mark.parametrize("name", list(ATTENTION_BACKBONES))
+@pytest.mark.parametrize("attention", ["causal", "bidirectional"])
+def test_varlen_matches_the_masked_forward(name, attention):
+    model = dict(zip(["causal", "bidirectional"], _flash_attention_models(name)))[attention]
+    batch = _padded_batch([16, 11, 7], seq_len=16)
+    torch.testing.assert_close(_log_probs(model, batch, varlen=True), _log_probs(model, batch, varlen=False),
+                               rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("name", list(ATTENTION_BACKBONES))
+@pytest.mark.parametrize("attention", ["causal", "bidirectional"])
+def test_varlen_ignores_padding(name, attention):
+    model = dict(zip(["causal", "bidirectional"], _flash_attention_models(name)))[attention]
+    # The same prompts padded to two lengths, as length buckets pad them, give the same answers
+    torch.testing.assert_close(_log_probs(model, _padded_batch([16, 11, 7], seq_len=32), varlen=True),
+                               _log_probs(model, _padded_batch([16, 11, 7], seq_len=16), varlen=True),
+                               rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("name", list(ATTENTION_BACKBONES))
+def test_varlen_makes_the_cpu_wait_for_nothing(name):
+    _, model = _flash_attention_models(name)
+    batch = _padded_batch([16, 11, 7], seq_len=16)
+    _log_probs(model, batch, varlen=True)  # The first pass may compile kernels and wait for them
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _log_probs(model, batch, varlen=True)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+def test_varlen_needs_flash_attention():
+    model = DecisionModel(DecisionConfig(text_config=_tiny_qwen3_config(), decision_head_dim=HEAD_DIM)).eval()
+    batch = {k: v.cpu() for k, v in _batch("cpu").items()}
+    with pytest.raises(ValueError, match="flash attention"):
+        model(**batch, seq_lens=batch["attention_mask"].sum(dim=1))
+
+
+# Fewer active experts without renormalization (moe_topk_renormalize)
+
+def _tiny_moe_config(**overrides):
+    config_cls = _require("Qwen3_5MoeTextConfig")[0]
+    kwargs = dict(
+        vocab_size=VOCAB_SIZE, hidden_size=HIDDEN_SIZE, num_hidden_layers=2, num_attention_heads=2,
+        num_key_value_heads=1, head_dim=16, moe_intermediate_size=32, shared_expert_intermediate_size=32,
+        num_experts=8, num_experts_per_tok=4, layer_types=["full_attention", "full_attention"],
+        tie_word_embeddings=True,
+    )
+    return config_cls(**{**kwargs, **overrides})
+
+
+def _moe_decision_model(**text_overrides) -> DecisionModel:
+    torch.manual_seed(SEED)
+    config = DecisionConfig(text_config=_tiny_moe_config(**text_overrides), decision_head_dim=HEAD_DIM)
+    return DecisionModel(config).eval()
+
+
+def _routers(model: DecisionModel) -> list:
+    return [m for m in model.model.modules() if type(m).__name__.endswith("TopKRouter")]
+
+
+def test_keeping_topk_weights_at_the_trained_k_changes_nothing():
+    plain = _moe_decision_model()
+    kept = _moe_decision_model(moe_topk_renormalize=False, moe_topk_norm_k=4)
+    kept.load_state_dict(plain.state_dict())
+    batch = {k: v.cpu() for k, v in _batch("cpu").items()}
+    with torch.no_grad():
+        torch.testing.assert_close(kept(**batch).log_probs, plain(**batch).log_probs, rtol=0, atol=0)
+
+
+def test_keeping_topk_weights_at_the_trained_k_changes_nothing_in_bfloat16():
+    # The experts multiply their outputs by the routing weights, so the weights must come back in the dtype
+    # transformers' router gives them, or the product runs in another precision and the answers move
+    plain = _moe_decision_model().to(torch.bfloat16)
+    kept = _moe_decision_model(moe_topk_renormalize=False, moe_topk_norm_k=4).to(torch.bfloat16)
+    kept.load_state_dict(plain.state_dict())
+    hidden = torch.randn(5, HIDDEN_SIZE, generator=torch.Generator().manual_seed(SEED)).to(torch.bfloat16)
+    expected, got = _routers(plain)[0](hidden), _routers(kept)[0](hidden)
+    assert got[1].dtype == expected[1].dtype
+    assert torch.equal(got[1], expected[1]) and torch.equal(got[2], expected[2])
+    batch = {k: v.cpu() for k, v in _batch("cpu").items()}
+    with torch.no_grad():
+        torch.testing.assert_close(kept(**batch).log_probs, plain(**batch).log_probs, rtol=0, atol=0)
+
+
+def test_fewer_active_experts_keep_their_weights_at_the_trained_k():
+    model = _moe_decision_model(num_experts_per_tok=2, moe_topk_renormalize=False, moe_topk_norm_k=4)
+    router = _routers(model)[0]
+    hidden = torch.randn(5, HIDDEN_SIZE, generator=torch.Generator().manual_seed(SEED))
+    probs, weights, indices = router(hidden)
+    top4, top4_indices = torch.topk(torch.softmax(hidden @ router.weight.T, dim=-1), 4, dim=-1)
+    # The two experts kept get the weights they have among the top four, which sum to less than 1
+    torch.testing.assert_close(weights, top4[:, :2] / top4.sum(dim=-1, keepdim=True))
+    assert torch.equal(indices, top4_indices[:, :2])
+    assert (weights.sum(dim=-1) < 1).all() and weights.dtype == torch.float32
+    assert probs.shape == (5, 8)
+
+
+def test_transformers_renormalizes_fewer_active_experts_by_default():
+    router = _routers(_moe_decision_model(num_experts_per_tok=2))[0]
+    _, weights, _ = router(torch.randn(5, HIDDEN_SIZE, generator=torch.Generator().manual_seed(SEED)))
+    torch.testing.assert_close(weights.sum(dim=-1), torch.ones(5))
+
+
+def test_keeping_topk_weights_survives_saving_and_loading(tmp_path):
+    model = _moe_decision_model(num_experts_per_tok=2, moe_topk_renormalize=False, moe_topk_norm_k=4)
+    model.save_pretrained(tmp_path)
+    loaded = AutoModel.from_pretrained(tmp_path).eval()
+    assert all(router.norm_k == 4 for router in _routers(loaded)) and len(_routers(loaded)) == 2
+    batch = {k: v.cpu() for k, v in _batch("cpu").items()}
+    with torch.no_grad():
+        torch.testing.assert_close(loaded(**batch).log_probs, model(**batch).log_probs)
+
+
+def test_keeping_topk_weights_needs_a_mixture_of_experts():
+    config = _tiny_qwen3_config()
+    config.moe_topk_renormalize = False
+    with pytest.raises(ValueError, match="no TopK routers"):
+        DecisionModel(DecisionConfig(text_config=config, decision_head_dim=HEAD_DIM))

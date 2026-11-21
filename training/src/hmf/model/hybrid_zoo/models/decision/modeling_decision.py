@@ -17,14 +17,28 @@ left to right, no real position ever reads a pad, and the padding mask changes n
 HMF's hybrid backbones are therefore run without it (see uses_padding_mask), as their sequence
 mixers do not all accept one (e.g. GKA refuses a padding mask in eval mode).
 
+Given each prompt's length (seq_lens), a stock backbone with flash attention runs without a mask at all.
+Its attention layers get each prompt's boundaries instead (see varlen_kwargs), computed from the lengths
+on the GPU, and its recurrent layers (Qwen3.5's Gated DeltaNet) read the right-padded prompts as they
+are. Building a padding mask, and transformers' checks of the mask, read values back from the GPU and
+make the CPU wait for it, which a CUDA graph cannot record. This path needs no such reads.
+
 With sequence parallelism, every rank of a sequence parallel group is given the same batch. Each
 rank runs the backbone on its zig-zag chunks of the prompts (see zigzag_local), and then gathers the
 backbone's hidden states of the whole prompts. Every rank therefore computes the head and the loss
 on the same hidden states, as without sequence parallelism. tests/decision/model/decision_sp_parity.py
 checks this against the same models without sequence parallelism.
+
+A mixture-of-experts backbone (e.g., Qwen3.5's) can run with fewer active experts per token than it was trained
+with, by lowering num_experts_per_tok in its config. Transformers' routers then renormalize the weights of the
+experts they keep to sum to 1, which scales them up. With moe_topk_renormalize: false in the backbone's config, the
+routers instead divide by the sum of the top moe_topk_norm_k weights (8 by default, the number Qwen3.5's and
+Qwen3.6's mixtures of experts are trained with), so that each kept expert has exactly the weight it has at
+moe_topk_norm_k experts (see keep_topk_weights).
 """
 
 import contextlib
+import types
 from dataclasses import dataclass
 from typing import Any, Generator, Optional
 
@@ -43,6 +57,9 @@ from .configuration_decision import DecisionConfig
 # A large negative value rather than -inf for masked logits, which keeps the softmax finite even if a
 # malformed row has every option masked.
 MASK_VALUE = -1e4
+
+# The arguments that give transformers' flash attention the prompts' boundaries (see varlen_kwargs)
+VARLEN_KWARGS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
 
 # The package of HMF's hybrid models (hmf.model.hybrid_zoo)
 HYBRID_ZOO_PACKAGE = __name__.split(".models.decision.")[0]
@@ -77,6 +94,85 @@ def zigzag_local(tensor: torch.Tensor, sp_rank: int, sp_size: int) -> torch.Tens
     """
     chunks = tensor.chunk(2 * sp_size, dim=1)
     return torch.cat([chunks[i] for i in get_zigzag_indices(sp_size, 2 * sp_size)[sp_rank]], dim=1)
+
+
+def varlen_kwargs(seq_lens: torch.Tensor, seq_len: int) -> dict:
+    """
+    The arguments that tell flash attention where each right-padded prompt starts and ends, so that it
+    needs no mask. Flash attention reads the batch as one sequence of batch * seq_len tokens split at
+    these boundaries, and each row's padding is a sequence of its own (empty when a row has none), so
+    no real token attends to padding and no padding token to a real one. Everything is computed on the
+    GPU, without reading anything back.
+
+    Args:
+        seq_lens: Each prompt's length without padding, of shape [batch], on the model's device.
+        seq_len: The padded length of the batch.
+
+    Returns:
+        cu_seq_lens_q, cu_seq_lens_k, max_length_q and max_length_k, as transformers' flash attention
+        takes them.
+    """
+    batch = seq_lens.size(0)
+    starts = torch.arange(batch, device=seq_lens.device, dtype=torch.int32) * seq_len
+    bounds = torch.stack([starts, starts + seq_lens.to(torch.int32)], dim=1).flatten()
+    end = torch.full((1,), batch * seq_len, device=seq_lens.device, dtype=torch.int32)
+    cu_seq_lens = torch.cat([bounds, end])
+    return dict(zip(VARLEN_KWARGS, (cu_seq_lens, cu_seq_lens, seq_len, seq_len)))
+
+
+def _router_forward_keeping_topk_weights(self: nn.Module, hidden_states: torch.Tensor) -> tuple:
+    """
+    The forward pass of a transformers TopK router (e.g., Qwen3.5's) that weights its top_k experts by their
+    probabilities divided by the sum of the top norm_k probabilities, rather than by the sum of the top_k ones (see
+    keep_topk_weights). It returns what the router returns, which is every expert's probability, the top_k weights,
+    and their indices. The weights are computed in float32 and returned in the dtype of the router's input, as
+    transformers' router returns them, since the experts multiply their outputs by them, and float32 weights would
+    make that product, on every token's every expert, run in float32.
+    """
+    hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+    logits = F.linear(hidden_states, self.weight)
+    probs = F.softmax(logits, dtype=torch.float, dim=-1)
+    top_probs, top_indices = torch.topk(probs, max(self.top_k, self.norm_k), dim=-1)
+    weights = top_probs[:, : self.top_k] / top_probs[:, : self.norm_k].sum(dim=-1, keepdim=True)
+    return probs, weights.to(logits.dtype), top_indices[:, : self.top_k]
+
+
+def keep_topk_weights(backbone: nn.Module, norm_k: int) -> int:
+    """
+    Makes every TopK router of a mixture-of-experts backbone give its active experts the weights they would have
+    among the top norm_k experts, instead of renormalizing them to sum to 1. With fewer active experts than norm_k,
+    the experts kept then contribute exactly as they do at norm_k, and the ones left out contribute nothing. With
+    norm_k active experts, the routers behave exactly as transformers' do.
+
+    Args:
+        backbone: The backbone, whose routers are modules named *TopKRouter, with top_k, hidden_dim, and weight.
+        norm_k: The number of top experts whose weights sum to 1, which is the number the model was trained with.
+
+    Returns:
+        The number of routers changed.
+    """
+    routers = [m for m in backbone.modules() if type(m).__name__.endswith("TopKRouter")]
+    if not routers:
+        raise ValueError(f"moe_topk_renormalize is false, but {type(backbone).__name__} has no TopK routers.")
+    for router in routers:
+        missing = [name for name in ("top_k", "hidden_dim", "weight") if not hasattr(router, name)]
+        if missing:
+            raise ValueError(
+                f"{type(router).__name__} has no {', '.join(missing)}, so it cannot keep its top-k weights."
+            )
+        router.norm_k = norm_k
+        router.forward = types.MethodType(_router_forward_keeping_topk_weights, router)
+    return len(routers)
+
+
+def _drop_varlen_kwargs(module: nn.Module, args: tuple, kwargs: dict) -> tuple:
+    """
+    A forward pre-hook for a recurrent layer (Qwen3.5's Gated DeltaNet) that removes the prompts' boundaries
+    (see varlen_kwargs). Given boundaries, its kernels lay out their chunks on the CPU, which makes the CPU
+    wait for the GPU. Without them, the layer reads each right-padded prompt left to right, so no real token
+    reads a pad.
+    """
+    return args, {k: v for k, v in kwargs.items() if k not in VARLEN_KWARGS}
 
 
 @dataclass
@@ -241,6 +337,8 @@ class DecisionModel(PreTrainedModel):
             )
         # Set by the training workflow when sequence parallelism is enabled
         self.sequence_parallel_group = None
+        if getattr(config.text_config, "moe_topk_renormalize", True) is False:
+            keep_topk_weights(self.model, getattr(config.text_config, "moe_topk_norm_k", 8))
 
         self.post_init()
 
@@ -343,6 +441,7 @@ class DecisionModel(PreTrainedModel):
         opt_idx: torch.LongTensor,
         answer_idx: torch.LongTensor,
         position_ids: Optional[torch.LongTensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> DecisionModelOutput:
         """
@@ -351,16 +450,35 @@ class DecisionModel(PreTrainedModel):
                 parallelism, every rank of the group is given the same whole prompts, and seq_len
                 must be a multiple of 2 * sequence_parallel_size.
             attention_mask: Attention mask of shape [batch, seq_len]. Not passed to HMF's hybrid
-                backbones (see uses_padding_mask), nor to any backbone with sequence parallelism.
+                backbones (see uses_padding_mask), nor to any backbone with sequence parallelism,
+                nor read when seq_lens is given.
             opt_idx: Position of the last token of each option's line, of shape
                 [batch, num_options]. Rows with fewer options are padded with -1.
             answer_idx: Position of the answer marker, of shape [batch].
             position_ids: Optional position ids of shape [batch, seq_len].
+            seq_lens: Optional length of each prompt without padding, of shape [batch], on the model's
+                device. Given, the backbone runs without a mask and makes the CPU wait for nothing (see
+                the module's docstring). It needs a stock backbone with flash attention, and no
+                sequence parallelism.
             kwargs: Passed to the backbone.
 
         Returns:
             A DecisionModelOutput with the option logits and log-probabilities.
         """
+        if seq_lens is not None:
+            self._check_varlen()
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=None,
+                position_ids=position_ids,
+                use_cache=False,
+                return_dict=True,
+                **varlen_kwargs(seq_lens, input_ids.size(1)),
+                **({"is_causal": False} if self.config.decision_attention == "bidirectional" else {}),
+                **kwargs,
+            )
+            return self._head_outputs(outputs.last_hidden_state, opt_idx, answer_idx)
+
         if not self.pass_attention_mask:
             attention_mask = None
 
@@ -398,7 +516,42 @@ class DecisionModel(PreTrainedModel):
         if group is not None:
             # Every rank gathers the hidden states of the whole prompts, which answer_idx and opt_idx index
             hidden_states = ZigZagGatherScatter.apply(hidden_states, group, sp_rank, sp_size, 2 * sp_size)
+        return self._head_outputs(hidden_states, opt_idx, answer_idx)
 
+    def _check_varlen(self) -> None:
+        """
+        Raises if the model cannot run from prompt lengths (seq_lens) instead of a mask, and the first time
+        it can, keeps the prompts' boundaries away from its recurrent layers (see _drop_varlen_kwargs).
+        """
+        attn_implementation = getattr(self.model.config, "_attn_implementation", None) or ""
+        if not self.pass_attention_mask or not attn_implementation.startswith("flash_attention"):
+            raise ValueError(
+                f"seq_lens needs a stock Hugging Face backbone with flash attention, and {type(self.model).__name__} "
+                f"uses {attn_implementation or 'no attention implementation'}."
+            )
+        if self.sequence_parallel_group is not None:
+            raise ValueError("seq_lens does not support sequence parallelism.")
+        if not getattr(self, "_varlen_hooks_added", False):
+            for layer in getattr(self.model, "layers", []):
+                if getattr(layer, "linear_attn", None) is not None:
+                    layer.linear_attn.register_forward_pre_hook(_drop_varlen_kwargs, with_kwargs=True)
+            self._varlen_hooks_added = True
+
+    def _head_outputs(
+        self, hidden_states: torch.Tensor, opt_idx: torch.LongTensor, answer_idx: torch.LongTensor
+    ) -> DecisionModelOutput:
+        """
+        The pointer head's outputs from the backbone's hidden states.
+
+        Args:
+            hidden_states: The backbone's last hidden states, of shape [batch, seq_len, hidden_size].
+            opt_idx: Position of the last token of each option's line, of shape [batch, num_options],
+                padded with -1.
+            answer_idx: Position of the answer marker, of shape [batch].
+
+        Returns:
+            A DecisionModelOutput with the option logits and log-probabilities.
+        """
         batch_idx = torch.arange(hidden_states.size(0), device=hidden_states.device)
         answer_states = hidden_states[batch_idx, answer_idx]  # [batch, hidden_size]
 
