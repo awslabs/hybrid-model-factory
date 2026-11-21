@@ -1,0 +1,11 @@
+# Convert Qwen3.5-2B-Base to a decision model with a label head, which keeps its language model's head's rows of
+# the letter codes' tokens (A, B, ...), so that before training it answers as the language model would with its
+# next token. Its data must be tokenized with decision_option_labels: letters.
+# hmf decision-init examples/decision/init/qwen3_5_2b/label.yaml
+base_model_name_or_path: Qwen/Qwen3.5-2B-Base
+dtype: bf16                     # The backbone's dtype, while the head is always stored in float32
+decision_head_type: label       # Or label_trained (the rows train), or label_pointer (plus a pointer that starts at 0)
+decision_head_init: auto        # lm_head for the label heads: the language model's rows of the letter codes' tokens
+decision_attention: causal      # The language model's head was trained to read causal hidden states
+seed: null                      # Seeds the pointer of a label_pointer head
+output_dir: ./models/Qwen3.5-2B-Base-Decision-Label

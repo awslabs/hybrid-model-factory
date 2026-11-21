@@ -14,6 +14,15 @@ The decision model reads the hidden state at the last token of each option's lin
 answer marker (see model/hybrid_zoo/models/decision/), so encode_decision_prompt maps those
 character spans to token positions.
 
+Each option's line starts with a label, which is its number (1, 2, ...) by default. With
+decision_option_labels: letters, the labels are letter codes instead, A to Z and then the two-letter
+codes that the tokenizer reads as one token (see letter_codes). Every letter code is one token when
+encoded on its own, so a causal LM can answer any question with the next token after the answer
+marker, which the label heads of decision models read (see model/hybrid_zoo/models/decision/). That
+token is exactly the model's own for tokenizers that add no space marker before a word, such as
+Qwen's, while a tokenizer that encodes "A" alone as "▁A" may predict another token after the marker.
+Numbers from 10 on are two tokens for most tokenizers.
+
 Training and inference must use the same format, so both go through this module.
 """
 
@@ -31,6 +40,9 @@ DECISION_KINDS = ("noul", "choice", "score")
 
 # A noul question always renders both options, in this order, so canonical index 0 is "false"
 NOUL_OPTION_NAMES = ("false", "true")
+
+# How each option's line is labeled (decision_option_labels)
+OPTION_LABELS = ("numbers", "letters")
 
 
 @dataclass(frozen=True)
@@ -64,6 +76,54 @@ class EncodedPrompt:
     input_ids: List[int]
     opt_idx: List[int]
     answer_idx: int
+
+
+def single_token_id(tokenizer: "PreTrainedTokenizer", text: str) -> Optional[int]:
+    """The token of text, or None if text is not a single known token that decodes back to itself."""
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) != 1 or ids[0] == tokenizer.unk_token_id or tokenizer.decode(ids) != text:
+        return None
+    return ids[0]
+
+
+def letter_codes(tokenizer: "PreTrainedTokenizer") -> List[str]:
+    """
+    The letter codes of a tokenizer, which are A to Z, followed by the two-letter codes AA, AB, ..., ZZ that it
+    reads as one token, in that order. Qwen3.5's tokenizer has 588 of them (all 26 letters and 562 of the 676
+    two-letter codes).
+    """
+    letters = [chr(ord("A") + i) for i in range(26)]
+    codes = [a for a in letters if single_token_id(tokenizer, a) is not None]
+    if len(codes) < len(letters):
+        raise ValueError("Letter labels need a tokenizer that reads each of the letters A to Z as one token.")
+    return codes + [a + b for a in letters for b in letters if single_token_id(tokenizer, a + b) is not None]
+
+
+class OptionLabels:
+    """
+    The labels of a question's options in the order the prompt shows them (decision_option_labels), which are
+    their numbers (1, 2, ...) or the tokenizer's letter codes (see letter_codes).
+
+    Args:
+        name: One of OPTION_LABELS.
+        tokenizer: The tokenizer the prompts are read with. Needed for letters.
+    """
+
+    def __init__(self, name: str, tokenizer: Optional["PreTrainedTokenizer"] = None):
+        if name not in OPTION_LABELS:
+            raise ValueError(f"Unknown decision_option_labels '{name}'. Supported values: {list(OPTION_LABELS)}")
+        if name == "letters" and tokenizer is None:
+            raise ValueError("Letter labels depend on the tokenizer, so OptionLabels needs one.")
+        self.name = name
+        self.codes = letter_codes(tokenizer) if name == "letters" else None
+
+    def __call__(self, num_options: int) -> List[str]:
+        """The labels of num_options options."""
+        if self.codes is None:
+            return [str(k + 1) for k in range(num_options)]
+        if num_options > len(self.codes):
+            raise ValueError(f"A question has {num_options} options, more than the {len(self.codes)} letter codes.")
+        return self.codes[:num_options]
 
 
 def render_content(content: Any) -> str:
@@ -111,6 +171,7 @@ class DecisionPromptFormat(ABC):
         kind: str,
         options: Sequence[Tuple[str, Optional[str]]],
         option_order: Optional[Sequence[int]] = None,
+        labels: Optional[Sequence[str]] = None,
     ) -> RenderedPrompt:
         """
         Renders a decision row.
@@ -124,6 +185,8 @@ class DecisionPromptFormat(ABC):
             option_order: A permutation of the option indices: option_order[k] is the canonical
                 index of the option shown at position k. If None, options are shown in canonical
                 order.
+            labels: The label of each position's option (see OptionLabels). If None, the options are
+                numbered from 1 (option_label).
 
         Returns:
             The RenderedPrompt.
@@ -198,6 +261,7 @@ class StrandsPromptFormat(DecisionPromptFormat):
         kind: str,
         options: Sequence[Tuple[str, Optional[str]]],
         option_order: Optional[Sequence[int]] = None,
+        labels: Optional[Sequence[str]] = None,
     ) -> Tuple[str, str, Tuple[Tuple[int, int], ...]]:
         """
         The state block, the question block (with its options), and each option line's span within the question
@@ -208,16 +272,19 @@ class StrandsPromptFormat(DecisionPromptFormat):
             if sorted(option_order) != list(range(len(pairs))):
                 raise ValueError(f"option_order must be a permutation of range({len(pairs)}), got {option_order}")
             pairs = [pairs[i] for i in option_order]
+        if labels is not None and len(labels) < len(pairs):
+            raise ValueError(f"{len(labels)} labels for {len(pairs)} options")
 
         state_block = f"<state>\n{render_content(state)}\n</state>\n"
         question = f'<question type="{kind}">\n{cls.HEADERS[kind]}\n{render_content(instructions)}\n<options>\n'
 
-        # One line per option, numbered from 1. Descriptions are collapsed to a single line so each
-        # option's span is exactly one line.
+        # One line per option, starting with its label. Descriptions are collapsed to a single line so
+        # each option's span is exactly one line.
         option_spans = []
         for i, (name, desc) in enumerate(pairs):
             desc = " ".join(desc.split())
-            line = f"{cls.option_label(i)}. {name}" + (f" — {desc}" if desc else "")
+            label = labels[i] if labels is not None else cls.option_label(i)
+            line = f"{label}. {name}" + (f" — {desc}" if desc else "")
             if i > 0:
                 question += "\n"
             option_spans.append((len(question), len(question) + len(line)))
@@ -247,8 +314,9 @@ class StrandsPromptFormat(DecisionPromptFormat):
         kind: str,
         options: Sequence[Tuple[str, Optional[str]]],
         option_order: Optional[Sequence[int]] = None,
+        labels: Optional[Sequence[str]] = None,
     ) -> RenderedPrompt:
-        state_block, question, spans = cls.blocks(state, instructions, kind, options, option_order)
+        state_block, question, spans = cls.blocks(state, instructions, kind, options, option_order, labels)
         return cls.assemble([state_block, question], 1, spans)
 
 
@@ -275,8 +343,9 @@ class QuestionFirstPromptFormat(StrandsPromptFormat):
         kind: str,
         options: Sequence[Tuple[str, Optional[str]]],
         option_order: Optional[Sequence[int]] = None,
+        labels: Optional[Sequence[str]] = None,
     ) -> RenderedPrompt:
-        state_block, question, spans = cls.blocks(state, instructions, kind, options, option_order)
+        state_block, question, spans = cls.blocks(state, instructions, kind, options, option_order, labels)
         return cls.assemble([question, state_block], 0, spans)
 
 
@@ -298,8 +367,9 @@ class ReadTwicePromptFormat(StrandsPromptFormat):
         kind: str,
         options: Sequence[Tuple[str, Optional[str]]],
         option_order: Optional[Sequence[int]] = None,
+        labels: Optional[Sequence[str]] = None,
     ) -> RenderedPrompt:
-        state_block, question, spans = cls.blocks(state, instructions, kind, options, option_order)
+        state_block, question, spans = cls.blocks(state, instructions, kind, options, option_order, labels)
         return cls.assemble([state_block, question, state_block, question], 3, spans)
 
 

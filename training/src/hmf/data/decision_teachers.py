@@ -32,7 +32,15 @@ import torch
 
 from ..extras import logging
 from .data_utils import flatten_decision_row
-from .decision_prompt import NOUL_OPTION_NAMES, encode_decision_prompt, get_prompt_format
+from .decision_prompt import (
+    NOUL_OPTION_NAMES,
+    OPTION_LABELS,
+    OptionLabels,
+    RenderedPrompt,
+    encode_decision_prompt,
+    get_prompt_format,
+    single_token_id,
+)
 
 
 if TYPE_CHECKING:
@@ -150,9 +158,7 @@ class CausalLMScorer:
     def label_id(self, label: str) -> Optional[int]:
         """The token of a label, or None if the label is not a single token that decodes back to itself."""
         if label not in self._label_ids:
-            ids = self.tokenizer.encode(label, add_special_tokens=False)
-            ok = len(ids) == 1 and ids[0] != self.tokenizer.unk_token_id and self.tokenizer.decode(ids) == label
-            self._label_ids[label] = ids[0] if ok else None
+            self._label_ids[label] = single_token_id(self.tokenizer, label)
         return self._label_ids[label]
 
     @torch.no_grad()
@@ -241,34 +247,53 @@ class TeacherPrompt(ABC):
 
 class DecisionTeacherPrompt(TeacherPrompt):
     """
-    The decision prompt the student trains on (decision_prompt_format), with the options in original
-    order and the question's original phrasing. The teacher answers with the options' labels in
-    that format (1, 2, ...) after the answer marker. Suits any causal LM, including base models.
+    The decision prompt the student trains on (decision_prompt_format and decision_option_labels), with
+    the options in original order and the question's original phrasing. The teacher answers with the
+    options' labels (1, 2, ... or A, B, ...) after the answer marker. Suits any causal LM, including
+    base models.
 
     Args:
         prompt_format: The prompt format's name.
         force_bos: Whether to start the prompt with the BOS token (see decision_force_bos).
+        option_labels: How the options are labeled, "numbers" or "letters" (see decision_option_labels).
+            Defaults to "numbers".
     """
 
-    def __init__(self, prompt_format: str, force_bos: bool = False):
+    def __init__(self, prompt_format: str, force_bos: bool = False, option_labels: str = "numbers"):
         self.prompt_format = get_prompt_format(prompt_format)
         self.force_bos = force_bos
+        self.option_labels = option_labels
+        if option_labels not in OPTION_LABELS:
+            raise ValueError(f"Unknown option_labels '{option_labels}'. Supported values: {list(OPTION_LABELS)}")
+        self._labels: Dict[int, OptionLabels] = {}  # by tokenizer, as letter codes depend on it
 
     @classmethod
     def from_data_args(cls, data_args: "DataArguments") -> "DecisionTeacherPrompt":
-        return cls(data_args.decision_prompt_format, data_args.decision_force_bos)
+        return cls(data_args.decision_prompt_format, data_args.decision_force_bos, data_args.decision_option_labels)
+
+    def labels(self, tokenizer: "PreTrainedTokenizer", num_options: int) -> List[str]:
+        """The labels of a question's num_options options, in the order the prompt shows them."""
+        if id(tokenizer) not in self._labels:
+            self._labels[id(tokenizer)] = OptionLabels(self.option_labels, tokenizer)
+        return self._labels[id(tokenizer)](num_options)
+
+    def render(self, tokenizer: "PreTrainedTokenizer", row: Dict[str, Any]) -> RenderedPrompt:
+        """A flat row (see flatten_decision_row, options as tuples) rendered in original order."""
+        num_options = len(NOUL_OPTION_NAMES) if row["kind"] == "noul" else len(row["options"])
+        return self.prompt_format.render(
+            row["state"], row["instructions"], row["kind"], row["options"], labels=self.labels(tokenizer, num_options)
+        )
 
     def encode(self, tokenizer: "PreTrainedTokenizer", row: Dict[str, Any]) -> "EncodedPrompt":
         """The row rendered as in training, in original order, and tokenized."""
         row = flatten_decision_row(row)
-        options = [tuple(option) for option in row["options"] or []]
-        rendered = self.prompt_format.render(row["state"], row["instructions"], row["kind"], options)
-        return encode_decision_prompt(tokenizer, rendered, force_bos=self.force_bos)
+        row["options"] = [tuple(option) for option in row["options"] or []]
+        return encode_decision_prompt(tokenizer, self.render(tokenizer, row), force_bos=self.force_bos)
 
     def build(self, tokenizer: "PreTrainedTokenizer", row: Dict[str, Any]) -> Optional[TeacherQuery]:
         encoded = self.encode(tokenizer, row)
         num_options = len(encoded.opt_idx)
-        labels = [self.prompt_format.option_label(k) for k in range(num_options)]
+        labels = self.labels(tokenizer, num_options)
         return TeacherQuery(ScoringQuery(encoded.input_ids, encoded.answer_idx, labels), list(range(num_options)))
 
 
@@ -415,6 +440,8 @@ class DecisionModelTeacher:
         prompt_format: The prompt format's name. Defaults to "strands".
         force_bos: Whether to start prompts with the BOS token (see decision_force_bos). Defaults to
             False.
+        option_labels: How the options are labeled, "numbers" or "letters" (see decision_option_labels).
+            A model with a label head reads letters only. Defaults to "numbers".
         max_len: Prompts longer than this many tokens get no teacher. Defaults to None (no limit).
         dtype: The model's dtype. Defaults to bfloat16 on GPU and float32 on CPU.
         attn_implementation: The backbone's attention implementation. Defaults to transformers' default, and
@@ -435,6 +462,7 @@ class DecisionModelTeacher:
         dtype: Optional[torch.dtype] = None,
         attn_implementation: Optional[str] = None,
         cuda_graphs: bool = False,
+        option_labels: str = "numbers",
     ):
         from transformers import AutoModel, AutoTokenizer
 
@@ -453,7 +481,13 @@ class DecisionModelTeacher:
             # Merging folds the LoRA weights into the backbone and puts the trained head in place
             model = PeftModel.from_pretrained(model, adapter_name_or_path).merge_and_unload()
         self.model = model.to(device).eval()
-        self.prompt = DecisionTeacherPrompt(prompt_format, force_bos)
+        head_labels = getattr(self.model.config, "decision_option_labels", None)
+        if head_labels is not None and option_labels != head_labels:
+            raise ValueError(
+                f"{model_name_or_path} has a {self.model.config.decision_head_type} head, which reads options labeled "
+                f"with {head_labels}, so it cannot be asked with option_labels={option_labels!r}."
+            )
+        self.prompt = DecisionTeacherPrompt(prompt_format, force_bos, option_labels)
         self.max_len = max_len
         self.pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         self.graphs = None
@@ -534,7 +568,11 @@ def load_teacher_model(data_args: "DataArguments", device: str):
     """
     path = data_args.decision_teacher_model
     if is_decision_model(path):
+        from transformers import AutoConfig
+
         logger.info_rank0(f"Teacher: the decision model {path}.")
+        # A teacher with a label head reads its own labels, and its answers come in original order whatever the labels
+        head_labels = getattr(AutoConfig.from_pretrained(path), "decision_option_labels", None)
         return DecisionModelTeacher(
             path,
             device,
@@ -542,6 +580,7 @@ def load_teacher_model(data_args: "DataArguments", device: str):
             prompt_format=data_args.decision_prompt_format,
             force_bos=data_args.decision_force_bos,
             max_len=data_args.decision_teacher_max_len,
+            option_labels=head_labels or data_args.decision_option_labels,
         )
 
     if data_args.decision_teacher_adapter is not None:

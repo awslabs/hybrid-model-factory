@@ -10,7 +10,8 @@ Values on the command line (key=value, e.g. jevbench.max_len=3072) override the 
     model_name_or_path: the decision model (required)
     adapter_name_or_path: its LoRA adapter (the training output_dir), if any
     output_dir: where the reports go (required)
-    max_len, prompt_format, force_bos, ordinal_smoothing, seed, dataset_dir: as for calibrate and evaluate
+    max_len, prompt_format, force_bos, option_labels, ordinal_smoothing, seed, dataset_dir: as for calibrate and
+    evaluate
     cuda_graphs: whether the model answers through CUDA graphs (see graphs.py), false by default
     calibration: {dataset or data, split, limit, method, gate}: fitted first, and used by everything after;
         gate, optional, holds the gate settings (rule, target, params, take_options, min_count,
@@ -273,7 +274,7 @@ def run_suite(path: str, *overrides: str) -> Dict[str, Any]:
     model, adapter, output_dir = suite["model_name_or_path"], suite.get("adapter_name_or_path"), suite["output_dir"]
     dataset_dir = suite.get("dataset_dir", "data")
     # Settings the suite leaves out come from the model's decision_prompt.json, else the defaults (see predictor.py)
-    options = {key: suite.get(key, AUTO) for key in ("prompt_format", "force_bos", "max_len")}
+    options = {key: suite.get(key, AUTO) for key in ("prompt_format", "force_bos", "max_len", "option_labels")}
     jevbench = suite.get("jevbench")
     # Every check before the first model is loaded
     calibration_data = resolve_data(suite["calibration"], dataset_dir) if suite.get("calibration") else None

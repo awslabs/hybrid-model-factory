@@ -187,7 +187,7 @@ class DecisionServer:
         self.raw = raw
         self.strict_window = strict_window
         self.tokenizer = predictor.model.tokenizer
-        self.prompt = predictor.model.prompt  # the prompt format and force_bos, as in training
+        self.prompt = predictor.model.prompt  # the prompt format, force_bos, and option labels, as in training
         self.max_len = max_len or predictor.max_len
         self.ordinal_smoothing = (predictor.calibration or {}).get("ordinal_smoothing", DEFAULT_ORDINAL_SMOOTHING)
         source = predictor.adapter_name_or_path or predictor.model_name_or_path
@@ -222,8 +222,7 @@ class DecisionServer:
         """A question's prompt, and its row (state, instructions, kind, and options), for shortening it if needed."""
         flat = flatten_decision_row(row)
         flat["options"] = [tuple(option) for option in flat["options"] or []]
-        rendered = self.prompt.prompt_format.render(flat["state"], flat["instructions"], flat["kind"], flat["options"])
-        return rendered, flat
+        return self.prompt.render(self.tokenizer, flat), flat
 
     def _encode(self, rendered: List[RenderedPrompt], rows: List[Dict[str, Any]]) -> List[EncodedPrompt]:
         """The questions' prompts as model inputs, shortened to the window if they do not fit."""
@@ -247,7 +246,7 @@ class DecisionServer:
 
         def encode(num_tokens: int) -> EncodedPrompt:
             cut = state[: offsets[num_tokens - 1][1]] if num_tokens > 0 else ""
-            rendered = self.prompt.prompt_format.render(cut, row["instructions"], row["kind"], row["options"])
+            rendered = self.prompt.render(self.tokenizer, {**row, "state": cut})
             return encode_decision_prompt(self.tokenizer, rendered, force_bos=self.prompt.force_bos)
 
         best = encode(0)
@@ -432,6 +431,7 @@ def serve(
     max_len: Union[int, str] = AUTO,
     prompt_format: str = AUTO,
     force_bos: Union[bool, str] = AUTO,
+    option_labels: str = AUTO,
     model_name: Optional[str] = None,
     device: Optional[str] = None,
     cuda_graphs: bool = False,
@@ -459,6 +459,8 @@ def serve(
             the model's, else "strands".
         force_bos: Whether prompts start with the BOS token (decision_force_bos in training).
             Defaults to "auto", the model's, else False.
+        option_labels: How the options are labeled, "numbers" or "letters" (decision_option_labels in training).
+            Defaults to "auto", the model's, else the labels its head reads.
         model_name: The name replies give as their model. Defaults to the adapter's folder name, else
             the model's.
         device: Where to run the model. Defaults to the first GPU if there is one, else the CPU.
@@ -476,7 +478,7 @@ def serve(
 
     predictor = DecisionPredictor(
         model_name_or_path, adapter_name_or_path, device=device, prompt_format=prompt_format, force_bos=force_bos,
-        max_len=max_len, calibration=calibration, cuda_graphs=cuda_graphs,
+        max_len=max_len, option_labels=option_labels, calibration=calibration, cuda_graphs=cuda_graphs,
     )
     graphs = predictor.model.graphs
     if graphs is not None:

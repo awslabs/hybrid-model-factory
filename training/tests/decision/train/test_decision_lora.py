@@ -306,7 +306,9 @@ def test_export_merges_into_a_decision_checkpoint(
     assert not any("lora_" in key or "modules_to_save" in key for key in keys)
     assert {dtype for key, dtype in keys.items() if key.startswith("decision_head.")} == {"F32"}
     with open(os.path.join(export_dir, PROMPT_FILE)) as f:
-        assert json.load(f) == {"prompt_format": "read_twice", "force_bos": False, "max_len": 8192}
+        assert json.load(f) == {
+            "prompt_format": "read_twice", "force_bos": False, "max_len": 8192, "option_labels": "numbers"
+        }
     with open(os.path.join(export_dir, CALIBRATION_FILE)) as f:
         assert json.load(f)["temperature"] == 1.5
 

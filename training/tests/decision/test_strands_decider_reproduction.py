@@ -434,7 +434,7 @@ def test_strands_checkpoint_converts_to_an_adapter(trained, tmp_path):
     assert not (output_dir / "adapter" / "decision_calibration.json").exists()  # The checkpoint is uncalibrated
     # Its prompt settings are Strands Decider's strands format, with the checkpoint's BOS setting and window
     settings = json.loads((output_dir / "adapter" / "decision_prompt.json").read_text())
-    assert settings == {"prompt_format": "strands", "force_bos": False, "max_len": 4096}
+    assert settings == {"prompt_format": "strands", "force_bos": False, "max_len": 4096, "option_labels": "numbers"}
     with open(output_dir / "adapter" / "adapter_config.json") as f:
         adapter_config = json.load(f)
     assert adapter_config["base_model_name_or_path"] == str(output_dir / "model")

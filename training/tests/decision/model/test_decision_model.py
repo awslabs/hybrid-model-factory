@@ -224,7 +224,8 @@ def test_load_config(tmp_path):
 
     assert config.dtype == torch.bfloat16
     assert config.seed == 3
-    assert config.decision_head_init == "random"
+    assert config.decision_head_type == "pointer"
+    assert config.decision_head_init == "auto"
 
     path.write_text(yaml.safe_dump({"base_model_name_or_path": "a", "output_dir": "b", "head_dim": 8}))
     with pytest.raises(ValueError, match="head_dim"):

@@ -536,6 +536,7 @@ Tokenize decision data with `hmf preprocess` and `stage: decision` (see [example
 | `decision_vary_instructions` | true | Sample among a row's phrasings of the question. |
 | `decision_ordinal_smoothing` | 0.1 | Target mass moved to the neighboring levels of `score` rows. |
 | `decision_force_bos` | false | Start prompts with the BOS token if the tokenizer does not add it. |
+| `decision_option_labels` | `numbers` | How each option's line is labeled: `numbers` (1, 2, ...) or `letters` (A to Z, then the two-letter codes that the tokenizer reads as one token, e.g., 588 codes for Qwen3.5). Every letter code is one token when encoded on its own, so a language model can answer with it, and for tokenizers that add no space marker before a word, such as Qwen's, that token is exactly the one the model predicts. Decision models with a label head (`decision_head_type: label`, `label_trained`, or `label_pointer`, which read the language model's scores for these codes) need `letters`. |
 
 With `val_size`, the validation split is held out per task and rendered once, without augmentation. Prompts longer than `cutoff_len` are dropped. `seed` sets both the validation split and the augmentations.
 

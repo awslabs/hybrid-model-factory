@@ -20,7 +20,7 @@ from hmf.train.tuner import _copy_decision_files
 
 
 def _resolve(model, adapter=None, **given):
-    settings = {"prompt_format": AUTO, "force_bos": AUTO, "max_len": AUTO}
+    settings = {"prompt_format": AUTO, "force_bos": AUTO, "max_len": AUTO, "option_labels": AUTO}
     settings.update(given)
     return resolve_prompt_settings(str(model), str(adapter) if adapter else None, **settings)
 
@@ -32,7 +32,9 @@ def test_a_model_without_the_file_gets_the_defaults(tmp_path):
 def test_saved_settings_are_used(tmp_path):
     save_prompt_settings(str(tmp_path), "read_twice", True, 8192)
 
-    assert _resolve(tmp_path) == {"prompt_format": "read_twice", "force_bos": True, "max_len": 8192}
+    assert _resolve(tmp_path) == {
+        "prompt_format": "read_twice", "force_bos": True, "max_len": 8192, "option_labels": "numbers"
+    }
 
 
 def test_adapter_settings_come_from_the_adapter_folder(tmp_path):
@@ -54,10 +56,25 @@ def test_a_value_given_is_used_and_warned_about_if_it_differs(tmp_path, monkeypa
 
     settings = _resolve(tmp_path, prompt_format="strands", max_len=None)
 
-    assert settings == {"prompt_format": "strands", "force_bos": False, "max_len": None}
+    assert settings == {"prompt_format": "strands", "force_bos": False, "max_len": None, "option_labels": "numbers"}
     # The prompt format and the window differ from the file's, but the BOS setting does not
     assert len(warnings) == 2
     assert "prompt_format='strands' differs from 'read_twice'" in warnings[0]
+
+
+def test_option_labels_come_from_the_file_else_from_the_head(tmp_path):
+    # A file saved before option labels existed: its model's options are numbered
+    (tmp_path / PROMPT_FILE).write_text(json.dumps({"prompt_format": "strands", "force_bos": False, "max_len": 4096}))
+    assert _resolve(tmp_path)["option_labels"] == "numbers"
+
+    # A model with a label head and no file yet (as hmf decision-init leaves it) is asked with letters
+    model = tmp_path / "label_model"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "hmf_decision", "decision_option_labels": "letters"}))
+    assert _resolve(model)["option_labels"] == "letters"
+    save_prompt_settings(str(model), "strands", False, 4096, "letters")
+    assert json.loads((model / PROMPT_FILE).read_text())["option_labels"] == "letters"
+    assert _resolve(model)["option_labels"] == "letters"
 
 
 def _files(folder):

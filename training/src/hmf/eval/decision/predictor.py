@@ -9,11 +9,12 @@ finetuning_type: full, or merged with hmf export) gets the file in its own folde
 holds the model's gate, if calibration fitted one (see gate.py).
 
 Training saves the prompt settings it trained with in decision_prompt.json, in the same folder: the prompt format
-(decision_prompt_format), whether prompts start with the BOS token (decision_force_bos), and the longest prompt
-(cutoff_len). A predictor uses them for every setting left at "auto", so that a model is asked in the format it was
-trained on without being told. A model without the file (trained before it existed) gets the defaults, strands, no
-BOS token, and 4096 tokens. A setting given explicitly is used as given, with a warning if it differs from the
-file's.
+(decision_prompt_format), whether prompts start with the BOS token (decision_force_bos), the longest prompt
+(cutoff_len), and how the options are labeled (decision_option_labels). A predictor uses them for every setting left
+at "auto", so that a model is asked in the format it was trained on without being told. A model without the file
+(trained before it existed, or not trained yet) gets the defaults, strands, no BOS token, 4096 tokens, and the labels
+its head reads (letters for a label head, else numbers). A setting given explicitly is used as given, with a warning
+if it differs from the file's.
 """
 
 import json
@@ -35,7 +36,7 @@ CALIBRATION_FILE = "decision_calibration.json"
 PROMPT_FILE = "decision_prompt.json"
 # A setting that comes from the model's decision_prompt.json, else from DEFAULT_PROMPT
 AUTO = "auto"
-DEFAULT_PROMPT = {"prompt_format": "strands", "force_bos": False, "max_len": 4096}
+DEFAULT_PROMPT = {"prompt_format": "strands", "force_bos": False, "max_len": 4096, "option_labels": "numbers"}
 
 
 def calibration_path(model_name_or_path: str, adapter_name_or_path: Optional[str] = None) -> str:
@@ -48,12 +49,24 @@ def prompt_path(model_name_or_path: str, adapter_name_or_path: Optional[str] = N
     return os.path.join(adapter_name_or_path or model_name_or_path, PROMPT_FILE)
 
 
-def save_prompt_settings(folder: str, prompt_format: str, force_bos: bool, max_len: Optional[int]) -> str:
+def save_prompt_settings(
+    folder: str, prompt_format: str, force_bos: bool, max_len: Optional[int], option_labels: str = "numbers"
+) -> str:
     """Writes the prompt settings a model was trained with to decision_prompt.json in folder, and returns its path."""
     path = os.path.join(folder, PROMPT_FILE)
+    settings = {"prompt_format": prompt_format, "force_bos": bool(force_bos), "max_len": max_len}
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"prompt_format": prompt_format, "force_bos": bool(force_bos), "max_len": max_len}, f, indent=2)
+        json.dump({**settings, "option_labels": option_labels}, f, indent=2)
     return path
+
+
+def head_option_labels(model_name_or_path: str) -> Optional[str]:
+    """The labels a decision model's head reads (letters for a label head), or None for the pointer head."""
+    path = os.path.join(model_name_or_path, "config.json")
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f).get("decision_option_labels")
 
 
 def resolve_prompt_settings(
@@ -67,17 +80,18 @@ def resolve_prompt_settings(
     Args:
         model_name_or_path: The decision model.
         adapter_name_or_path: Its LoRA adapter, whose folder holds the file, if any.
-        given: prompt_format, force_bos, and max_len, each a value or "auto".
+        given: prompt_format, force_bos, max_len, and option_labels, each a value or "auto".
     """
     path = prompt_path(model_name_or_path, adapter_name_or_path)
     saved = {}
     if os.path.isfile(path):
         with open(path, encoding="utf-8") as f:
             saved = json.load(f)
+    defaults = dict(DEFAULT_PROMPT, option_labels=head_option_labels(model_name_or_path) or "numbers")
     settings = {}
     for key, value in given.items():
         if isinstance(value, str) and value == AUTO:
-            settings[key] = saved.get(key, DEFAULT_PROMPT[key])
+            settings[key] = saved.get(key, defaults[key])
             continue
         if key in saved and saved[key] != value:
             logger.warning_rank0(
@@ -121,6 +135,9 @@ class DecisionPredictor:
         cuda_graphs: Whether to answer through CUDA graphs (see graphs.py), which makes one decision at a
             time several times faster on a GPU, with the same answers. It needs a stock backbone and loads
             it with flash attention. Defaults to False.
+        option_labels: How the options are labeled, "numbers" or "letters" (decision_option_labels in
+            training). Defaults to "auto", the model's own, else the labels its head reads.
+        dtype: The model's dtype. Defaults to bfloat16 on GPU and float32 on CPU.
     """
 
     def __init__(
@@ -133,12 +150,19 @@ class DecisionPredictor:
         max_len: Union[int, None, str] = AUTO,
         calibration: Optional[str] = "auto",
         cuda_graphs: bool = False,
+        option_labels: str = AUTO,
+        dtype: Optional[torch.dtype] = None,
     ):
         self.model_name_or_path = model_name_or_path
         self.adapter_name_or_path = adapter_name_or_path
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.prompt_settings = resolve_prompt_settings(
-            model_name_or_path, adapter_name_or_path, prompt_format=prompt_format, force_bos=force_bos, max_len=max_len
+            model_name_or_path,
+            adapter_name_or_path,
+            prompt_format=prompt_format,
+            force_bos=force_bos,
+            max_len=max_len,
+            option_labels=option_labels,
         )
         self.max_len = self.prompt_settings["max_len"]
         logger.info_rank0(f"Prompt settings: {self.prompt_settings}.")
@@ -147,6 +171,7 @@ class DecisionPredictor:
             self.device,
             adapter_name_or_path=adapter_name_or_path,
             cuda_graphs=cuda_graphs,
+            dtype=dtype,
             **self.prompt_settings,
         )
         if calibration == "auto":

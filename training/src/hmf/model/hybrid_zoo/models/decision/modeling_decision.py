@@ -1,7 +1,7 @@
-"""A decision model, which is a pretrained backbone with its LM head removed and a pointer head added.
+"""A decision model, which is a pretrained backbone with its LM head removed and a decision head added.
 
 The prompt lists a set of options and ends with an answer marker. The backbone reads it once, and
-the pointer head scores each option from two hidden states:
+the pointer head, the default, scores each option from two hidden states:
 
     q = W_q · LN(h_answer)                hidden state at the answer marker
     k_j = W_k · LN(h_j)                   hidden state at the last token of option j's line
@@ -11,6 +11,13 @@ There are no per-option parameters, so the head handles any number of options, a
 each option comes from the prompt rather than from the weights. The positions of the answer marker
 and of each option are computed when the prompt is tokenized and passed in as answer_idx and
 opt_idx.
+
+Label heads (decision_head_type) read the options as a causal LM answers a multiple-choice
+question instead. The prompt labels the options with letters (A, B, ...), and the head keeps the
+source LM's LM-head rows of those letters' tokens, so that the logit of the option shown at position
+k is that row applied to the hidden state at the answer marker, which before training is the
+source LM's next-token logit of label k. The "label" head keeps the rows frozen, "label_trained" trains them,
+and "label_pointer" adds a pointer head whose scores start at 0 (see LabelHead and LabelPointerHead).
 
 Prompts are right-padded, so under causal attention, and in recurrent layers that read the sequence
 left to right, no real position ever reads a pad, and the padding mask changes nothing the head reads.
@@ -296,10 +303,150 @@ class PointerHead(nn.Module):
         return logits.masked_fill(~option_mask, MASK_VALUE)
 
 
+class LabelHead(nn.Module):
+    """
+    Scores the option shown at position k with row k, the LM head's row of label k's token (A, B, ..., see
+    data/decision_prompt.py), applied to the hidden state at the answer marker:
+
+        logit_k = <w_k, h_answer>             capped as cap * tanh(logit_k / cap) for a source LM that caps its logits
+
+    hmf decision-init copies the rows from the source causal LM, so the untrained head gives the source LM's own
+    next-token distribution over the labels, renormalized over the question's options. Frozen rows are a buffer,
+    saved with the model, so that only the backbone trains, and trainable rows are a parameter. Like the pointer
+    head, the label head computes in float32.
+
+    Args:
+        hidden_size: The hidden size of the backbone.
+        num_labels: The number of rows, which is the most options a question can have.
+        trainable: Whether the rows are trained. Defaults to False.
+        softcap: The cap of the logits, or None. Defaults to None.
+    """
+
+    def __init__(self, hidden_size: int, num_labels: int, trainable: bool = False, softcap: Optional[float] = None):
+        super().__init__()
+        rows = torch.zeros(num_labels, hidden_size)
+        if trainable:
+            self.rows = nn.Parameter(rows)
+        else:
+            self.register_buffer("rows", rows)
+        self.softcap = softcap
+        # No dropout: the rows are pretrained, and an untrained head must equal the source LM
+        self.dropout = nn.Identity()
+        for module in self.modules():
+            module._is_hf_initialized = True
+
+    def reset_parameters(self) -> None:
+        """The rows come from the source LM (hmf decision-init), so there is nothing to re-initialize here."""
+
+    def copy_rows(self, rows: torch.Tensor) -> None:
+        """Sets the rows, e.g., to the source LM's rows of the label tokens, of shape [num_labels, hidden_size]."""
+        if rows.shape != self.rows.shape:
+            raise ValueError(f"Expected label rows of shape {tuple(self.rows.shape)}, got {tuple(rows.shape)}.")
+        with torch.no_grad():
+            self.rows.copy_(rows.float())
+
+    def forward(
+        self,
+        answer_states: torch.Tensor,
+        option_states: torch.Tensor,
+        option_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            answer_states: Hidden states at the answer position, of shape [batch, hidden_size].
+            option_states: Unused, for the pointer head's signature.
+            option_mask: Boolean mask of shape [batch, num_options], True for real options.
+
+        Returns:
+            logits: Option logits of shape [batch, num_options], in float32. Padded options hold MASK_VALUE.
+        """
+        num_options = option_mask.size(1)
+        if num_options > self.rows.size(0):
+            raise ValueError(f"The label head reads at most {self.rows.size(0)} options, got {num_options}.")
+        with torch.autocast(device_type=answer_states.device.type, enabled=False):
+            logits = answer_states.float() @ self.rows[:num_options].float().T
+            if self.softcap:
+                logits = self.softcap * torch.tanh(logits / self.softcap)
+        return logits.masked_fill(~option_mask, MASK_VALUE)
+
+
+class LabelPointerHead(nn.Module):
+    """
+    A frozen label head plus a pointer head whose scores start at 0 (its query projection is zero), so the
+    untrained head is the label head, and the pointer learns from the options' own hidden states what the labels'
+    rows get wrong:
+
+        logit_k = <w_k, h_answer> + <q(h_answer), k(h_k)> / sqrt(dim)
+
+    Args:
+        hidden_size: The hidden size of the backbone.
+        num_labels: The number of label rows.
+        softcap: The cap of the label logits, or None. The pointer's scores are not capped.
+        dim, use_norm, dropout: The pointer head's (see PointerHead).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_labels: int,
+        softcap: Optional[float] = None,
+        dim: int = 256,
+        use_norm: bool = True,
+        dropout: float = 0.05,
+    ):
+        super().__init__()
+        self.label = LabelHead(hidden_size, num_labels, trainable=False, softcap=softcap)
+        self.pointer = PointerHead(hidden_size, dim=dim, use_norm=use_norm, dropout=dropout)
+        self.dropout = self.pointer.dropout
+
+    def reset_parameters(self) -> None:
+        """Initializes the pointer as PyTorch does, then zeroes its query projection, so that it scores 0."""
+        self.pointer.reset_parameters()
+        nn.init.zeros_(self.pointer.q.weight)
+        nn.init.zeros_(self.pointer.q.bias)
+
+    def copy_rows(self, rows: torch.Tensor) -> None:
+        self.label.copy_rows(rows)
+
+    def forward(
+        self,
+        answer_states: torch.Tensor,
+        option_states: torch.Tensor,
+        option_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = self.label(answer_states, option_states, option_mask) + self.pointer(
+            answer_states, option_states, option_mask
+        )
+        return logits.masked_fill(~option_mask, MASK_VALUE)
+
+
+def build_head(config: DecisionConfig) -> nn.Module:
+    """The decision head of a config (decision_head_type)."""
+    hidden_size = config.text_config.hidden_size
+    if config.decision_head_type in ("label", "label_trained"):
+        return LabelHead(
+            hidden_size,
+            config.decision_num_labels,
+            trainable=config.decision_head_type == "label_trained",
+            softcap=config.decision_label_softcap,
+        )
+    pointer_kwargs = {
+        "dim": config.decision_head_dim,
+        "use_norm": config.decision_head_norm,
+        "dropout": config.decision_head_dropout,
+    }
+    if config.decision_head_type == "label_pointer":
+        return LabelPointerHead(
+            hidden_size, config.decision_num_labels, softcap=config.decision_label_softcap, **pointer_kwargs
+        )
+    return PointerHead(hidden_size=hidden_size, **pointer_kwargs)
+
+
 class DecisionModel(PreTrainedModel):
     """
-    A backbone loaded with AutoModel (no LM head) followed by a PointerHead. The backbone is any
-    model supported by AutoModel, including our Hybrid models.
+    A backbone loaded with AutoModel (no LM head) followed by a decision head (a PointerHead, LabelHead or
+    LabelPointerHead, see decision_head_type). The backbone is any model supported by AutoModel, including our
+    Hybrid models.
 
     Args:
         config: The DecisionConfig, holding the backbone's configuration as text_config.
@@ -321,12 +468,7 @@ class DecisionModel(PreTrainedModel):
             raise ValueError("DecisionConfig.text_config must be set to build a DecisionModel.")
 
         self.model = AutoModel.from_config(config.text_config)
-        self.decision_head = PointerHead(
-            hidden_size=config.text_config.hidden_size,
-            dim=config.decision_head_dim,
-            use_norm=config.decision_head_norm,
-            dropout=config.decision_head_dropout,
-        )
+        self.decision_head = build_head(config)
 
         # Device placement (e.g. device_map="auto") should not split the backbone's layers
         self._no_split_modules = getattr(self.model, "_no_split_modules", None)

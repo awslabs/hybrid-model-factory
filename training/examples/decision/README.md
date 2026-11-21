@@ -50,6 +50,15 @@ hmf decision-init examples/decision/init/qwen3_5_2b/pointer.yaml
 
 Like Stage 0 of priming (`hmf prime-init`), this step builds a new architecture from the base model's weights without training it. The language model's head, which turns its last hidden states into next-token probabilities, is removed, and a small decision head that scores the options (about 2 million parameters) takes its place. The decision head starts from random weights, and training teaches it. The result is saved as a new model folder (`output_dir` in the config). Every later step starts from this folder, and training never changes it.
 
+A decision model can have one of four decision heads, chosen with `decision_head_type` in the config. The default, `pointer`, is the head described above. A label head instead keeps part of the language model's head. Its prompts label the options with letters (A, B, ...), and the head reads the language model's rows of those letters' tokens, so that before any training it answers as the language model would answer the question with its next token. [init/qwen3_5_2b/label.yaml](init/qwen3_5_2b/label.yaml) converts the model with one. Its data must then be tokenized with `decision_option_labels: letters` (see [data/README.md](../../data/README.md#decision-format)).
+
+| `decision_head_type` | what it scores each option with | what trains |
+| --- | --- | --- |
+| `pointer` | its own hidden state against the answer marker's | the head |
+| `label` | the language model's row of its letter, applied to the answer marker's hidden state | nothing in the head (only the backbone, e.g., LoRA) |
+| `label_trained` | the same rows | the rows |
+| `label_pointer` | the same rows, plus a pointer head that starts at 0 | the pointer |
+
 ### 2. Prepare Model 1's Data
 
 This step and step 4 use Strands Decider's data as an example. [Preparing the Data](#preparing-the-data) in Part 2 describes the format for your own data.

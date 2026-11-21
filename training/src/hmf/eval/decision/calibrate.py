@@ -176,6 +176,7 @@ def calibrate(
     prompt_format: str = AUTO,
     force_bos: Union[bool, str] = AUTO,
     max_len: Union[int, None, str] = AUTO,
+    option_labels: str = AUTO,
     device: Optional[str] = None,
     predictor: Optional[DecisionPredictor] = None,
 ) -> Dict[str, Any]:
@@ -208,6 +209,8 @@ def calibrate(
             the model's, else False.
         max_len: The longest prompt, in tokens, beyond which rows are skipped. Defaults to "auto",
             the model's, else 4096.
+        option_labels: How the options are labeled, "numbers" or "letters" (decision_option_labels).
+            Defaults to "auto", the model's, else the labels its head reads.
         device: Where to run the model. Defaults to the first GPU if there is one, else the CPU.
         predictor: A DecisionPredictor to use instead of loading the model. Defaults to None.
 
@@ -221,7 +224,7 @@ def calibrate(
     rows = sample_rows(partition_rows(read_rows(data), split, seed), limit, seed)
     predictor = predictor or DecisionPredictor(
         model_name_or_path, adapter_name_or_path, device=device, prompt_format=prompt_format, force_bos=force_bos,
-        max_len=max_len, calibration=None,
+        max_len=max_len, option_labels=option_labels, calibration=None,
     )
     log_probs = predictor.log_probs(rows)
     kept = [(row, lp) for row, lp in zip(rows, log_probs) if lp is not None]

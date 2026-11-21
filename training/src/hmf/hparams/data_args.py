@@ -177,6 +177,16 @@ class DataArguments:
             )
         },
     )
+    decision_option_labels: str = field(
+        default="numbers",
+        metadata={
+            "help": (
+                "How each option's line of a decision prompt is labeled: `numbers` (1, 2, ...) or `letters` (A, "
+                "B, ..., then two-letter codes that are one token each). The label heads of decision models need "
+                "`letters`."
+            )
+        },
+    )
     decision_num_augmentations: int = field(
         default=1,
         metadata={
@@ -329,6 +339,9 @@ class DataArguments:
 
         if not 0.0 <= self.decision_ordinal_smoothing < 1.0:
             raise ValueError("`decision_ordinal_smoothing` must be in [0, 1).")
+
+        if self.decision_option_labels not in ("numbers", "letters"):
+            raise ValueError("`decision_option_labels` must be `numbers` or `letters`.")
 
 
     def to_dict(self) -> dict[str, Any]:

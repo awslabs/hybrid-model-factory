@@ -33,6 +33,7 @@ def _data_args(**overrides) -> SimpleNamespace:
         decision_vary_instructions=True,
         decision_ordinal_smoothing=0.1,
         decision_force_bos=False,
+        decision_option_labels="numbers",
         cutoff_len=4096,
     )
     args.update(overrides)
@@ -150,6 +151,21 @@ def test_matches_direct_encoding(prompt_format):
         assert (row["input_ids"], row["opt_idx"], row["answer_idx"]) == (
             encoded.input_ids, encoded.opt_idx, encoded.answer_idx
         )
+
+
+def test_letter_labels():
+    # With letter labels, every option's line starts with its letter code, in the order the prompt shows them
+    letters = tuple(chr(ord("A") + i) for i in range(26))
+    tokenizer = _tiny_tokenizer(words=letters)
+    processor = _processor(tokenizer=tokenizer, decision_option_labels="letters", decision_vary_instructions=False)
+    for row in _rows(processor.preprocess_dataset(_batch())):
+        source_row = ROWS[row["row_index"]]
+        rendered = get_prompt_format("strands").render(
+            source_row["_state"], source_row["_instructions"], source_row["_kind"],
+            source_row["_options"], option_order=row["option_order"], labels=letters[: len(row["opt_idx"])],
+        )
+        assert row["input_ids"] == encode_decision_prompt(tokenizer, rendered).input_ids
+        assert "A. " in rendered.text and "1. " not in rendered.text
 
 
 def test_option_orders():
