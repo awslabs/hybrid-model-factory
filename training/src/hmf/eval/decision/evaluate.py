@@ -50,6 +50,7 @@ def evaluate(
     device: Optional[str] = None,
     predictor: Optional[DecisionPredictor] = None,
     pairs: bool = False,
+    cuda_graphs: bool = False,
 ) -> Dict[str, Any]:
     """
     Evaluates a trained decision model on a data file.
@@ -78,6 +79,7 @@ def evaluate(
         device: Where to run the model. Defaults to the first GPU if there is one, else the CPU.
         predictor: A DecisionPredictor to use instead of loading the model. Defaults to None.
         pairs: Whether the file's rows come in adjacent pairs, which adds the pair metrics. Defaults to False.
+        cuda_graphs: Whether the model answers through CUDA graphs (see graphs.py). Defaults to False.
 
     Returns:
         The report, with the metrics overall and by kind, task, and confidence band, the temperatures, and
@@ -98,7 +100,7 @@ def evaluate(
         rows = sample_rows(partition_rows(read_rows(data), split, seed), limit, seed)
     predictor = predictor or DecisionPredictor(
         model_name_or_path, adapter_name_or_path, device=device, prompt_format=prompt_format, force_bos=force_bos,
-        max_len=max_len, calibration=calibration,
+        max_len=max_len, calibration=calibration, cuda_graphs=cuda_graphs,
     )
     calibrated = predictor.calibration is not None and not raw
     if ordinal_smoothing is None:

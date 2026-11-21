@@ -145,6 +145,7 @@ Each run is a `results.jsonl` from JevBench, or a CSV with the columns `run`, `t
 | `--force_bos` | `auto` | start prompts with the BOS token, if the model was trained with `decision_force_bos: true`. `auto` takes the model's, else off |
 | `--model_name` | the adapter's folder name, else the model's | the name the replies give as their model |
 | `--device` | the first GPU, else the CPU | where to run the model |
+| `--cuda_graphs` | off | answer through CUDA graphs, which record the model's pass once per prompt length and replay it without the CPU launching each kernel. Requests then take about the GPU's own work, several times less than without graphs at one request at a time, with the same answers. It needs a GPU, the `flash_attn` package, and a stock Hugging Face backbone (not one of HMF's hybrid models), which it loads with flash attention. The graphs of every prompt length up to `--max_len` are recorded at startup, which takes about half a second per 128 tokens of window (under 20 seconds for 4,096 tokens) |
 
 **A request holds a state and one or more named questions,** and the reply holds one answer per question:
 

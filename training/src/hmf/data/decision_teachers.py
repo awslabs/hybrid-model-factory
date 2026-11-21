@@ -417,6 +417,11 @@ class DecisionModelTeacher:
             False.
         max_len: Prompts longer than this many tokens get no teacher. Defaults to None (no limit).
         dtype: The model's dtype. Defaults to bfloat16 on GPU and float32 on CPU.
+        attn_implementation: The backbone's attention implementation. Defaults to transformers' default, and
+            to flash_attention_2 with cuda_graphs.
+        cuda_graphs: Whether to answer through CUDA graphs (see eval/decision/graphs.py), which makes small
+            batches several times faster on a GPU. It needs a stock backbone with flash attention. Defaults
+            to False.
     """
 
     def __init__(
@@ -428,6 +433,8 @@ class DecisionModelTeacher:
         force_bos: bool = False,
         max_len: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
+        attn_implementation: Optional[str] = None,
+        cuda_graphs: bool = False,
     ):
         from transformers import AutoModel, AutoTokenizer
 
@@ -436,7 +443,10 @@ class DecisionModelTeacher:
         self.name = model_name_or_path
         self.device = device
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-        model = AutoModel.from_pretrained(model_name_or_path, dtype=dtype or _default_dtype(device))
+        if cuda_graphs and attn_implementation is None:
+            attn_implementation = "flash_attention_2"
+        attention = {"attn_implementation": attn_implementation} if attn_implementation is not None else {}
+        model = AutoModel.from_pretrained(model_name_or_path, dtype=dtype or _default_dtype(device), **attention)
         if adapter_name_or_path is not None:
             from peft import PeftModel
 
@@ -445,6 +455,12 @@ class DecisionModelTeacher:
         self.model = model.to(device).eval()
         self.prompt = DecisionTeacherPrompt(prompt_format, force_bos)
         self.max_len = max_len
+        self.pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        self.graphs = None
+        if cuda_graphs:
+            from ..eval.decision.graphs import DecisionGraphRunner
+
+            self.graphs = DecisionGraphRunner(self.model, self.pad_token_id)
 
     def __call__(
         self,
@@ -472,10 +488,19 @@ class DecisionModelTeacher:
         encoded = [encoded[i] for i in keep]
 
         results: List[Optional[List[float]]] = [None] * len(rows)
-        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         lengths = [len(e.input_ids) for e in encoded]
+        if self.graphs is not None:
+            # Rows of similar length together, in batches no larger than a graph takes
+            order = sorted(range(len(encoded)), key=lambda i: -lengths[i])
+            for start in range(0, len(order), self.graphs.max_batch):
+                batch = order[start : start + self.graphs.max_batch]
+                answers = self.graphs([encoded[b].input_ids for b in batch], [encoded[b].opt_idx for b in batch],
+                                      [encoded[b].answer_idx for b in batch])
+                for b, answer in zip(batch, answers):
+                    results[keep[b]] = answer
+            return results
         for batch, seq_len in _batches(lengths, max_batch_tokens, pad_to_multiple_of):
-            input_ids, attention_mask = _pad([encoded[b].input_ids for b in batch], seq_len, pad_token_id)
+            input_ids, attention_mask = _pad([encoded[b].input_ids for b in batch], seq_len, self.pad_token_id)
             num_options = max(len(encoded[b].opt_idx) for b in batch)
             opt_idx = torch.full((len(batch), num_options), -1, dtype=torch.long)
             for j, b in enumerate(batch):

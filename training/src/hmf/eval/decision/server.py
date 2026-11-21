@@ -310,6 +310,31 @@ class DecisionServer:
         rendered, rows = zip(*(self._render(question_row(request.state, q)) for q in questions))
         encoded = self._encode(list(rendered), list(rows))
 
+        all_log_probs = self._log_probs(encoded)
+        answers = {}
+        for i, (name, question) in enumerate(zip(names, questions)):
+            probs = apply_temperature(all_log_probs[i], self.temperature(question.type))
+            answers[name] = self._to_answer(question, probs)
+            if self.gate is not None:
+                top = max(range(len(probs)), key=probs.__getitem__)
+                option = self._option_names(question)[top]
+                answers[name]["take"] = self.predictor.takes(question.type, option, probs[top])
+        return {
+            "model": self.model_name,
+            "answers": answers,
+            "usage": {"input_tokens": sum(len(e.input_ids) for e in encoded), "output_tokens": len(names)},
+        }
+
+    def _log_probs(self, encoded: List[EncodedPrompt]) -> List[List[float]]:
+        """
+        Each encoded prompt's log-probabilities over its options at temperature 1, in one pass. A request with
+        no more questions than a CUDA graph takes goes through the predictor's graphs if it has them (see
+        graphs.py), and a larger one in one padded batch, which keeps the GPU busy without them and is faster than
+        splitting it into graph-sized batches.
+        """
+        graphs = getattr(self.predictor.model, "graphs", None)
+        if graphs is not None and len(encoded) <= graphs.max_batch:
+            return graphs([e.input_ids for e in encoded], [e.opt_idx for e in encoded], [e.answer_idx for e in encoded])
         seq_len = max(len(e.input_ids) for e in encoded)
         num_options = max(len(e.opt_idx) for e in encoded)
         pad = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
@@ -327,21 +352,7 @@ class DecisionServer:
             opt_idx=opt_idx.to(device),
             answer_idx=torch.tensor([e.answer_idx for e in encoded]).to(device),
         )
-
-        answers = {}
-        for i, (name, question) in enumerate(zip(names, questions)):
-            log_probs = out.log_probs[i, : len(encoded[i].opt_idx)].float().tolist()
-            probs = apply_temperature(log_probs, self.temperature(question.type))
-            answers[name] = self._to_answer(question, probs)
-            if self.gate is not None:
-                top = max(range(len(probs)), key=probs.__getitem__)
-                option = self._option_names(question)[top]
-                answers[name]["take"] = self.predictor.takes(question.type, option, probs[top])
-        return {
-            "model": self.model_name,
-            "answers": answers,
-            "usage": {"input_tokens": int(attention_mask.sum()), "output_tokens": len(names)},
-        }
+        return [out.log_probs[i, : len(e.opt_idx)].float().tolist() for i, e in enumerate(encoded)]
 
     @staticmethod
     def _option_names(question) -> List[str]:
@@ -423,6 +434,7 @@ def serve(
     force_bos: Union[bool, str] = AUTO,
     model_name: Optional[str] = None,
     device: Optional[str] = None,
+    cuda_graphs: bool = False,
 ) -> None:
     """
     Serves a trained decision model on 127.0.0.1.
@@ -450,6 +462,9 @@ def serve(
         model_name: The name replies give as their model. Defaults to the adapter's folder name, else
             the model's.
         device: Where to run the model. Defaults to the first GPU if there is one, else the CPU.
+        cuda_graphs: Whether to answer through CUDA graphs (see graphs.py), which makes each request several
+            times faster on a GPU, with the same answers. It needs a stock backbone, which it loads with flash
+            attention, and records the graph of every prompt length up to max_len at startup. Defaults to False.
     """
     if not is_loopback(host):
         raise ValueError(
@@ -461,8 +476,14 @@ def serve(
 
     predictor = DecisionPredictor(
         model_name_or_path, adapter_name_or_path, device=device, prompt_format=prompt_format, force_bos=force_bos,
-        max_len=max_len, calibration=calibration,
+        max_len=max_len, calibration=calibration, cuda_graphs=cuda_graphs,
     )
+    graphs = predictor.model.graphs
+    if graphs is not None:
+        started = time.perf_counter()
+        longest = min(predictor.max_len or graphs.max_length, graphs.max_length)
+        graphs.warm_up(range(graphs.length_multiple, longest + graphs.length_multiple, graphs.length_multiple))
+        logger.info_rank0(f"Recorded {len(graphs.graphs)} CUDA graphs in {time.perf_counter() - started:.0f} s.")
     server = DecisionServer(predictor, raw=raw, strict_window=strict_window, model_name=model_name)
     logger.info_rank0(f"Serving {server.model_name} on http://{host}:{port} (POST /v1/systemone, GET /health).")
     uvicorn.run(create_app(server), host=host, port=port, workers=1)

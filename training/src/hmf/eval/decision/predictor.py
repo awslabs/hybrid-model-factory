@@ -118,6 +118,9 @@ class DecisionPredictor:
             the model's own, else 4096.
         calibration: "auto" (the model's saved calibration, if any), the path of a calibration file,
             or None (temperature 1). Defaults to "auto".
+        cuda_graphs: Whether to answer through CUDA graphs (see graphs.py), which makes one decision at a
+            time several times faster on a GPU, with the same answers. It needs a stock backbone and loads
+            it with flash attention. Defaults to False.
     """
 
     def __init__(
@@ -129,6 +132,7 @@ class DecisionPredictor:
         force_bos: Union[bool, str] = AUTO,
         max_len: Union[int, None, str] = AUTO,
         calibration: Optional[str] = "auto",
+        cuda_graphs: bool = False,
     ):
         self.model_name_or_path = model_name_or_path
         self.adapter_name_or_path = adapter_name_or_path
@@ -142,6 +146,7 @@ class DecisionPredictor:
             model_name_or_path,
             self.device,
             adapter_name_or_path=adapter_name_or_path,
+            cuda_graphs=cuda_graphs,
             **self.prompt_settings,
         )
         if calibration == "auto":
