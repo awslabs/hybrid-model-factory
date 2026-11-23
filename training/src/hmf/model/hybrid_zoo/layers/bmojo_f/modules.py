@@ -108,7 +108,7 @@ class BMojoLayer(nn.Module):
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,
         position_ids: Optional[Tensor] = None,
-        past_key_values: Optional["HybridCache"] = None,
+        cache: Optional["HybridCache"] = None,
         use_cache: Optional[bool] = False,
         position_embeddings: Optional[Tuple[Tensor, Tensor]] = None,
         **kwargs,
@@ -125,7 +125,7 @@ class BMojoLayer(nn.Module):
             hidden_states: Input tensor of shape [batch, seq_len, hidden_size].
             attention_mask: Optional attention mask tensor (not currently used).
             position_ids: Optional position indices tensor (not currently used).
-            past_key_values: HybridCache object, extracts B'MOJO-specific cache if present.
+            cache: HybridCache object, extracts B'MOJO-specific cache if present.
             use_cache: Whether the SSM mixer keeps its state in the cache, which GDN and GKA need.
             position_embeddings: Optional tuple of (cos, sin) for rotary embeddings.
             **kwargs: Additional arguments, ignored.
@@ -142,15 +142,15 @@ class BMojoLayer(nn.Module):
         # and finds its own part of it, and GDN and GKA keep their state only with use_cache
         fading_kwargs = {
             "position_embeddings": position_embeddings,
-            "past_key_values": past_key_values,
+            "cache": cache,
             "use_cache": use_cache,
         }
 
         # Extract B'MOJO-specific cache
-        if hasattr(past_key_values, "bmojo_f"):
-            bmojo_f_past_key_values = past_key_values.bmojo_f
+        if hasattr(cache, "bmojo_f"):
+            bmojo_f_cache = cache.bmojo_f
         else:
-            bmojo_f_past_key_values = None
+            bmojo_f_cache = None
 
         # Generate fading tokens through SSM mixer
         fading_tokens_ = self.ssm_mixer(hidden_states, **fading_kwargs)
@@ -166,8 +166,8 @@ class BMojoLayer(nn.Module):
             key_value_states=fading_tokens_,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=bmojo_f_past_key_values,
+            cache=bmojo_f_cache,
             position_embeddings=position_embeddings,
         )
 
-        return outputs, None, past_key_values
+        return outputs, None, cache

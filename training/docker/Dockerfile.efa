@@ -25,11 +25,11 @@ RUN pip install --no-cache-dir --no-build-isolation \
 # Install HuggingFace packages
 RUN pip install --no-cache-dir \
     yunchang==0.6.1 \
-    transformers==5.22.2 \
+    transformers==5.24.0 \
     datasets==3.4.1 \
     huggingface_hub==1.33.0 \
     tokenizers==0.23.3 \
-    peft==0.21.2 \
+    peft==0.22.0 \
     "jinja2>=3.1.6"
 
 # Install accelerator packages

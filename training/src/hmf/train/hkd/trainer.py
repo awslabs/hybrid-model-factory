@@ -65,7 +65,7 @@ def fused_layer_outputs(model: nn.Module, inputs: Dict[str, Any]):
         "config": backbone.config,
         "inputs_embeds": inputs_embeds,
         "attention_mask": attention_mask,
-        "past_key_values": None,
+        "cache": None,
         "position_ids": position_ids,
     }
     causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
@@ -87,7 +87,7 @@ def fused_layer_outputs(model: nn.Module, inputs: Dict[str, Any]):
                 attn_hidden_states,
                 causal_mask,
                 position_ids,
-                None,  # past_key_values (we do not use fused layers for inference)
+                None,  # cache (we do not use fused layers for inference)
                 False,  # output_attentions
                 False,  # use_cache
                 position_embeddings,
@@ -98,7 +98,7 @@ def fused_layer_outputs(model: nn.Module, inputs: Dict[str, Any]):
                 attention_hidden_states=attn_hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
-                past_key_values=None,
+                cache=None,
                 output_attentions=False,
                 use_cache=False,
                 position_embeddings=position_embeddings,

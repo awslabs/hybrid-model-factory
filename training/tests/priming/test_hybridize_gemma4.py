@@ -130,10 +130,13 @@ def test_source_converted_to_gka_still_gives_the_sharing_layers_their_keys_and_v
     # computes from the layer's input, the same input as in the base model
     gka = model.model.layers[source].gka
     monkeypatch.setattr(gka, "forward", lambda hidden_states, **kwargs: (torch.zeros_like(hidden_states), None, None))
-    shared, base_shared = UserDict(), UserDict()
+    shared = UserDict()
     with torch.no_grad():
         model.model(input_ids=_ids(), shared_kv_states=shared, use_cache=False)
-        base.model.language_model(input_ids=_ids(), shared_kv_states=base_shared, use_cache=False)
+        # Transformers' Gemma 4 keeps the shared keys and values in a dict of its own, and returns it when asked
+        base_shared = base.model.language_model(
+            input_ids=_ids(), use_cache=False, return_shared_kv_states=True
+        ).shared_kv_states
     # Only the source's own kind matches, since the zeros change the input of the layers after it, such as layer 9
     kind = base.config.text_config.layer_types[source]
     assert all(torch.equal(a, b) for a, b in zip(shared[kind], base_shared[kind]))

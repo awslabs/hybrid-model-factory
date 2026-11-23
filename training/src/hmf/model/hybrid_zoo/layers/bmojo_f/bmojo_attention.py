@@ -340,7 +340,7 @@ class BMOJOAttention(nn.Module):
         query_fading: Tensor,
         key_fading: Tensor,
         value_fading: Tensor,
-        past_key_values,
+        cache,
     ) -> Tuple[
         Tensor,
         Optional[Tensor],
@@ -353,7 +353,7 @@ class BMOJOAttention(nn.Module):
         Adjust key-value tensors for incremental inference with caching.
 
         This method handles different scenarios:
-        - No cache (past_key_values is None): Training or inference without cache object
+        - No cache (cache is None): Training or inference without cache object
         - With cache, prefill (nothing cached for this layer yet): First pass, populates cache
         - With cache, decoding (keys and values cached): Incremental generation, one token at a time
 
@@ -373,7 +373,7 @@ class BMOJOAttention(nn.Module):
             query_fading: Fading memory query tensor with shape [L, B, H, D].
             key_fading: Fading memory key tensor with shape [L, B, Hkv, D].
             value_fading: Fading memory value tensor with shape [L, B, Hkv, D].
-            past_key_values: Cache object for storing KV pairs. None during training or uncached inference.
+            cache: Cache object for storing KV pairs. None during training or uncached inference.
 
         Returns:
             Tuple of (query_in_ctx, key_in_ctx, value_in_ctx, query_fading, key_fading, value_fading) where:
@@ -388,7 +388,7 @@ class BMOJOAttention(nn.Module):
         window_size = self.window_size[0]
 
         # Handle case without cache (e.g., during training or prefill)
-        if past_key_values is None:
+        if cache is None:
             if len(query_fading) <= window_size + 1:
                 # Sequence too short for fading memory
                 query_fading, key_fading, value_fading = None, None, None
@@ -411,15 +411,15 @@ class BMOJOAttention(nn.Module):
         # where w = bmojo_config["window_size"], so no later token reads further back than the last 2w tokens, and
         # the cache keeps only those
         kept_tokens = 2 * (window_size + 1)
-        past_key_values.record_tokens(self.layer_idx, key_in_ctx.shape[0])
-        cached = past_key_values.key_value_memory_dict.get(self.layer_idx)
+        cache.record_tokens(self.layer_idx, key_in_ctx.shape[0])
+        cached = cache.key_value_memory_dict.get(self.layer_idx)
         if cached is not None:
             cached_keys, cached_values = cached
             key_in_ctx = torch.cat([cached_keys["in-context"], key_in_ctx])
             value_in_ctx = torch.cat([cached_values["in-context"], value_in_ctx])
             key_fading = torch.cat([cached_keys["fading-memory"], key_fading])
             value_fading = torch.cat([cached_values["fading-memory"], value_fading])
-        past_key_values.key_value_memory_dict[self.layer_idx] = (
+        cache.key_value_memory_dict[self.layer_idx] = (
             {
                 "in-context": _last_tokens(key_in_ctx, kept_tokens),
                 "fading-memory": _last_tokens(key_fading, kept_tokens),
@@ -458,7 +458,7 @@ class BMOJOAttention(nn.Module):
         key_value_states: Tensor,
         attention_mask: Optional[Tensor] = None,
         position_ids: Optional[Tensor] = None,
-        past_key_values: Optional["BMojoCache"] = None,
+        cache: Optional["BMojoCache"] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         position_embeddings: Optional[Tuple[Tensor, Tensor]] = None,
@@ -472,17 +472,17 @@ class BMOJOAttention(nn.Module):
                 This is typically the output of processing hidden_states through an SSM layer.
             attention_mask: Optional attention mask (not currently used).
             position_ids: Optional position indices (not currently used).
-            past_key_values: BMojoCache object containing KV cache for in-context and fading tokens.
+            cache: BMojoCache object containing KV cache for in-context and fading tokens.
             output_attentions: Whether to return attention weights (not currently used).
             use_cache: Whether to use KV caching (not currently used).
             position_embeddings: Tuple of (cos, sin) tensors for rotary positional embeddings,
                 each with shape [B, L, D] or [1, L, D]. Required for proper position encoding.
 
         Returns:
-            Tuple of (attn_output, None, past_key_values) where:
+            Tuple of (attn_output, None, cache) where:
                 - attn_output: Output tensor with shape [B, L, Dh]
                 - None: Placeholder for attention weights (not returned)
-                - past_key_values: Updated cache object (same as input if provided, else None)
+                - cache: Updated cache object (same as input if provided, else None)
         """
         original_seqlen = hidden_states.shape[1]
 
@@ -516,7 +516,7 @@ class BMOJOAttention(nn.Module):
             query_fading,
             key_fading,
             value_fading,
-            past_key_values=past_key_values,
+            cache=cache,
         )
         # query_in_ctx: [L_sp, B_sp, H, D]
         # key_in_ctx and value_in_ctx: [L_sp, B_sp, Hkv, D]
@@ -546,4 +546,4 @@ class BMOJOAttention(nn.Module):
         # Project output back to hidden dimension
         attn_output = self.o_proj(attn_output)  # [B, L, Dh]
 
-        return attn_output, None, past_key_values
+        return attn_output, None, cache

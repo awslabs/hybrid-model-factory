@@ -534,7 +534,7 @@ class DecisionModel(PreTrainedModel):
                     config=self.model.config,
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
-                    past_key_values=None,
+                    cache=None,
                     position_ids=position_ids,
                 ),
             }

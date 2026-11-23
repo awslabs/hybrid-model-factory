@@ -69,7 +69,7 @@ def _mask_for(attn, padding, q_len, past=0):
         inputs_embeds=torch.zeros(padding.shape[0], q_len, HIDDEN),
         attention_mask=padding,
         position_ids=torch.arange(past, past + q_len).unsqueeze(0),
-        past_key_values=cache,
+        cache=cache,
     )
 
 
@@ -177,8 +177,8 @@ def _incremental(model, ids, chunks, attention_mask=None):
     cache, start, steps = None, 0, []
     for n in chunks:
         kwargs = {} if attention_mask is None else {"attention_mask": attention_mask[:, : start + n]}
-        out = model(ids[:, start : start + n], past_key_values=cache, use_cache=True, **kwargs)
-        cache, start = out.past_key_values, start + n
+        out = model(ids[:, start : start + n], cache=cache, use_cache=True, **kwargs)
+        cache, start = out.cache, start + n
         steps.append(out.logits)
     return torch.cat(steps, dim=1)
 

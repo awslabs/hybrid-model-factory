@@ -46,8 +46,8 @@ def _incremental(model, ids, chunks, attention_mask=None):
         cache, start, steps = HybridCache(model.config), 0, []
         for n in chunks:
             kwargs = {} if attention_mask is None else {"attention_mask": attention_mask[:, : start + n]}
-            out = model(ids[:, start : start + n], past_key_values=cache, use_cache=True, **kwargs)
-            cache, start = out.past_key_values, start + n
+            out = model(ids[:, start : start + n], cache=cache, use_cache=True, **kwargs)
+            cache, start = out.cache, start + n
             steps.append(out.logits)
     return torch.cat(steps, dim=1)
 

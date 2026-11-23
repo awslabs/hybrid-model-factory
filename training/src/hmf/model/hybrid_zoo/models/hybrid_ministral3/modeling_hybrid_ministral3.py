@@ -262,7 +262,7 @@ class Ministral3Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
-        past_key_values: Cache | None = None,
+        cache: Cache | None = None,
         llama_4_position_ids: torch.Tensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -291,8 +291,8 @@ class Ministral3Attention(nn.Module):
             self.config.rope_parameters.get("original_max_position_embeddings"),
         ).to(query_states.dtype)
 
-        if past_key_values is not None:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+        if cache is not None:
+            key_states, value_states = cache.update(key_states, value_states, self.layer_idx)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -333,21 +333,21 @@ class Ministral3SWAttention(Ministral3Attention):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[HybridCache] = None,
+        cache: Optional[HybridCache] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         
         if self.sequence_parallel_group is not None:
             return self._forward_sp(
                 hidden_states, position_embeddings, attention_mask,
-                past_key_values, **kwargs,
+                cache, **kwargs,
             )
         
         attn_output, attn_weights = super().forward(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
+            cache=cache,
             **kwargs
         )
         
@@ -360,7 +360,7 @@ class Ministral3SWAttention(Ministral3Attention):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[HybridCache] = None,
+        cache: Optional[HybridCache] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], None]:
         assert attention_mask is None, (
@@ -398,7 +398,7 @@ class Ministral3SWAttention(Ministral3Attention):
                 hidden_states=hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
-                past_key_values=past_key_values,
+                cache=cache,
                 llama_4_position_ids=llama_4_position_ids,
                 **kwargs,
             )
@@ -427,7 +427,7 @@ class Ministral3DecoderLayer(GradientCheckpointingLayer):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: HybridCache | None = None,
+        cache: HybridCache | None = None,
         use_cache: bool | None = False,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -439,7 +439,7 @@ class Ministral3DecoderLayer(GradientCheckpointingLayer):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            cache=cache,
             use_cache=use_cache,
             position_embeddings=position_embeddings,
             **kwargs,
@@ -507,7 +507,7 @@ class Ministral3HybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[HybridCache] = None,
+        cache: Optional[HybridCache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -525,7 +525,7 @@ class Ministral3HybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            cache=cache,
             use_cache=use_cache,
             position_embeddings=position_embeddings,
             **kwargs,
@@ -639,7 +639,7 @@ class Ministral3DualAttDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[torch.Tensor]] = None,
+        cache: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -655,7 +655,7 @@ class Ministral3DualAttDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            cache=cache,
             use_cache=use_cache,
             position_embeddings=position_embeddings,
         )
@@ -675,7 +675,7 @@ class Ministral3DualAttDecoderLayer(nn.Module):
         attention_hidden_states: torch.Tensor = None,  # Attention from previous layer
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[torch.Tensor]] = None,
+        cache: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -767,7 +767,7 @@ class Ministral3FusedAttHybridDecoderLayer(nn.Module, ABC):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[torch.Tensor]] = None,
+        cache: Optional[Tuple[torch.Tensor]] = None,
         use_cache: Optional[bool] = False,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -781,7 +781,7 @@ class Ministral3FusedAttHybridDecoderLayer(nn.Module, ABC):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            cache=cache,
             use_cache=use_cache,
             position_embeddings=position_embeddings,
         )
@@ -801,7 +801,7 @@ class Ministral3FusedAttHybridDecoderLayer(nn.Module, ABC):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[torch.Tensor]] = None,
+        cache: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -817,7 +817,7 @@ class Ministral3FusedAttHybridDecoderLayer(nn.Module, ABC):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            cache=cache,
             use_cache=use_cache,
             position_embeddings=position_embeddings,
         )
@@ -842,7 +842,7 @@ class Ministral3FusedAttHybridDecoderLayer(nn.Module, ABC):
         attention_hidden_states: torch.Tensor = None,  # Attention output from previous layer
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[torch.Tensor]] = None,
+        cache: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -856,7 +856,7 @@ class Ministral3FusedAttHybridDecoderLayer(nn.Module, ABC):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            cache=cache,
             use_cache=use_cache,
             position_embeddings=position_embeddings,
         )
@@ -953,7 +953,7 @@ class HybridMinistral3PreTrainedModel(PreTrainedModel):
         name for name in globals() 
         if name.endswith("DecoderLayer") and "Ministral3" in name
     ]
-    _skip_keys_device_placement = ["past_key_values"]
+    _skip_keys_device_placement = ["cache"]
     _supports_flash_attn = True
     _supports_sdpa = True
     _supports_flex_attn = True
@@ -996,7 +996,7 @@ class HybridMinistral3Model(HybridMinistral3PreTrainedModel):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
+        cache: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -1008,17 +1008,17 @@ class HybridMinistral3Model(HybridMinistral3PreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if not self.training and use_cache and (
-            past_key_values is None or not isinstance(past_key_values, HybridCache)
+            cache is None or not isinstance(cache, HybridCache)
         ):
             logger.warning_once(
-                "You are passing `use_cache=True` and `past_key_values` is `None`. "
-                "We are setting `past_key_values` to a new instance of `HybridCache`."
+                "You are passing `use_cache=True` and `cache` is `None`. "
+                "We are setting `cache` to a new instance of `HybridCache`."
             )
-            del past_key_values
-            past_key_values = HybridCache(self.config)
+            del cache
+            cache = HybridCache(self.config)
 
         if position_ids is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            past_seen_tokens = cache.get_seq_length() if cache is not None else 0
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             position_ids = position_ids.unsqueeze(0)
 
@@ -1033,7 +1033,7 @@ class HybridMinistral3Model(HybridMinistral3PreTrainedModel):
                 config=self.config,
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                past_key_values=past_key_values,
+                cache=cache,
                 position_ids=position_ids,
             )
 
@@ -1045,7 +1045,7 @@ class HybridMinistral3Model(HybridMinistral3PreTrainedModel):
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
-                past_key_values=past_key_values,
+                cache=cache,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
                 **kwargs,
@@ -1055,7 +1055,7 @@ class HybridMinistral3Model(HybridMinistral3PreTrainedModel):
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=past_key_values if use_cache else None,
+            cache=cache if use_cache else None,
         )
 
 
@@ -1080,8 +1080,8 @@ class HybridMinistral3ForCausalLM(HybridMinistral3PreTrainedModel, GenerationMix
         Gives generate() a HybridCache, which holds the state of every layer type, in place of the DynamicCache
         that generate() would build otherwise, and which the hybrid layers can't use.
         """
-        if model_kwargs.get("past_key_values") is None and generation_config.use_cache is not False:
-            model_kwargs["past_key_values"] = HybridCache(self.config)
+        if model_kwargs.get("cache") is None and generation_config.use_cache is not False:
+            model_kwargs["cache"] = HybridCache(self.config)
         return super()._prepare_cache_for_generation(generation_config, model_kwargs, *args, **kwargs)
 
     @can_return_tuple
@@ -1091,7 +1091,7 @@ class HybridMinistral3ForCausalLM(HybridMinistral3PreTrainedModel, GenerationMix
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
+        cache: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
@@ -1108,7 +1108,7 @@ class HybridMinistral3ForCausalLM(HybridMinistral3PreTrainedModel, GenerationMix
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            cache=cache,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             **kwargs,
@@ -1126,7 +1126,7 @@ class HybridMinistral3ForCausalLM(HybridMinistral3PreTrainedModel, GenerationMix
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=outputs.past_key_values,
+            cache=outputs.cache,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )

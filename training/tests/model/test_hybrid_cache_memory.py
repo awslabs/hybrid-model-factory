@@ -60,8 +60,8 @@ def test_generate_frees_its_cache_once_its_output_is_gone():
     with torch.no_grad():
         out = model.generate(input_ids=_ids(), max_new_tokens=3, do_sample=False, pad_token_id=0,
                              return_dict_in_generate=True)
-    assert isinstance(out.past_key_values, HybridCache)
-    cache_ref = weakref.ref(out.past_key_values)
+    assert isinstance(out.cache, HybridCache)
+    cache_ref = weakref.ref(out.cache)
     del out
     assert cache_ref() is None
 

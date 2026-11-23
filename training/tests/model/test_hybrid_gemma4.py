@@ -190,9 +190,9 @@ def test_gka_outputs_match_between_cached_decoding_and_the_full_forward():
     ids, prefill = _ids(seq=24).cuda(), 8
     with torch.no_grad():
         model(ids, use_cache=False)
-        cache = model(ids[:, :prefill], use_cache=True).past_key_values
+        cache = model(ids[:, :prefill], use_cache=True).cache
         for t in range(prefill, ids.shape[1]):
-            cache = model(ids[:, t : t + 1], past_key_values=cache, use_cache=True).past_key_values
+            cache = model(ids[:, t : t + 1], cache=cache, use_cache=True).cache
     for hook in hooks:
         hook.remove()
     for full, *cached in outputs.values():

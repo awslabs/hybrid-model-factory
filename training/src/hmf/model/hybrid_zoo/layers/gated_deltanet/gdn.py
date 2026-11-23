@@ -304,7 +304,7 @@ class GatedDeltaNet(nn.Module):
         self,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,
-        past_key_values: Optional["GatedDeltaNetCache"] = None,
+        cache: Optional["GatedDeltaNetCache"] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
         **kwargs,
@@ -333,17 +333,17 @@ class GatedDeltaNet(nn.Module):
             attention_mask: Optional 0-1 mask with shape [B, L] for padding purposes.
                 0 indicates padding positions. Arbitrary attention masks of shape
                 [B, L, L] are not allowed.
-            past_key_values: Optional cache containing conv_state and recurrent_state
+            cache: Optional cache containing conv_state and recurrent_state
                 for inference. When provided, performs incremental decoding.
             use_cache: Whether to return updated cache states. Default: False.
             output_attentions: Whether to return attention weights (not used). Default: False.
             **kwargs: Additional keyword arguments, may include cu_seqlens for packed sequences.
 
         Returns:
-            Tuple of (output, None, past_key_values) where:
+            Tuple of (output, None, cache) where:
                 - output: Output tensor with same shape as hidden_states [B, L, Dh]
                 - None: Placeholder for consistency with attention layers
-                - past_key_values: Updated cache (same as input if provided, else None)
+                - cache: Updated cache (same as input if provided, else None)
         """
         # Under SDPA and eager, models pass the 4D attention mask, so keep only which new tokens are padding.
         # A 2D mask (flash attention) is used as it is.
@@ -365,8 +365,8 @@ class GatedDeltaNet(nn.Module):
             assert mode == "chunk", "Only chunk mode is supported in training."
 
         last_state = None
-        if not self.training and past_key_values is not None:
-            last_state = past_key_values[self.layer_idx]
+        if not self.training and cache is not None:
+            last_state = cache[self.layer_idx]
 
         cu_seqlens = kwargs.get("cu_seqlens")
 
@@ -496,8 +496,8 @@ class GatedDeltaNet(nn.Module):
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 
         # Update cache
-        if past_key_values is not None:
-            past_key_values.update(
+        if cache is not None:
+            cache.update(
                 recurrent_state=recurrent_state,
                 conv_state=(conv_state_q, conv_state_k, conv_state_v)
                 if self.use_short_conv
@@ -534,4 +534,4 @@ class GatedDeltaNet(nn.Module):
                 o, self.sequence_parallel_group, sp_rank, sp_size, sp_size * 2
             )  # [B, L, Dh]
 
-        return o, None, past_key_values
+        return o, None, cache

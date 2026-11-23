@@ -358,7 +358,7 @@ class Gemma4TextAttention(nn.Module):
         position_embeddings: torch.Tensor,
         attention_mask: torch.Tensor | None,
         shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]],
-        past_key_values: Cache | None = None,
+        cache: Cache | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -374,7 +374,7 @@ class Gemma4TextAttention(nn.Module):
         # For layers with shared KV (from kv sharing point onwards), we reuse the same keys/values states as the last
         # non-sharing layer. We cannot simply reuse the cached state if we have a Cache, as sliding layers will not
         # remember the full states in their Cache once we are past the sliding window - so we always use
-        # `shared_kv_states` instead, even when past_key_values is not None
+        # `shared_kv_states` instead, even when cache is not None
         if self.is_kv_shared_layer:
             key_states, value_states = shared_kv_states[self.layer_type]
             # Device of past layer may be different from current one
@@ -391,8 +391,8 @@ class Gemma4TextAttention(nn.Module):
             value_states = self.v_norm(value_states)
             value_states = value_states.transpose(1, 2)
 
-        if past_key_values is not None and not self.is_kv_shared_layer:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+        if cache is not None and not self.is_kv_shared_layer:
+            key_states, value_states = cache.update(key_states, value_states, self.layer_idx)
         if self.store_full_length_kv:
             shared_kv_states[self.layer_type] = key_states, value_states
 
@@ -446,10 +446,10 @@ class Gemma4SWAttention(Gemma4TextAttention):
             raise ValueError("swa_config must specify window_size.")
         self.is_sliding = True
 
-    def forward(self, hidden_states, position_embeddings, attention_mask, shared_kv_states=None, past_key_values=None,
+    def forward(self, hidden_states, position_embeddings, attention_mask, shared_kv_states=None, cache=None,
                 **kwargs):
         attn_output, attn_weights = super().forward(
-            hidden_states, position_embeddings, attention_mask, shared_kv_states, past_key_values, **kwargs
+            hidden_states, position_embeddings, attention_mask, shared_kv_states, cache, **kwargs
         )
         # Return 3-tuple to be consistent with all other Hybrid layer outputs
         return attn_output, attn_weights, None
@@ -507,11 +507,11 @@ class Gemma4SourceKeysAndValues(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]],
-        past_key_values: Cache | None = None,
+        cache: Cache | None = None,
     ) -> None:
         key_states, value_states = project_keys_and_values(self, hidden_states, position_embeddings)
-        if past_key_values is not None:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+        if cache is not None:
+            key_states, value_states = cache.update(key_states, value_states, self.layer_idx)
         shared_kv_states[self.layer_type] = key_states, value_states
 
 
@@ -549,7 +549,7 @@ class Gemma4DecoderLayer(GradientCheckpointingLayer):
         position_embeddings: torch.Tensor = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
+        cache: Cache | None = None,
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -561,7 +561,7 @@ class Gemma4DecoderLayer(GradientCheckpointingLayer):
             attention_mask=attention_mask,
             shared_kv_states=shared_kv_states,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            cache=cache,
             **kwargs,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -707,7 +707,7 @@ class Gemma4HybridDecoderLayerBase(Gemma4DecoderLayerBody, GradientCheckpointing
         position_embeddings: torch.Tensor = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: HybridCache | None = None,
+        cache: HybridCache | None = None,
         use_cache: bool | None = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -726,7 +726,7 @@ class Gemma4HybridDecoderLayerBase(Gemma4DecoderLayerBody, GradientCheckpointing
             attention_mask (`torch.FloatTensor`, *optional*): the full attention mask, whose padding the sequence
                 mixers read
             position_ids (`torch.LongTensor`, *optional*): Position IDs for the input.
-            past_key_values (`HybridCache`, *optional*): the cache of every layer type
+            cache (`HybridCache`, *optional*): the cache of every layer type
             use_cache (`bool`, *optional*): whether the sequence mixer keeps its state in the cache
             kwargs (`dict`, *optional*): Arbitrary kwargs to be ignored, used for FSDP and other methods that injects
                 code into the model
@@ -737,7 +737,7 @@ class Gemma4HybridDecoderLayerBase(Gemma4DecoderLayerBody, GradientCheckpointing
 
         def mixer(normed_hidden_states):
             if self.source_kv is not None:
-                self.source_kv(normed_hidden_states, position_embeddings, shared_kv_states, past_key_values)
+                self.source_kv(normed_hidden_states, position_embeddings, shared_kv_states, cache)
 
             # Sequence mixing (Mamba2, B'MOJO, GDN, etc.). SWA reads or writes the shared keys and values as Gemma
             # 4's attention does at its layer, while the other mixers neither read nor write them.
@@ -747,7 +747,7 @@ class Gemma4HybridDecoderLayerBase(Gemma4DecoderLayerBody, GradientCheckpointing
                 hidden_states=normed_hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=past_key_values,
+                cache=cache,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
                 **kwargs,
@@ -1007,7 +1007,7 @@ class Gemma4FusedAttHybridDecoderLayerBase(Gemma4Stage1DecoderLayerBase):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=None,
+            cache=None,
             use_cache=False,
             position_embeddings=position_embeddings,
             **kwargs,
@@ -1079,7 +1079,7 @@ class HybridGemma4PreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = [name for name in globals() if name.endswith("DecoderLayer") and "Gemma4" in name]
-    _skip_keys_device_placement = ["past_key_values", "shared_kv_states"]
+    _skip_keys_device_placement = ["cache", "shared_kv_states"]
     _supports_flash_attn = True
     _supports_sdpa = True
     _supports_flex_attn = True
@@ -1211,7 +1211,7 @@ class HybridGemma4TextModel(HybridGemma4PreTrainedModel):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
+        cache: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         per_layer_inputs: torch.Tensor | None = None,
         use_cache: bool | None = None,
@@ -1243,17 +1243,17 @@ class HybridGemma4TextModel(HybridGemma4PreTrainedModel):
             per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
 
         if not self.training and use_cache and (
-            past_key_values is None or not isinstance(past_key_values, HybridCache)
+            cache is None or not isinstance(cache, HybridCache)
         ):
             logger.warning_once(
-                "You are passing `use_cache=True` and `past_key_values` is `None`. "
-                "We are setting `past_key_values` to a new instance of `HybridCache`."
+                "You are passing `use_cache=True` and `cache` is `None`. "
+                "We are setting `cache` to a new instance of `HybridCache`."
             )
-            del past_key_values
-            past_key_values = HybridCache(self.config)
+            del cache
+            cache = HybridCache(self.config)
 
         if position_ids is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            past_seen_tokens = cache.get_seq_length() if cache is not None else 0
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             position_ids = position_ids.unsqueeze(0)
 
@@ -1268,7 +1268,7 @@ class HybridGemma4TextModel(HybridGemma4PreTrainedModel):
                     "config": self.config,
                     "inputs_embeds": inputs_embeds,
                     "attention_mask": attention_mask,
-                    "past_key_values": past_key_values,
+                    "cache": cache,
                     "position_ids": position_ids,
                 })
 
@@ -1295,7 +1295,7 @@ class HybridGemma4TextModel(HybridGemma4PreTrainedModel):
                 position_embeddings=position_embeddings[self.config.base_layer_types[i]],
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_ids=position_ids,
-                past_key_values=past_key_values,
+                cache=cache,
                 use_cache=use_cache,
                 **kwargs,
             )
@@ -1304,7 +1304,7 @@ class HybridGemma4TextModel(HybridGemma4PreTrainedModel):
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=past_key_values if use_cache else None,
+            cache=cache if use_cache else None,
         )
 
     def stage1_layer_outputs(
@@ -1340,7 +1340,7 @@ class HybridGemma4TextModel(HybridGemma4PreTrainedModel):
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
-                "past_key_values": None,
+                "cache": None,
                 "position_ids": position_ids,
             })
         position_embeddings = {
@@ -1470,8 +1470,8 @@ class HybridGemma4ForCausalLM(HybridGemma4PreTrainedModel, GenerationMixin):
         build transformers' DynamicCache from config.layer_types, and a DynamicCache cannot hold the states of the
         Mamba2, B'MOJO, GDN, and GKA layers.
         """
-        if model_kwargs.get("past_key_values") is None and generation_config.use_cache is not False:
-            model_kwargs["past_key_values"] = HybridCache(self.config)
+        if model_kwargs.get("cache") is None and generation_config.use_cache is not False:
+            model_kwargs["cache"] = HybridCache(self.config)
         return super()._prepare_cache_for_generation(generation_config, model_kwargs, *args, **kwargs)
 
     @can_return_tuple
@@ -1481,7 +1481,7 @@ class HybridGemma4ForCausalLM(HybridGemma4PreTrainedModel, GenerationMixin):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
+        cache: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
@@ -1499,7 +1499,7 @@ class HybridGemma4ForCausalLM(HybridGemma4PreTrainedModel, GenerationMixin):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            cache=cache,
             inputs_embeds=inputs_embeds,
             per_layer_inputs=per_layer_inputs,
             use_cache=use_cache,
@@ -1521,7 +1521,7 @@ class HybridGemma4ForCausalLM(HybridGemma4PreTrainedModel, GenerationMixin):
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=outputs.past_key_values,
+            cache=outputs.cache,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )

@@ -57,7 +57,7 @@ class GatedDeltaNetLayer(GatedDeltaNet):
         self,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,
-        past_key_values: Optional["HybridCache"] = None,
+        cache: Optional["HybridCache"] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
         **kwargs,
@@ -68,7 +68,7 @@ class GatedDeltaNetLayer(GatedDeltaNet):
         Args:
             hidden_states: Input tensor of shape [batch, seq_len, hidden_size]
             attention_mask: Optional attention mask tensor
-            past_key_values: HybridCache object, extracts GDN-specific cache if present
+            cache: HybridCache object, extracts GDN-specific cache if present
             use_cache: Whether to use caching
             output_attentions: Whether to output attention weights
             **kwargs: Additional arguments passed to parent forward
@@ -81,15 +81,15 @@ class GatedDeltaNetLayer(GatedDeltaNet):
 
         """
 
-        if hasattr(past_key_values, "gated_deltanet"):
-            gated_deltanet_past_key_values = past_key_values.gated_deltanet
+        if hasattr(cache, "gated_deltanet"):
+            gated_deltanet_cache = cache.gated_deltanet
         else:
-            gated_deltanet_past_key_values = None
+            gated_deltanet_cache = None
 
         return super().forward(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            past_key_values=gated_deltanet_past_key_values,
+            cache=gated_deltanet_cache,
             use_cache=use_cache,
             output_attentions=output_attentions,
             **kwargs,

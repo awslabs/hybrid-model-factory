@@ -150,7 +150,7 @@ pip install -e .
 hmf train examples/priming/stage2/hqwen3_8b_gka_sft_it.yaml
 ```
 
-HMF requires transformers 5.22.2, which both the Docker image and `pip install -e .` install, so an environment set up for an earlier version of HMF needs the image rebuilt and the install repeated.
+HMF requires transformers 5.24.0 and PEFT 0.22.0, which both the Docker image and `pip install -e .` install, so an environment set up for an earlier version of HMF needs the image rebuilt and the install repeated.
 
 See [docs/Training.md](docs/Training.md) for detailed training documentation.
 

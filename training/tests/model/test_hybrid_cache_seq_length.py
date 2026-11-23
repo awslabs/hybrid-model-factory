@@ -88,16 +88,16 @@ def test_generate_counts_every_token():
         out = model.generate(input_ids=ids, max_new_tokens=4, min_new_tokens=4, do_sample=False, pad_token_id=0,
                              eos_token_id=None, return_dict_in_generate=True)
     # The last generated token isn't fed back through the model, so the cache holds one token fewer
-    assert out.past_key_values.get_seq_length() == out.sequences.shape[1] - 1
+    assert out.cache.get_seq_length() == out.sequences.shape[1] - 1
 
 
 def _inner_model_steps(model, ids, prefill):
     """Returns the logits of a prefill followed by one-token steps through the inner model, without its ForCausalLM."""
     cache, steps = HybridCache(model.config), []
-    hidden = model.model(ids[:, :prefill], past_key_values=cache, use_cache=True).last_hidden_state
+    hidden = model.model(ids[:, :prefill], cache=cache, use_cache=True).last_hidden_state
     steps.append(model.lm_head(hidden))
     for i in range(prefill, ids.shape[1]):
-        hidden = model.model(ids[:, i : i + 1], past_key_values=cache, use_cache=True).last_hidden_state
+        hidden = model.model(ids[:, i : i + 1], cache=cache, use_cache=True).last_hidden_state
         steps.append(model.lm_head(hidden))
     return torch.cat(steps, dim=1)
 

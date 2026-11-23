@@ -108,7 +108,7 @@ class HybridQwen3MoeConfig(PreTrainedConfig):
     """
 
     model_type = "hybrid_qwen3_moe"
-    keys_to_ignore_at_inference = ["past_key_values"]
+    keys_to_ignore_at_inference = ["cache"]
 
     attribute_map = {
         "num_experts": "num_local_experts",

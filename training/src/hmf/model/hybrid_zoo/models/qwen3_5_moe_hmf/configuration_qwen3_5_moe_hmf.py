@@ -100,7 +100,7 @@ class Qwen3_5MoeHMFTextConfig(PreTrainedConfig):
     """
 
     model_type = "qwen3_5_moe_hmf_text"
-    keys_to_ignore_at_inference = ["past_key_values"]
+    keys_to_ignore_at_inference = ["cache"]
 
     base_model_tp_plan = {
         "layers.*.self_attn.q_proj": "colwise",
@@ -270,7 +270,7 @@ class Qwen3_5MoeHMFConfig(PreTrainedConfig):
 
     model_type = "qwen3_5_moe_hmf"
     sub_configs = {"vision_config": Qwen3_5MoeHMFVisionConfig, "text_config": Qwen3_5MoeHMFTextConfig}
-    keys_to_ignore_at_inference = ["past_key_values"]
+    keys_to_ignore_at_inference = ["cache"]
 
     def __init__(
         self,

@@ -152,11 +152,11 @@ def test_flash_attention_decodes_from_the_cache_as_its_full_forward_does(pattern
         full = flash(ids, attention_mask=mask).logits
         prefix = 16
         out = flash(ids[:, :prefix], attention_mask=mask[:, :prefix], use_cache=True)
-        cache, steps = out.past_key_values, [out.logits[:, -1]]
+        cache, steps = out.cache, [out.logits[:, -1]]
         for position in range(prefix, ids.shape[1] - 1):
             out = flash(ids[:, position : position + 1], attention_mask=mask[:, : position + 1],
-                        past_key_values=cache, use_cache=True)
-            cache = out.past_key_values
+                        cache=cache, use_cache=True)
+            cache = out.cache
             steps.append(out.logits[:, -1])
     assert _error(torch.stack(steps, dim=1), full[:, prefix - 1 : -1]) < TOLERANCE
 

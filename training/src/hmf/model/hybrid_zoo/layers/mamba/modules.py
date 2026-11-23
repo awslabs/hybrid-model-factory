@@ -57,7 +57,7 @@ class Mamba2Layer(Mamba2):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[HybridCache] = None,
+        cache: Optional[HybridCache] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -70,7 +70,7 @@ class Mamba2Layer(Mamba2):
             hidden_states: Input tensor of shape [batch, seq_len, hidden_size]
             attention_mask: Optional padding mask (2D, or the 4D mask of SDPA and eager), whose padding Mamba2 keeps
                 out of its state
-            past_key_values: HybridCache object, extracts Mamba2-specific cache if present.
+            cache: HybridCache object, extracts Mamba2-specific cache if present.
             use_cache: Ignored, kept for consistency
             output_attentions: Ignored, kept for consistency
             position_embeddings: Optional tuple of (cos, sin) for rotary embeddings
@@ -83,14 +83,14 @@ class Mamba2Layer(Mamba2):
                 - cache: Mamba2Cache or None
         """
 
-        if hasattr(past_key_values, "mamba2"):
-            mamba_past_key_values = past_key_values.mamba2
+        if hasattr(cache, "mamba2"):
+            mamba_cache = cache.mamba2
         else:
-            mamba_past_key_values = None
+            mamba_cache = None
 
         return super().forward(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
-            past_key_values=mamba_past_key_values,
+            cache=mamba_cache,
             attention_mask=attention_mask,
         )
