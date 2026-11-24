@@ -662,6 +662,7 @@ def run_decision_mlx(
     run_decision has loaded.
     """
     from ....data import DecisionDataCollator
+    from ....eval.decision.predictor import save_prompt_settings
     from ....extras.ploting import plot_loss
     from ..workflow import _warn_if_augmentations_reused
 
@@ -687,6 +688,13 @@ def run_decision_mlx(
         _warn_if_augmentations_reused(SimpleNamespace(train_dataset=trainer.train_dataset), training_args, 1)
         metrics = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
         trainer.save_final(training_args.output_dir)
+        # Saves the prompt settings the model was trained with, which evaluation and serving then use by default, as
+        # run_decision does for PyTorch
+        path = save_prompt_settings(
+            training_args.output_dir, data_args.decision_prompt_format, data_args.decision_force_bos,
+            data_args.cutoff_len, data_args.decision_option_labels,
+        )
+        logger.info_rank0(f"Prompt settings saved to {path}.")
         _save_metrics(training_args.output_dir, "train", metrics)
         if finetuning_args.plot_loss:
             plot_loss(training_args.output_dir, keys=["loss", "eval_loss", "eval_accuracy"])

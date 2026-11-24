@@ -245,6 +245,7 @@ def test_training_end_to_end(decision_model_dir, dataset_dir, tmp_path):
         _config(
             model_dir, dataset_dir, output_dir, do_eval=True, val_size=0.25, max_steps=4, eval_strategy="steps",
             eval_steps=2, save_strategy="steps", save_steps=2, save_total_limit=1, bf16=True,
+            decision_prompt_format="question_first",
         )
     )
 
@@ -269,8 +270,11 @@ def test_training_end_to_end(decision_model_dir, dataset_dir, tmp_path):
     with open(output_dir / "all_results.json") as f:
         assert {"train_loss", "eval_loss"} <= set(json.load(f))
 
-    # PyTorch's predictor loads the adapter
+    # PyTorch's predictor loads the adapter and uses the prompt settings that the model was trained with
     predictor = DecisionPredictor(model_dir, str(output_dir), device="cpu", calibration=None)
+    assert predictor.prompt_settings == {
+        "prompt_format": "question_first", "force_bos": False, "max_len": 512, "option_labels": "numbers",
+    }
     probabilities = predictor.probabilities([decision_row(i) for i in range(3)])
     assert all(sum(probs) == pytest.approx(1.0, abs=1e-5) for probs in probabilities)
 
