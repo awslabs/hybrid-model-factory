@@ -5,6 +5,7 @@ with conftest.py's tiny model:
     - reading a suite file, with overrides, required keys, a file with nothing to run, and data by dataset name or
       path;
     - partial suites run only their sections, such as only benchmarks or only calibration;
+    - a pair benchmark, scored whole and reported in the summary's table of pairs;
     - a full suite with JevBench, against a stand-in for JevBench's harness (same command line, asks the
       suite's server), which the suite starts and stops;
     - the JevBench section is checked before anything runs, including the checkout, its commit, the output
@@ -96,6 +97,21 @@ def test_only_calibration(tmp_path, trained):
     assert json.loads((reports / "calibration.json").read_text()) == json.loads(saved.read_text())
     assert results["calibration"]["num_rows"] == 91
     assert "Calibration (nll) on 91 rows" in (reports / "summary.md").read_text()  # nll, the default method
+
+
+
+def test_pair_benchmark_is_scored_whole_and_reported_as_pairs(tmp_path, trained):
+    _no_saved_calibration(trained)
+    pairs = tmp_path / "pairs.jsonl"
+    pairs.write_text("".join(json.dumps(trained["row"](i)) + "\n" for i in range(20)))
+    path = _suite(tmp_path, trained, benchmarks=[{"name": "toy_pairs", "data": str(pairs), "pairs": True}])
+
+    results = run_suite(path)
+
+    report = results["benchmarks"]["toy_pairs"]
+    assert report["split"] == "all" and report["overall"]["n"] == 20 and report["pairs"]["pairs"] == 10
+    summary = (tmp_path / "reports" / "summary.md").read_text()
+    assert "| benchmark | pairs | pairs left out |" in summary and "| toy_pairs | 10 | 0 |" in summary
 
 
 # JevBench
@@ -236,3 +252,23 @@ def test_decision_eval_command(tmp_path):
 def test_decision_serve_command_refuses_other_hosts(trained):
     result = _launch("decision-serve", trained["model_dir"], "--host", "0.0.0.0")
     assert result.returncode != 0 and "Refusing to listen on 0.0.0.0" in result.stderr
+
+
+def test_calibration_with_a_gate(tmp_path, trained):
+    gate = {"rule": "accuracy", "target": 0.0, "min_count": 1}
+    path = _suite(tmp_path, trained, calibration={"data": trained["data"], "split": "calib", "limit": 0, "gate": gate},
+                  benchmarks=[{"name": "toy", "data": trained["data"], "split": "test", "limit": 0}])
+
+    results = run_suite(path)
+
+    assert set(results["calibration"]["gate"]["thresholds"]) == {"noul", "choice", "score"}
+    assert results["benchmarks"]["toy"]["gate"]["overall"]["rows"] == results["benchmarks"]["toy"]["overall"]["n"]
+    summary = (tmp_path / "reports" / "summary.md").read_text()
+    assert "Gate (accuracy 0.0), thresholds by kind" in summary and "| toy | " in summary.split("taken by the gate")[1]
+
+
+def test_gate_settings_are_checked_first(tmp_path, trained):
+    path = _suite(tmp_path, trained, calibration={"data": trained["data"], "gate": {"rule": "x", "target": 1}})
+    with pytest.raises(ValueError, match="Unknown gate rule"):
+        run_suite(path)
+    assert not (tmp_path / "reports").exists()  # before anything ran

@@ -184,40 +184,23 @@ def swa_sp_post_attn(
     return attn_output
 
 
-def swa_sp_reorder_cache_position(
-    cache_position: torch.Tensor,
+def swa_sp_reorder_position_ids(
+    position_ids: torch.Tensor,
     sp_group: dist.ProcessGroup,
     sliding_window: int,
 ) -> torch.Tensor:
     """
-    Reorders cache_position to match the gathered sequence layout from swa_sp_gather.
-
-    swa_sp_gather transforms tensors from [B, L, D] to [2*B, L//2 + sliding_window, D]
-    via zig-zag split + boundary token prepend (reorder_for_ssm_p2p). cache_position is
-    a 1-D tensor [L] that must undergo the same transformation so that per-position
-    operations (e.g., _get_llama_4_attn_scale) see matching sequence dimensions.
-
-    We reshape cache_position to [1, L, 1], run it through reorder_for_ssm_p2p (which
-    handles the zig-zag split and P2P exchange of boundary tokens), then take the first
-    chunk and squeeze back to 1D [L//2 + sliding_window].
-
-    Args:
-        cache_position: 1-D position tensor [L].
-        sp_group: Sequence parallel process group.
-        sliding_window: Sliding window size.
-
-    Returns:
-        Reordered 1-D cache_position [L//2 + sliding_window] matching the gathered
-        sequence length.
+    Reorders position_ids of shape [B, L] like swa_sp_gather reorders the hidden states, from [B, L] to
+    [2*B, L//2 + sliding_window], with the zig-zag split and the boundary tokens from the neighboring chunk
+    (reorder_for_ssm_p2p), so that per-position operations such as Ministral3's Llama 4-style query scaling see
+    each token's position. Each of the two chunks keeps its own positions.
     """
     sp_size = dist.get_world_size(group=sp_group)
     sp_rank = dist.get_rank(group=sp_group)
     stream = torch.cuda.Stream()
     d_conv = sliding_window + 1
 
-    # Reshape to 3-D so reorder_for_ssm_p2p can handle it: [1, L, 1]
-    cp_3d = cache_position.unsqueeze(0).unsqueeze(-1).float()
-    cp_reordered = reorder_for_ssm_p2p(cp_3d, sp_group, stream, sp_size, sp_rank, d_conv)
-    # cp_reordered shape: [2, L//2 + sliding_window, 1]
-    # Both chunks have the same positional layout, take the first and squeeze back to 1-D
-    return cp_reordered[0, :, 0].long()
+    # reorder_for_ssm_p2p takes [B, L, D] tensors, and float32 holds positions exactly up to 2**24
+    positions = position_ids.unsqueeze(-1).float().contiguous()
+    reordered = reorder_for_ssm_p2p(positions, sp_group, stream, sp_size, sp_rank, d_conv)
+    return reordered[..., 0].long()

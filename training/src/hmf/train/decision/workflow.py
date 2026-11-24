@@ -39,6 +39,21 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def _check_option_labels(model_args: "ModelArguments", data_args: "DataArguments") -> None:
+    """
+    Rejects prompts whose options are labeled otherwise than the model's head reads them, before the data is
+    tokenized: a label head reads letters (see decision_option_labels).
+    """
+    from ...eval.decision.predictor import head_option_labels
+
+    head_labels = head_option_labels(model_args.model_name_or_path)
+    if head_labels is not None and data_args.decision_option_labels != head_labels:
+        raise ValueError(
+            f"{model_args.model_name_or_path} has a label head, which reads options labeled with {head_labels}, "
+            f"so set decision_option_labels: {head_labels}."
+        )
+
+
 def _check_arguments(
     model_args: "ModelArguments",
     data_args: "DataArguments",
@@ -190,6 +205,7 @@ def run_decision(
     callbacks: Optional[list["TrainerCallback"]] = None,
 ):
     _check_arguments(model_args, data_args, training_args, finetuning_args)
+    _check_option_labels(model_args, data_args)
 
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
@@ -245,6 +261,15 @@ def run_decision(
         _warn_if_augmentations_reused(trainer, training_args, model_args.sequence_parallel_size)
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
         trainer.save_model()
+        if trainer.is_world_process_zero():
+            # Saves the prompt settings the model was trained with, which evaluation and serving then use by default
+            from ...eval.decision.predictor import save_prompt_settings
+
+            path = save_prompt_settings(
+                training_args.output_dir, data_args.decision_prompt_format, data_args.decision_force_bos,
+                data_args.cutoff_len, data_args.decision_option_labels,
+            )
+            logger.info_rank0(f"Prompt settings saved to {path}.")
         if finetuning_args.decision_save_optimizer:
             trainer.save_optimizer_state(training_args.output_dir)
         trainer.log_metrics("train", train_result.metrics)

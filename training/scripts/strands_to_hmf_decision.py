@@ -34,7 +34,8 @@ The converted model is the same model as the checkpoint. Its LoRA weights are re
 decoder (base_model.model.<layer>) to the decision model's backbone (base_model.model.model.<layer>),
 and the head's weights are copied unchanged. The checkpoint's calibration, if it has one, is written as
 decision_calibration.json, next to the adapter or in the merged model's folder (see
-src/hmf/eval/decision/README.md).
+src/hmf/eval/decision/README.md), and its prompt settings (strands format, its BOS setting and window) as
+decision_prompt.json in the same folder, which evaluation and serving then use by default.
 
 To keep training the converted adapter, set adapter_name_or_path to <output_dir>/adapter in a training
 config with stage decision. The adapter keeps its own rank, alpha, and target modules, whatever
@@ -43,8 +44,13 @@ create_new_adapter: true to that config, or convert with --merge and train on th
 way, the training config must match the checkpoint's settings, which the conversion prints at the end.
 
 Only checkpoints whose base model hmf decision-init converts can be converted. This includes the
-Qwen3.5 releases, but not the Gemma 4 ones, whose multimodal checkpoints need loading code that HMF
-does not have.
+Qwen3.5 and Gemma 4 releases. The base model is downloaded from the Hub, unless --base_model names a
+local copy of it, which must be the revision the checkpoint was trained on:
+
+    python scripts/strands_to_hmf_decision.py \
+        --checkpoint path/to/strands-decider-E2B-gemma4-v1-2610 \
+        --base_model path/to/gemma-4-E2B-it \
+        --output_dir path/to/strands-decider-e2b
 
     # Also prepare a check that Strands Decider's loader gives the same probabilities, on the first
     # rows of a decision data file. It writes <output_dir>.check/; then, with Strands Decider's
@@ -72,9 +78,6 @@ CONFIG_NAMES = ("strands_decider_config.json", "hobson_config.json")
 HEAD_KEYS = {"norm.weight", "norm.bias", "q.weight", "q.bias", "k.weight", "k.bias"}
 # Where PEFT saves the LoRA weights of Strands Decider's decoder, and where they go on the decision model's backbone
 DECODER_PREFIX, BACKBONE_PREFIX = "base_model.model.", "base_model.model.model."
-# Base models that hmf decision-init cannot convert yet, which are Gemma 4's multimodal checkpoints, whose
-# text weights the causal LM class does not load
-UNSUPPORTED_MODEL_TYPES = {"gemma4", "gemma4_unified"}
 
 
 def _checkpoint_dir(checkpoint: str, revision: Optional[str]) -> str:
@@ -123,22 +126,6 @@ def _base_revision(checkpoint_dir: str, config: dict) -> Optional[str]:
     if provenance.get("base_model") != config["base_model"]:
         return None
     return provenance.get("base_model_revision")
-
-
-def _check_base_model(base_model: str, revision: Optional[str]) -> None:
-    """Refuses base models that hmf decision-init cannot convert, reading only their config.json."""
-    if os.path.isdir(base_model):
-        path = os.path.join(base_model, "config.json")
-    else:
-        from huggingface_hub import hf_hub_download
-
-        path = hf_hub_download(base_model, "config.json", revision=revision)
-    with open(path, encoding="utf-8") as f:
-        model_type = json.load(f).get("model_type")
-    if model_type in UNSUPPORTED_MODEL_TYPES:
-        raise ValueError(
-            f"The base model {base_model} is a {model_type} model, which hmf decision-init cannot convert yet."
-        )
 
 
 def _read_head(checkpoint_dir: str, pointer_dim: int) -> Dict[str, torch.Tensor]:
@@ -298,6 +285,23 @@ def _merge(decision_model: str, adapter_dir: str, output_dir: str, dtype: str) -
     )
 
 
+def _checkpoint_on_local_base(checkpoint_dir: str, copy_dir: str, base_model: str) -> str:
+    """
+    Copies the checkpoint to copy_dir with its settings naming the local base model, without a revision,
+    so that Strands Decider's loader runs the check without downloading the base model. Returns copy_dir.
+    """
+    shutil.copytree(checkpoint_dir, copy_dir)
+    for name in CONFIG_NAMES:
+        path = os.path.join(copy_dir, name)
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                settings = json.load(f)
+            settings.update(base_model=os.path.abspath(base_model), base_revision=None)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2)
+    return copy_dir
+
+
 def _write_check(check_dir: str, checkpoint_dir: str, model: str, adapter: Optional[str], check_data: str,
                  num_check_rows: int, max_length: int, force_bos: bool) -> str:
     """Writes the check folder with hmf_decision_to_strands.py's code, which this script shares."""
@@ -315,6 +319,7 @@ def convert(
     output_dir: str,
     merge: bool = False,
     decision_model: Optional[str] = None,
+    base_model: Optional[str] = None,
     revision: Optional[str] = None,
     check_data: Optional[str] = None,
     num_check_rows: int = 64,
@@ -327,6 +332,9 @@ def convert(
             False, which writes the decision model and the adapter separately.
         decision_model: An existing decision model of the checkpoint's base model (from hmf
             decision-init), to use instead of converting the base model again. Defaults to None.
+        base_model: A local folder with the checkpoint's base model, to convert instead of the
+            download of the model its settings name. It must be the revision the checkpoint was
+            trained on. Defaults to None.
         revision: The revision of the checkpoint on the Hugging Face Hub. Defaults to None, which
             downloads its default branch.
         check_data: A decision data file to check the conversion on: the decision model's
@@ -338,16 +346,25 @@ def convert(
         raise ValueError(f"{output_dir} already exists.")
     if check_data is not None and not os.path.isfile(check_data):
         raise ValueError(f"check_data {check_data} does not exist.")
+    if base_model is not None and decision_model is not None:
+        raise ValueError("Give base_model or decision_model, not both.")
+    if base_model is not None and not os.path.isdir(base_model):
+        raise ValueError(f"base_model {base_model} is not a folder.")
 
     checkpoint_dir = _checkpoint_dir(checkpoint, revision)
     config = _read_config(checkpoint_dir)
-    base_model, base_revision = config["base_model"], _base_revision(checkpoint_dir, config)
+    trained_on, base_revision = config["base_model"], _base_revision(checkpoint_dir, config)
     pointer_dim = config.get("pointer_dim", 256)
     head = _read_head(checkpoint_dir, pointer_dim)
     if decision_model is not None:
-        _check_decision_model(decision_model, base_model, pointer_dim)
+        _check_decision_model(decision_model, trained_on, pointer_dim)
+    if base_model is not None:
+        revision_note = f" at revision {base_revision}" if base_revision else ""
+        print(f"Note: the checkpoint was trained on {trained_on}{revision_note}, so {base_model} must be that model.")
+        # A local folder has no revision to download
+        base_revision = None
     else:
-        _check_base_model(base_model, base_revision)
+        base_model = trained_on
 
     # With --merge, the decision model and the adapter are only steps, written next to output_dir
     # (on the same file system) and deleted afterwards
@@ -369,6 +386,12 @@ def convert(
         else:
             model, adapter = decision_model, adapter_dir
         calibration = _write_calibration(adapter or model, config, checkpoint)
+        from hmf.eval.decision.predictor import save_prompt_settings
+
+        # Strands Decider's prompt is HMF's strands format, and saving its settings lets evaluation and serving use
+        # them by default
+        prompt = save_prompt_settings(adapter or model, "strands", bool(config.get("force_bos", False)),
+                                      config.get("max_length", 4096))
     finally:
         if work_dir is not None:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -379,6 +402,7 @@ def convert(
     if adapter is not None:
         print(f"  adapter:        {adapter}")
     print(f"  calibration:    {calibration or 'none (the checkpoint is uncalibrated)'}")
+    print(f"  prompt:         {prompt}")
     print(
         "Configs that train or evaluate it must match the checkpoint's settings:\n"
         "  decision_prompt_format: strands\n"
@@ -393,8 +417,12 @@ def convert(
         )
 
     if check_data is not None:
+        check_dir = output_dir.rstrip("/") + ".check"
+        reference = checkpoint_dir
+        if base_model != trained_on:
+            reference = _checkpoint_on_local_base(checkpoint_dir, os.path.join(check_dir, "checkpoint"), base_model)
         check_dir = _write_check(
-            output_dir.rstrip("/") + ".check", checkpoint_dir, model, adapter, check_data, num_check_rows,
+            check_dir, reference, model, adapter, check_data, num_check_rows,
             config.get("max_length", 4096), bool(config.get("force_bos", False)),
         )
         print(

@@ -10,9 +10,14 @@ Values on the command line (key=value, e.g. jevbench.max_len=3072) override the 
     model_name_or_path: the decision model (required)
     adapter_name_or_path: its LoRA adapter (the training output_dir), if any
     output_dir: where the reports go (required)
-    max_len, prompt_format, force_bos, ordinal_smoothing, seed, dataset_dir: as for calibrate and evaluate
-    calibration: {dataset or data, split, limit, method}: fitted first, and used by everything after
-    benchmarks: [{name, dataset or data, split, limit}, ...]: each evaluated in turn
+    max_len, prompt_format, force_bos, option_labels, ordinal_smoothing, seed, dataset_dir: as for calibrate and
+    evaluate
+    cuda_graphs: whether the model answers through CUDA graphs (see graphs.py), false by default
+    calibration: {dataset or data, split, limit, method, gate}: fitted first, and used by everything after;
+        gate, optional, holds the gate settings (rule, target, params, take_options, min_count,
+        use_weights; see gate.py), and the benchmarks then report what the gate takes
+    benchmarks: [{name, dataset or data, split, limit, pairs}, ...]: each evaluated in turn; pairs: true for a
+        pair file (see evaluate.py), which is scored whole
     jevbench: {dir, commit, max_len, port, compare: [{name, results, run}, ...]}: JevBench on a server the
         run starts and stops
 
@@ -40,8 +45,9 @@ from typing import Any, Dict, List, Optional, Sequence
 from ...extras import logging
 from .calibrate import calibrate
 from .evaluate import evaluate
+from .gate import check_gate_settings
 from .jevbench import compare, load_results
-from .predictor import DecisionPredictor, calibration_path, load_calibration
+from .predictor import AUTO, DecisionPredictor, calibration_path, load_calibration
 
 
 logger = logging.get_logger(__name__)
@@ -191,6 +197,14 @@ def _summary_table(results: Dict[str, Any]) -> str:
             f"{calibration['after']['ece']:.3f} after.",
             "",
         ]
+        gate = calibration.get("gate")
+        if gate:
+            target = "" if gate["target"] is None else f" {gate['target']}"
+            fitted = ", ".join(
+                f"{kind} {'none' if gate['thresholds'][kind] is None else format(gate['thresholds'][kind], '.4f')} "
+                f"({b['share']:.1%} taken)" for kind, b in gate["fitted"].items()
+            )
+            lines += [f"Gate ({gate['rule']}{target}), thresholds by kind: {fitted}.", ""]
     else:
         lines += [f"Calibration: {results['calibration_used']}.", ""]
     if results.get("benchmarks"):
@@ -206,6 +220,29 @@ def _summary_table(results: Dict[str, Any]) -> str:
                 f"{o['nll']:.3f} | {tasks} |"
             )
         lines.append("")
+        paired = {name: report["pairs"] for name, report in results["benchmarks"].items() if report.get("pairs")}
+        if paired:
+            lines += [
+                "| benchmark | pairs | pairs left out | same answer | both right | accuracy of first / second |",
+                "| --- | --- | --- | --- | --- | --- |",
+            ]
+            for name, p in paired.items():
+                if not p["pairs"]:
+                    lines.append(f"| {name} | 0 | {p['num_pairs_skipped']} | - | - | - |")
+                    continue
+                lines.append(
+                    f"| {name} | {p['pairs']:,} | {p['num_pairs_skipped']} | {p['same_answer']:.3f} | "
+                    f"{p['both_right']:.3f} | {p['acc_first']:.3f} / {p['acc_second']:.3f} |"
+                )
+            lines.append("")
+        gated = {name: report["gate"] for name, report in results["benchmarks"].items() if report.get("gate")}
+        if gated:
+            lines += ["| benchmark | taken by the gate | accuracy of the taken answers |", "| --- | --- | --- |"]
+            for name, g in gated.items():
+                accuracy = "-" if g["overall"]["accuracy"] is None else f"{g['overall']['accuracy']:.3f}"
+                lines.append(f"| {name} | {g['overall']['taken']:,} of {g['overall']['rows']:,} "
+                             f"({g['overall']['share']:.1%}) | {accuracy} |")
+            lines.append("")
     jevbench = results.get("jevbench")
     if jevbench:
         s = jevbench["summary"]
@@ -236,14 +273,13 @@ def run_suite(path: str, *overrides: str) -> Dict[str, Any]:
     suite = load_suite(path, overrides)
     model, adapter, output_dir = suite["model_name_or_path"], suite.get("adapter_name_or_path"), suite["output_dir"]
     dataset_dir = suite.get("dataset_dir", "data")
-    options = {
-        "prompt_format": suite.get("prompt_format", "strands"),
-        "force_bos": suite.get("force_bos", False),
-        "max_len": suite.get("max_len", 4096),
-    }
+    # Settings the suite leaves out come from the model's decision_prompt.json, else the defaults (see predictor.py)
+    options = {key: suite.get(key, AUTO) for key in ("prompt_format", "force_bos", "max_len", "option_labels")}
     jevbench = suite.get("jevbench")
     # Every check before the first model is loaded
     calibration_data = resolve_data(suite["calibration"], dataset_dir) if suite.get("calibration") else None
+    if calibration_data is not None and suite["calibration"].get("gate") is not None:
+        check_gate_settings(suite["calibration"]["gate"])
     benchmarks = {b["name"]: (b, resolve_data(b, dataset_dir)) for b in suite.get("benchmarks") or []}
     if jevbench:
         _check_jevbench(jevbench, output_dir)
@@ -252,14 +288,15 @@ def run_suite(path: str, *overrides: str) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
     seed = suite.get("seed", 0)
     # The model is loaded once, for calibration, the benchmarks, and JevBench
-    predictor = DecisionPredictor(model, adapter, calibration=None, **options)
+    predictor = DecisionPredictor(model, adapter, calibration=None, cuda_graphs=suite.get("cuda_graphs", False),
+                                  **options)
     saved = calibration_path(model, adapter)
     if calibration_data is not None:
         section = suite["calibration"]
         results["calibration"] = calibrate(
             model, calibration_data, adapter, split=section.get("split", "calib"), limit=section.get("limit", 4000),
             seed=seed, ordinal_smoothing=suite.get("ordinal_smoothing", 0.1), method=section.get("method", "nll"),
-            predictor=predictor,
+            gate=section.get("gate"), predictor=predictor,
         )
         shutil.copy(saved, os.path.join(output_dir, "calibration.json"))
     # From here on, the model answers at its calibration, either the one just fitted or the one it had
@@ -268,8 +305,8 @@ def run_suite(path: str, *overrides: str) -> Dict[str, Any]:
     results["benchmarks"] = {}
     for name, (section, data) in benchmarks.items():
         results["benchmarks"][name] = evaluate(
-            model, data, adapter, split=section.get("split", "test"), limit=section.get("limit", 4000), seed=seed,
-            out=os.path.join(output_dir, f"{name}.json"), predictor=predictor,
+            model, data, adapter, split=section.get("split"), limit=section.get("limit"), seed=seed,
+            out=os.path.join(output_dir, f"{name}.json"), predictor=predictor, pairs=section.get("pairs", False),
         )
     if jevbench:
         results["jevbench"] = run_jevbench(jevbench, predictor, output_dir)

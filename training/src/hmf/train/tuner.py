@@ -115,6 +115,36 @@ def run_exp(args: Optional[dict[str, Any]] = None, callbacks: Optional[list["Tra
         _training_function(config={"args": args, "callbacks": callbacks})
 
 
+def _copy_decision_files(
+    model_name_or_path: str, adapter_name_or_path: Optional[list[str]], export_dir: str
+) -> None:
+    """
+    Copies a decision model's calibration and prompt settings (see eval/decision/predictor.py) into the exported
+    folder, from the folder that describes the exported model, which is the adapter's when one adapter is merged,
+    or the model's own when there is none. The base model's files describe the base model alone, not the base
+    model with an adapter merged into it, so a merged model gets no file the adapter lacks, and a merge of several
+    adapters gets none, since neither file describes it.
+
+    Args:
+        model_name_or_path: The decision model.
+        adapter_name_or_path: The adapters merged into it, if any.
+        export_dir: The exported model's folder.
+    """
+    from ..eval.decision.predictor import CALIBRATION_FILE, PROMPT_FILE
+
+    if adapter_name_or_path is not None and len(adapter_name_or_path) > 1:
+        logger.warning_rank0(
+            f"{len(adapter_name_or_path)} adapters were merged, so the exported model gets no {CALIBRATION_FILE} or "
+            f"{PROMPT_FILE}. Calibrate it again and save its prompt settings."
+        )
+        return
+    source = adapter_name_or_path[0] if adapter_name_or_path else model_name_or_path
+    for name in (CALIBRATION_FILE, PROMPT_FILE):
+        if os.path.isfile(os.path.join(source, name)):
+            shutil.copy(os.path.join(source, name), os.path.join(export_dir, name))
+            logger.info_rank0(f"Copied {name} from {source} to {export_dir}.")
+
+
 def export_model(args: Optional[dict[str, Any]] = None) -> None:
     model_args, data_args, finetuning_args, _ = get_infer_args(args)
 
@@ -169,6 +199,9 @@ def export_model(args: Optional[dict[str, Any]] = None) -> None:
             max_shard_size=f"{model_args.export_size}GB",
             safe_serialization=(not model_args.export_legacy_format),
         )
+
+    if finetuning_args.stage == "decision":
+        _copy_decision_files(model_args.model_name_or_path, model_args.adapter_name_or_path, model_args.export_dir)
 
     if finetuning_args.stage == "rm":
         if model_args.adapter_name_or_path is not None:

@@ -17,6 +17,8 @@ from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_rope_utils import RopeParameters
 from transformers.utils import logging
 
+from ..utils import hybrid_layer_types
+
 
 logger = logging.get_logger(__name__)
 
@@ -74,7 +76,8 @@ class HybridQwen2Config(PreTrainedConfig):
             The number of layers using full attention. The first `max_window_layers` layers will use full attention, while any
             additional layer afterwards will use SWA (Sliding Window Attention).
         layer_types (`list`, *optional*):
-            Attention pattern for each layer.
+            The kind of each layer in transformers' names, such as "full_attention" or "linear_attention". A config
+            with a hybrid_override_pattern derives them from the pattern and ignores this argument.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
         pad_token_id (`int`, *optional*):
@@ -89,7 +92,7 @@ class HybridQwen2Config(PreTrainedConfig):
     """
 
     model_type = "hybrid_qwen2"
-    keys_to_ignore_at_inference = ["past_key_values"]
+    keys_to_ignore_at_inference = ["cache"]
 
     # Default tensor parallel plan for base model `Qwen2`
     base_model_tp_plan = {
@@ -152,7 +155,6 @@ class HybridQwen2Config(PreTrainedConfig):
         self.sliding_window = sliding_window if self.use_sliding_window else None
         self.max_window_layers = max_window_layers
         self.hybrid_override_pattern = hybrid_override_pattern
-        self.layer_types = layer_types
 
         # for backward compatibility
         if num_key_value_heads is None:
@@ -165,18 +167,20 @@ class HybridQwen2Config(PreTrainedConfig):
         self.use_cache = use_cache
         self.attention_dropout = attention_dropout
 
+        # The base model's attention kinds, which Qwen2 derives from its sliding window settings
+        base_layer_types = [
+            (
+                "sliding_attention"
+                if self.sliding_window is not None and i >= self.max_window_layers
+                else "full_attention"
+            )
+            for i in range(self.num_hidden_layers)
+        ]
         if self.hybrid_override_pattern is not None:
-            self.layer_types = self.hybrid_override_pattern.split("-")
-        elif self.layer_types is None:
-            self.layer_types = [
-                (
-                    "sliding_attention"
-                    if self.sliding_window is not None and i >= self.max_window_layers
-                    else "full_attention"
-                )
-                for i in range(self.num_hidden_layers)
-            ]
-        assert len(self.layer_types) == self.num_hidden_layers, f"Number of elements in layer_types ({len(self.layer_types)}) does not equal num_hidden_layers ({self.num_hidden_layers})"
+            layer_types = hybrid_layer_types(self.hybrid_override_pattern, base_layer_types)
+        elif layer_types is None:
+            layer_types = base_layer_types
+        self.layer_types = layer_types
 
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id

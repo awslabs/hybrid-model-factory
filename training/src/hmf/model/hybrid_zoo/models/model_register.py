@@ -33,6 +33,7 @@ logger = logging.get_logger(__name__)
 try:
     from transformers.utils.auto_docstring import HARDCODED_CONFIG_FOR_MODELS
     HARDCODED_CONFIG_FOR_MODELS.update({
+        "hybrid-gemma4": "HybridGemma4TextConfig",
         "hybrid-llama": "HybridLlamaConfig",
         "hybrid-ministral3": "HybridMinistral3Config",
         "hybrid-qwen2": "HybridQwen2Config",
@@ -79,6 +80,10 @@ def register_model_family(
     
     for model_class in model_classes:
         class_name = model_class.__name__
+        # A family's PreTrainedModel base class also ends with "Model", but it has no forward of its own, and
+        # registering it after the family's Model would make AutoModel build it instead
+        if class_name.endswith("PreTrainedModel"):
+            continue
         for suffix, auto_class in AUTO_MODEL_REGISTRY.items():
             if class_name.endswith(suffix):
                 auto_class.register(config_class, model_class)
@@ -308,7 +313,6 @@ def register_hybrid_models():
             ["Qwen3NextHMFForCausalLM",
              "Qwen3NextHMFForQuestionAnswering",
              "Qwen3NextHMFModel",
-             "Qwen3NextHMFPreTrainedModel",
              "Qwen3NextHMFForSequenceClassification",
              "Qwen3NextHMFForTokenClassification"],
             Qwen3NextHMFConfig,
@@ -334,6 +338,17 @@ def register_hybrid_models():
     except ImportError:
         pass
     AutoModel.register(HybridQwen2_5_VLConfig, HybridQwen2_5_VLModel)
+
+    # Hybrid Gemma 4 (text only)
+    from .hybrid_gemma4.configuration_hybrid_gemma4 import HybridGemma4TextConfig
+    register_model_family(
+        HybridGemma4TextConfig,
+        _import_models(
+            ".hybrid_gemma4.modeling_hybrid_gemma4",
+            ["HybridGemma4ForCausalLM", "HybridGemma4TextModel"],
+            HybridGemma4TextConfig,
+        ),
+    )
 
     # Decision models (any AutoModel backbone with a pointer head instead of an LM head)
     from .decision.configuration_decision import DecisionConfig

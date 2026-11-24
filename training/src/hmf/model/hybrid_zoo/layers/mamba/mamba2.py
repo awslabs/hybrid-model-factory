@@ -68,6 +68,7 @@ from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 if TYPE_CHECKING:
     from hmf.model.hybrid_zoo.models.cache import Mamba2Cache
 
+from ..mask_utils import padding_mask_for_new_tokens
 from ..sp_p2p_utils import reorder_for_ssm_p2p
 from .sequence_parallel.mamba2.mamba_mixer_cp_utils import state_passing_p2p
 
@@ -366,7 +367,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         seqlen: Optional[int] = None,
         seq_idx: Optional[Tensor] = None,
         cu_seqlens: Optional[Tensor] = None,
-        past_key_values: Optional["Mamba2Cache"] = None,
+        cache: Optional["Mamba2Cache"] = None,
+        attention_mask: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, None, "Mamba2Cache"]:
         """
@@ -399,14 +401,18 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 Used with causal_conv1d for efficient varlen processing.
             cu_seqlens: Optional tensor of cumulative sequence lengths for packed sequences.
                 Shape [num_sequences + 1,] where cu_seqlens[i] is the start position of sequence i.
-            past_key_values: Optional Mamba2Cache containing conv_state and ssm_state for inference.
-                When provided with seqlen_offset > 0, performs incremental decoding via step().
+            cache: Optional Mamba2Cache containing conv_state and ssm_state for inference.
+                Once this layer has processed tokens, the layer decodes incrementally via step().
+            attention_mask: Optional padding mask, 2D or the 4D mask of SDPA and eager. The padded tokens' inputs
+                are zeroed before and after the convolution, so that they don't enter the state, and a left-padded
+                row then gives the same outputs as on its own. Left padding only comes with a prefill, so a decoding
+                step needs no mask.
 
         Returns:
-            Tuple of (output, None, past_key_values) where:
+            Tuple of (output, None, cache) where:
                 - output: Same shape as hidden_states input
                 - None: Placeholder for consistency with other SSM layers
-                - past_key_values: Updated cache (same as input if provided, else None)
+                - cache: Updated cache (same as input if provided, else None)
         """
         if self.sequence_parallel_group:
             assert cu_seqlens is None, "SP not implemented for varlen Mamba2."
@@ -417,18 +423,27 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             batch_seqlen, dim = hidden_states.shape
             batch = batch_seqlen // seqlen
 
+        # [B, L, 1], 1 for real tokens and 0 for padding, or None without padding. Sequence parallelism and packed
+        # inputs pass no padding mask.
+        padding = padding_mask_for_new_tokens(attention_mask, seqlen)
+        if padding is not None:
+            assert self.sequence_parallel_group is None and cu_seqlens is None, (
+                "Mamba2 takes a padding mask without sequence parallelism or packed inputs only"
+            )
+            padding = padding[..., None]
+
         conv_state, ssm_state = None, None
-        if past_key_values is not None:
+        if cache is not None:
             inference_batch = (
                 cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch
             )
             conv_state, ssm_state = self._get_states_from_cache(
-                past_key_values, inference_batch
+                cache, inference_batch
             )
             log_aprods = self._get_log_aprods_from_cache(
-                past_key_values, inference_batch
+                cache, inference_batch
             )
-            if past_key_values.seqlen_offset > 0:
+            if cache.seen_tokens(self.layer_idx) > 0:
                 # Single-token decoding - states are updated inplace
                 out, _, _ = self.step(
                     hidden_states,
@@ -437,7 +452,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                     position_embeddings=position_embeddings,
                     log_aprods=log_aprods,
                 )
-                return out, None, past_key_values
+                cache.record_tokens(self.layer_idx, seqlen)
+                return out, None, cache
 
         zxbcdt = self.in_proj(hidden_states)  # [B, L, Din + Dxbc + H]
 
@@ -483,6 +499,10 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             xBC, position_embeddings=position_embeddings
         )  # [B_sp, L_sp, Dxbc]
 
+        # The padded tokens give the convolution, and the conv state that the cache keeps, only zeros
+        if padding is not None:
+            xBC = xBC * padding.to(xBC.dtype)
+
         if conv_state is not None:
             assert (
                 self.sequence_parallel_group is None
@@ -522,6 +542,10 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             ).transpose(
                 1, 2
             )  # [B_sp, L_sp, Dxbc]
+
+        # The scan then gets no input from the padded tokens, so the state stays at 0 until the first real token
+        if padding is not None:
+            xBC = xBC * padding.to(xBC.dtype)
 
         if self.sequence_parallel_group is not None:
             # When SP is activated, we need to remove the first tokens since they were just needed for the conv operation.
@@ -576,7 +600,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 **dt_limit_kwargs,
                 return_final_states=return_final_states,
                 return_varlen_states=cu_seqlens is not None
-                and past_key_values is not None,
+                and cache is not None,
             )  # [B_sp, Lp, H, D]
         # During training, if SP=1, y shape is [B, L, H, D]
         # If SP>1, it is a tuple since return_final_states is True in this case.
@@ -677,20 +701,25 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         out = self.out_proj(y)  # [B, L, Dm]
 
         # Cache cumulative A products for state composition
-        if past_key_values and past_key_values.cache_aprods:
-            log_aprods = self._get_log_aprods_from_cache(past_key_values, inference_batch)
+        if cache and cache.cache_aprods:
+            log_aprods = self._get_log_aprods_from_cache(cache, inference_batch)
             dt = F.softplus(dt + repeat(self.dt_bias.to(dtype=dt.dtype), 
                                        "h -> b l h", b=dt.shape[0], l=dt.shape[1]))
             
             log_dA = dt * A
+            # The padded tokens don't decay the state in the products that cache composition reads either
+            if padding is not None:
+                log_dA = log_dA * padding.to(log_dA.dtype)
             log_next_aprods = torch.sum(log_dA, dim=1)
             
-            if past_key_values.seqlen_offset <= 0:
+            if cache.seen_tokens(self.layer_idx) <= 0:
                 log_aprods.copy_(log_next_aprods)
             else:
                 log_aprods.copy_(log_aprods + log_next_aprods)
 
-        return out, None, past_key_values
+        if cache is not None:
+            cache.record_tokens(self.layer_idx, seqlen)
+        return out, None, cache
 
     def step(
         self,
@@ -857,13 +886,13 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         return conv_state, ssm_state
 
     def _get_states_from_cache(
-        self, past_key_values, batch_size, initialize_states=False
+        self, cache, batch_size, initialize_states=False
     ):
         """
         Retrieves or initializes conv and SSM states from the cache.
 
         Args:
-            past_key_values: Mamba2Cache object containing cached states.
+            cache: Mamba2Cache object containing cached states.
             batch_size: Batch size for state initialization.
             initialize_states: If True, zeros out existing states.
 
@@ -871,7 +900,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             Tuple of (conv_state, ssm_state) retrieved from or stored in the cache.
         """
         assert self.layer_idx is not None
-        if self.layer_idx not in past_key_values.key_value_memory_dict:
+        if self.layer_idx not in cache.key_value_memory_dict:
             batch_shape = (batch_size,)
             conv_state = torch.zeros(
                 batch_size,
@@ -888,12 +917,12 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 device=self.in_proj.weight.device,
                 dtype=self.in_proj.weight.dtype,
             )
-            past_key_values.key_value_memory_dict[self.layer_idx] = (
+            cache.key_value_memory_dict[self.layer_idx] = (
                 conv_state,
                 ssm_state,
             )
         else:
-            conv_state, ssm_state = past_key_values.key_value_memory_dict[
+            conv_state, ssm_state = cache.key_value_memory_dict[
                 self.layer_idx
             ]
             # TODO: What if batch size changes between generation, and we reuse the same states?
@@ -902,22 +931,22 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 ssm_state.zero_()
         return conv_state, ssm_state
 
-    def _get_log_aprods_from_cache(self, past_key_values, batch_size, reset_aprods=False):
+    def _get_log_aprods_from_cache(self, cache, batch_size, reset_aprods=False):
         """Retrieve or initialize log(A_prod) from cache for state composition."""
         assert self.layer_idx is not None
-        if not past_key_values.cache_aprods:
+        if not cache.cache_aprods:
             return None
         
-        if self.layer_idx not in past_key_values.log_aprods:
+        if self.layer_idx not in cache.log_aprods:
             log_aprods = torch.zeros(
                 batch_size,
                 self.nheads,
                 device=self.in_proj.weight.device,
                 dtype=self.in_proj.weight.dtype,
             )
-            past_key_values.log_aprods[self.layer_idx] = log_aprods
+            cache.log_aprods[self.layer_idx] = log_aprods
         else:
-            log_aprods = past_key_values.log_aprods[self.layer_idx]
+            log_aprods = cache.log_aprods[self.layer_idx]
             if reset_aprods:
                 log_aprods.zero_()
 

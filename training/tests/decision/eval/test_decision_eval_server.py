@@ -5,7 +5,8 @@ Tests for the decision server (hmf/eval/decision/server.py) and the comparison o
     - the protocol, with each answer's fields, and invalid requests refused with 422;
     - the answers equal DecisionPredictor's for the same questions, calibrated or not, and a
       request's questions are answered as if asked alone;
-    - prompts longer than the window, whose state is cut and options kept, and which --strict_window refuses;
+    - prompts longer than the window, whose state is cut and options kept, and which --strict_window refuses, for
+      every prompt format;
     - the server listens on 127.0.0.1 only;
     - the exact McNemar test.
 """
@@ -44,8 +45,10 @@ QUESTIONS = {
 def _server(trained, **kwargs) -> DecisionServer:
     calibration = kwargs.pop("calibration", None)
     max_len = kwargs.pop("max_len", 4096)
+    prompt_format = kwargs.pop("prompt_format", "strands")
     predictor = DecisionPredictor(
-        trained["model_dir"], trained["adapter_dir"], device="cpu", calibration=calibration, max_len=max_len
+        trained["model_dir"], trained["adapter_dir"], device="cpu", calibration=calibration, max_len=max_len,
+        prompt_format=prompt_format,
     )
     return DecisionServer(predictor, **kwargs)
 
@@ -118,13 +121,14 @@ def test_health(trained):
 # Consistency
 
 
+@pytest.mark.parametrize("prompt_format", ["strands", "question_first", "read_twice"])
 @pytest.mark.parametrize("calibrated", [False, True])
-def test_answers_equal_the_predictors(trained, tmp_path, calibrated):
+def test_answers_equal_the_predictors(trained, tmp_path, calibrated, prompt_format):
     calibration = None
     if calibrated:
         calibration = str(tmp_path / "calibration.json")
         Path(calibration).write_text(json.dumps({"temperature": 1.5, "temperature_by_kind": {"choice": 0.7}}))
-    server = _server(trained, calibration=calibration)
+    server = _server(trained, calibration=calibration, prompt_format=prompt_format)
     request = _request()
 
     reply = server.answer(request)
@@ -133,6 +137,7 @@ def test_answers_equal_the_predictors(trained, tmp_path, calibrated):
         [probs] = server.predictor.probabilities([question_row(request.state, question)])
         answer = reply["answers"][name]
         if question.type == "noul":
+            # Replies round to 4 decimals, so they differ from the predictor's by at most 5e-5
             assert answer["noul"] == pytest.approx(probs[1], abs=1e-4)  # options shown as [false, true]
         else:
             assert list(answer["probabilities"].values()) == pytest.approx(probs, abs=1e-4)
@@ -156,19 +161,41 @@ def test_questions_together_are_answered_as_alone(trained):
 # The window
 
 
-def test_long_states_are_cut_to_fit(trained):
-    server = _server(trained, max_len=80)
-    long_state = "state " * 300
-    rendered, states = zip(*(server._render(question_row(long_state, q)) for q in _request().questions.values()))
+# read_twice holds the question twice, which needs a larger window than the other formats
+WINDOWS = {"strands": 80, "question_first": 80, "read_twice": 200}
 
-    encoded = server._encode(list(rendered), list(states))
+
+@pytest.mark.parametrize("prompt_format", ["strands", "question_first", "read_twice"])
+def test_long_states_are_cut_to_fit(trained, prompt_format):
+    window = WINDOWS[prompt_format]
+    server = _server(trained, max_len=window, prompt_format=prompt_format)
+    long_state = "state " * 300
+    rendered, rows = zip(*(server._render(question_row(long_state, q)) for q in _request().questions.values()))
+
+    encoded = server._encode(list(rendered), list(rows))
 
     for e in encoded:
-        assert len(e.input_ids) <= 80
+        assert len(e.input_ids) <= window
         # The options and the answer marker survive, in order, after the state
         assert all(0 < i < e.answer_idx for i in e.opt_idx) and e.answer_idx == len(e.input_ids) - 1
     reply = server.answer(_request(state=long_state))  # answered
     assert set(reply["answers"]) == set(QUESTIONS)
+
+
+@pytest.mark.parametrize("prompt_format", ["question_first", "read_twice"])
+def test_question_first_and_read_twice_keep_the_longest_state_that_fits(trained, prompt_format):
+    window = WINDOWS[prompt_format]
+    server = _server(trained, max_len=window, prompt_format=prompt_format)
+    question = _request().questions["pick"]
+    rendered, row = server._render(question_row("state " * 300, question))
+    [encoded] = server._encode([rendered], [row])
+    assert len(encoded.input_ids) <= window
+    # The state kept is the longest that fits, since one more word of state makes the prompt too long
+    copies = 2 if prompt_format == "read_twice" else 1
+    kept = encoded.input_ids.count(server.tokenizer.convert_tokens_to_ids("state")) // copies
+    assert 0 < kept < 300
+    longer = server.prompt.prompt_format.render("state " * (kept + 1), row["instructions"], row["kind"], row["options"])
+    assert len(server.tokenizer(longer.text)["input_ids"]) > window
 
 
 def test_strict_window_refuses_long_prompts(trained):
@@ -255,3 +282,52 @@ def test_compare_runs(tmp_path):
     assert result["both_right"] == 1 and result["both_wrong"] == 1
     with pytest.raises(ValueError, match="name the run"):
         load_results(str(b))
+
+
+# The gate
+
+
+def _gated_server(trained, tmp_path, thresholds, take_options=None, **kwargs) -> DecisionServer:
+    calibration = tmp_path / "gated_calibration.json"
+    calibration.write_text(json.dumps({
+        "method": "nll", "temperature": 1.0, "temperature_by_kind": {},
+        "gate": {"rule": "accuracy", "target": 0.9, "params": {}, "take_options": take_options, "min_count": 1,
+                 "use_weights": False, "thresholds": thresholds},
+    }))
+    return _server(trained, calibration=str(calibration), **kwargs)
+
+
+def test_the_gate_compares_the_top_probability(trained, tmp_path):
+    pick = {"pick": QUESTIONS["pick"]}
+    probs = _server(trained).answer(_request(pick))["answers"]["pick"]["probabilities"]
+    top = max(probs.values())
+    confidence = choice_confidence(list(probs.values()))
+    # A threshold between the answer's confidence and its top probability: the gate takes it, as it reads the
+    # top probability, which the threshold was fitted on
+    between = (confidence + top) / 2
+    answer = _gated_server(trained, tmp_path, {"choice": between}).answer(_request(pick))["answers"]["pick"]
+    assert answer["take"] is True and answer["confidence"] < between
+    above = _gated_server(trained, tmp_path, {"choice": min(1.0, top + 0.01)})
+    assert above.answer(_request(pick))["answers"]["pick"]["take"] is False
+
+
+def test_the_gate_only_takes_its_options_and_kinds(trained, tmp_path):
+    reply = _server(trained).answer(_request())
+    choice = reply["answers"]["pick"]["choice"]
+    others = [name for name in QUESTIONS["pick"]["criteria"] if name != choice]
+
+    taken = _gated_server(trained, tmp_path, {"choice": 0.0}, take_options=[choice]).answer(_request())["answers"]
+    assert taken["pick"]["take"] is True
+    assert taken["yes_no"]["take"] is False and taken["rate"]["take"] is False  # no threshold for these kinds
+
+    not_taken = _gated_server(trained, tmp_path, {"choice": 0.0}, take_options=others).answer(_request())["answers"]
+    assert not_taken["pick"]["take"] is False
+
+
+def test_without_a_gate_or_raw_answers_have_no_take(trained, tmp_path):
+    assert all("take" not in a for a in _server(trained).answer(_request())["answers"].values())
+    raw = _gated_server(trained, tmp_path, {"choice": 0.0}, raw=True)
+    assert all("take" not in a for a in raw.answer(_request())["answers"].values())
+    assert raw.health()["gate"] is None
+    gated = _gated_server(trained, tmp_path, {"choice": 0.5}).health()["gate"]
+    assert gated["rule"] == "accuracy" and gated["thresholds"] == {"choice": 0.5}

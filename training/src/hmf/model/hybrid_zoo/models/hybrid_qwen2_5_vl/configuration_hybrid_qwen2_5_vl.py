@@ -15,7 +15,8 @@ from ..hybrid_qwen2.configuration_hybrid_qwen2 import HybridQwen2Config
 
 class HybridQwen2_5_VLConfig(Qwen2_5_VLConfig):
     model_type = "hybrid_qwen2_5_vl"
-    sub_configs = {
+    # Qwen2_5_VLConfig builds its sub-configs from sub_configs_defaults, and sub_configs is derived from them
+    sub_configs_defaults = {
         "vision_config": Qwen2_5_VLVisionConfig,
         "text_config": HybridQwen2Config,
     }

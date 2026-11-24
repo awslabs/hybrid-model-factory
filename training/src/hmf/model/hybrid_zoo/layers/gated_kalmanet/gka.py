@@ -334,7 +334,7 @@ class GatedKalmaNet(nn.Module):
         self,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,
-        past_key_values: Optional["GatedKalmaNetCache"] = None,
+        cache: Optional["GatedKalmaNetCache"] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
         **kwargs,
@@ -364,31 +364,49 @@ class GatedKalmaNet(nn.Module):
 
         Args:
             hidden_states: Input tensor with shape [B, L/SP, Dh].
-            attention_mask: Optional 0-1 mask. Not used.
-            past_key_values: Optional cache containing conv_state and recurrent_state
+            attention_mask: Optional padding mask, 2D or the 4D mask of SDPA and eager. At inference, the padded
+                tokens' queries, keys, and values are zeroed, so that they don't enter the state.
+            cache: Optional cache containing conv_state and recurrent_state
                 for inference. When provided, performs incremental decoding.
             use_cache: Whether to return updated cache states. Defaults to False.
             output_attentions: Whether to return attention weights (not used). Defaults to False.
             **kwargs: Additional keyword arguments, may include cu_seqlens for packed sequences.
 
         Returns:
-            Tuple of (output, attention_weights, past_key_values) where:
+            Tuple of (output, attention_weights, cache) where:
                 - output: Output tensor with same shape as hidden_states [B, L, Dh]
                 - attention_weights: None (not computed for GKA)
-                - past_key_values: Updated cache (same as input if provided, else None)
+                - cache: Updated cache (same as input if provided, else None)
         """
-        # The kernels cannot skip padding, so inference fails if any new token is padding. A mask without padding
-        # among the new tokens, such as the 4D mask SDPA builds for a step after a prefill, is ignored.
-        if not self.training and padding_mask_for_new_tokens(attention_mask, hidden_states.shape[1]) is not None:
-            raise NotImplementedError(
-                "GKA kernels currently do not support varlen inputs."
-            )
+        # The kernels cannot skip padding, so at inference the padded tokens' queries, keys, and values are zeroed
+        # before and after the short convolutions. A zero key and value do not add anything to the state, which sums
+        # decayed k k^T and k v^T, so the state stays at 0 until the first real token, as for an unpadded row. 
+        # A mask without padding among the new tokens, such as the 4D mask SDPA builds for a step after a prefill,
+        #  gives None.
+        padding = None if self.training else padding_mask_for_new_tokens(attention_mask, hidden_states.shape[1])
+        if padding is not None:
+            # Neat packing's block-diagonal mask (under SDPA and eager) looks like left padding in its last row, so
+            # positions that restart within a row, which only packing gives, are refused rather than taken for it.
+            # Qwen3.5's multimodal positions have three rows, of which the first never decreases within a sample.
+            position_ids = kwargs.get("position_ids")
+            if position_ids is not None and position_ids.dim() == 3:
+                position_ids = position_ids[0]
+            packed = position_ids is not None and bool((position_ids.diff(dim=-1) < 0).any())
+            if packed or self.sequence_parallel_group is not None or kwargs.get("cu_seqlens") is not None:
+                raise NotImplementedError(
+                    "GKA kernels currently do not support varlen inputs: a padding mask works only without packing "
+                    "or sequence parallelism."
+                )
+            padding = padding[..., None].to(hidden_states.dtype)  # [B, L, 1]
+
+        def masked(x: Tensor) -> Tensor:
+            return x if padding is None else x * padding.to(x.dtype)
 
         batch_size, q_len, _ = hidden_states.shape
 
         last_state = None
-        if past_key_values is not None:
-            last_state = past_key_values[self.layer_idx]
+        if cache is not None:
+            last_state = cache[self.layer_idx]
 
         cu_seqlens = kwargs.get("cu_seqlens", None)
 
@@ -418,7 +436,7 @@ class GatedKalmaNet(nn.Module):
             conv_state_q, conv_state_k, conv_state_v = last_state["conv_state"]
 
         q, conv_state_q = self.q_conv1d(
-            x=self.q_proj(hidden_states),
+            x=masked(self.q_proj(hidden_states)),
             cache=conv_state_q,
             output_final_state=use_cache,
             cu_seqlens=cu_seqlens,
@@ -427,7 +445,7 @@ class GatedKalmaNet(nn.Module):
         # conv_state_q: [B, Dq, C] or None
 
         k, conv_state_k = self.k_conv1d(
-            x=self.k_proj(hidden_states),
+            x=masked(self.k_proj(hidden_states)),
             cache=conv_state_k,
             output_final_state=use_cache,
             cu_seqlens=cu_seqlens,
@@ -437,7 +455,7 @@ class GatedKalmaNet(nn.Module):
 
         if self.use_v_conv:
             v, conv_state_v = self.v_conv1d(
-                x=self.v_proj(hidden_states),
+                x=masked(self.v_proj(hidden_states)),
                 cache=conv_state_v,
                 output_final_state=use_cache,
                 cu_seqlens=cu_seqlens,
@@ -447,6 +465,7 @@ class GatedKalmaNet(nn.Module):
         else:
             v = self.v_proj(hidden_states)  # [B_sp, L_sp, Dv]
             conv_state_v = None
+        q, k, v = masked(q), masked(k), masked(v)
 
         # Remove padding for custom zigzag SP (first conv_size-1 tokens added by P2P)
         if self.sequence_parallel_group is not None:
@@ -662,13 +681,20 @@ class GatedKalmaNet(nn.Module):
             o = o.to(q)
 
         # Update cache
-        if past_key_values is not None:
-            past_key_values.update(
+        if cache is not None:
+            cache.update(
                 recurrent_state=(h_kk, h_kv),
                 conv_state=(conv_state_q, conv_state_k, conv_state_v),
                 layer_idx=self.layer_idx,
                 offset=q_len,
             )
+
+        # A padded token's state is still all zero, which the solver can't handle, since its ridge strength and step
+        # size scale with the state's norm, so its output is NaN. It is replaced with 0, since even masked attention
+        # in the next layer would carry a NaN into the real tokens (0 * NaN is NaN). The real tokens' outputs are
+        # unaffected, as each token's solve reads only its own query and a state that its own key already entered.
+        if padding is not None:
+            o = torch.where(padding[..., None].bool(), o, torch.zeros_like(o))
 
         # Apply output gating and normalization
         if self.use_gate:
@@ -693,4 +719,4 @@ class GatedKalmaNet(nn.Module):
                 o = torch.cat([o[: bz // 2], o[bz // 2 :]], dim=1).contiguous()
             # o: [B, L/SP, Dh]
 
-        return o, None, past_key_values
+        return o, None, cache

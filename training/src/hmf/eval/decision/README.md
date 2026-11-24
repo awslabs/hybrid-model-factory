@@ -1,35 +1,78 @@
-# Evaluating Decision Models
+# Evaluating and Serving Decision Models
 
-This package evaluates decision models trained with `stage: decision`. It calibrates a model, and then measures its accuracy and calibration on a set of benchmarks.
+This package evaluates and serves decision models trained with `stage: decision`. It calibrates a model, measures its accuracy and calibration on a set of benchmarks, and answers questions with it over HTTP ([serving a model](#serving-a-model)).
 
-- **The split of held-out data, the definition of confidence, and the metrics are defined as in [Strands Decider](https://github.com/strands-labs/strands-decider)'s evaluation,** and so is the calibration with `--method strands_decider`, so that results can be compared with the numbers it publishes. By default, the calibration instead fits the probabilities themselves ([How It Measures](#how-it-measures)).
+- **The split of held-out data, the definition of confidence, and the metrics are defined as in [Strands Decider](https://github.com/strands-labs/strands-decider)'s evaluation,** and so is the calibration with `--method strands_decider`, so that results can be compared with the numbers it publishes. By default, the calibration instead fits the probabilities themselves ([how calibration, the gate, and the metrics work](#how-calibration-the-gate-and-the-metrics-work)).
 - **The benchmarks listed below are built by Strands Decider,** from public datasets and from its own generated data. Any data file in the decision format can be evaluated in the same way.
 - **JevBench is an external benchmark,** which HMF runs against a server for the model.
 
-## The Benchmarks
+## Serving a Model
+
+A trained decision model answers questions over HTTP, using the same request format as Strands Decider's server, in three steps.
+
+**1. Start the server** from `training/`, with the model's folder:
+
+```bash
+hmf decision-serve path/to/decision-model
+```
+
+It reads the model's prompt format (e.g., `strands` or `read_twice`, see [Decision Prompt Formats](../../../../data/README.md#decision-prompt-formats)) and calibration from `decision_prompt.json` and `decision_calibration.json` in the model's folder (or in its adapter's folder, for a model trained with LoRA), and listens on `127.0.0.1:8099`. The server builds each prompt in the model's format, so requests are the same whatever format the model was trained with. For a model trained with LoRA, also pass its adapter with `--adapter_name_or_path path/to/adapter`. To reach the server from another machine, forward its port over SSH with `ssh -N -L 8099:127.0.0.1:8099 <server machine>`.
+
+**2. Send it a state and one or more named questions:**
+
+```bash
+curl -s http://127.0.0.1:8099/v1/systemone -H 'Content-Type: application/json' -d '{
+  "state": "Order 1182 was charged twice. The customer asked for the duplicate charge to be removed.",
+  "questions": {
+    "next_step": {"type": "choice", "instructions": "What should support do next?",
+                  "criteria": {"refund": "return the duplicate payment", "ignore": "take no action",
+                               "escalate": "send the case to a human agent"}},
+    "is_duplicate": {"type": "noul", "instructions": "The customer was charged more than once."}
+  }
+}'
+```
+
+**3. Read the answers.** Each question gets one answer in the reply, under the name you gave it in the request (`next_step` and `is_duplicate` below). A yes/no question (`noul`) gets the probability that its statement is true, a choice gets its most probable option and a probability for every option, and a rating (`score`) gets its expected level and a probability for every level. For the request above, a model's answer may look like:
+
+```json
+{"model": "my-decision-model",
+ "answers": {"next_step": {"type": "choice", "choice": "refund",
+                           "probabilities": {"refund": 0.9548, "ignore": 0.0175, "escalate": 0.0277}, "confidence": 0.9323},
+             "is_duplicate": {"type": "noul", "noul": 0.9972}},
+ "usage": {"input_tokens": 192, "output_tokens": 2}, "latency_ms": 30.0}
+```
+
+Expect the first request to take a second or two, since the GPU kernels are compiled when they are first used, and the next ones to be much faster. `GET /health` shows the model being served and its settings, and [the server's options and fields](#serving-options) are listed below.
+
+## Benchmarks
 
 | benchmark | file | what it measures | source |
 | --- | --- | --- | --- |
 | Held-out tasks | `holdout_v5_norule.jsonl` | four classification tasks never trained on, which are `emotion` (choice), `massive_intent` (choice), `sarcasm` (yes/no), and `hate_severity` (rating). One half of the file is used to fit the calibration, the other to evaluate. | Built by Strands Decider from the public datasets [dair-ai/emotion](https://huggingface.co/datasets/dair-ai/emotion), [Amazon MASSIVE](https://huggingface.co/datasets/mteb/amazon_massive_intent), [news headlines for sarcasm detection](https://huggingface.co/datasets/raquiba/Sarcasm_News_Headline), and [Measuring Hate Speech](https://huggingface.co/datasets/ucberkeley-dlab/measuring-hate-speech) |
 | Multi-step documents | `multistep_v14_eval.jsonl` | reading long documents, with ContractNLI (claims about contracts), MuSiQue (multi-hop questions), BoardgameQA (rules with exceptions), and HotpotQA (multi-hop questions from a source never trained on, so it measures whether the skill carries over to new documents) | Built by Strands Decider from ContractNLI, MuSiQue, BoardgameQA, and HotpotQA |
 | Generated documents | `generated_v16_eval.jsonl`, `generated_v18_eval.jsonl` | workplace documents with questions targeting specific skills | Generated by Strands Decider |
-| Answer adequacy | `adequacy_hs2_eval.jsonl`, `adequacy_gen_eval.jsonl` | whether a response adequately answers a request | Built by Strands Decider from [HelpSteer2](https://huggingface.co/datasets/nvidia/HelpSteer2) (NVIDIA); generated by Strands Decider |
+| Answer adequacy | `adequacy_hs2_eval.jsonl`, `adequacy_gen_eval.jsonl` | whether a response adequately answers a request | Built by Strands Decider from [HelpSteer2](https://huggingface.co/datasets/nvidia/HelpSteer2) (NVIDIA), and generated by Strands Decider |
+| Catch-all options | `catchall_v20_eval.jsonl` | choice questions with an "other" or "none of these" option, which is the right answer half the time. Its rows come from the test half of the held-out `massive_intent` and `emotion` tasks, so it is not independent of the held-out tasks. | Built by Strands Decider from the held-out tasks |
+| Paraphrase pairs | `para_pairs_v16_eval.jsonl`, `para_pairs_v18_eval.jsonl` | pairs of rows that ask one question of the generated documents in two wordings, with the same label, scored by how often the model gives both the same answer | Generated by Strands Decider |
+| Instruction flips | `flips_v20_eval.jsonl` | pairs of rows that ask two instructions with opposite answers on one document, scored by how often the model gets both right | Generated by Strands Decider |
 | JevBench | its public set (231 tasks) | decision tasks in three tiers, with 48 easy, 72 standard, and 111 hard tasks | [JevBench](https://github.com/fstandhartinger/jevbench), an external benchmark |
 
-Strands Decider builds the files with its `training/recipe.sh build fetch multistep generated adequacy`. HMF's entries for them in `data/dataset_info.json` (`strands_holdout_v5_norule`, `strands_multistep_v14_eval`, …) expect them in `data/strands-decider/`. Each source has its own license; Strands Decider's `data/README.md` lists them. For example, `emotion` is for research and educational use only.
+Strands Decider builds the files with its `training/recipe.sh build fetch multistep generated adequacy catchall` (see [examples/decision/README.md](../../../../examples/decision/README.md#before-you-start)). HMF's entries for them in `data/dataset_info.json` (`strands_holdout_v5_norule`, `strands_multistep_v14_eval`, …) expect them in `data/strands-decider/`. Each source has its own license, as listed in Strands Decider's `data/README.md`, and `emotion`, for example, is for research and educational use only.
 
-## Running It
+## Calibrating and Evaluating a Model
 
 The commands take a trained model as two folders, which are the decision model (from `hmf decision-init`) and, for a model trained with LoRA, its adapter (the training `output_dir`, the folder that holds `adapter_config.json`). A model trained with `finetuning_type: full`, or merged with `hmf export`, has no adapter, so only its folder is passed.
 
-**1. Calibrate** on the calibration half of the held-out tasks. This writes `decision_calibration.json` into the adapter's folder. To compare the results with Strands Decider's own, add `--method strands_decider`.
+**1. Calibrate** on the calibration half of the held-out tasks, which writes `decision_calibration.json` into the adapter's folder. To compare the results with Strands Decider's own, add `--method strands_decider`.
 
 ```bash
 hmf decision-eval calibrate path/to/decision-model --adapter_name_or_path path/to/lora \
     --data data/strands-decider/holdout_v5_norule.jsonl
 ```
 
-**2. Evaluate on the held-out tasks,** using the test half, which holds the rows that calibration did not use (`--split test`, the default). The model is evaluated at the temperatures `decision_calibration.json` holds; `--raw` evaluates it at temperature 1.
+To also fit a gate, which tells a caller when to act on an answer and when to defer (for example to an LLM), add its settings with `--gate`, such as `--gate '{rule: accuracy, target: 0.95}'`, or the path of a YAML file that holds them, and the gate is saved in the same file as the temperatures ([how the gate works](#gating-answers)).
+
+**2. Evaluate on the held-out tasks,** using the test half, which holds the rows that calibration did not use (`--split test`, the default). The model is evaluated at the temperatures `decision_calibration.json` holds, and `--raw` evaluates it at temperature 1.
 
 ```bash
 hmf decision-eval evaluate path/to/decision-model --adapter_name_or_path path/to/lora \
@@ -41,6 +84,13 @@ hmf decision-eval evaluate path/to/decision-model --adapter_name_or_path path/to
 ```bash
 hmf decision-eval evaluate path/to/decision-model --adapter_name_or_path path/to/lora \
     --data data/strands-decider/multistep_v14_eval.jsonl --split all --limit 0 --out reports/multistep.json
+```
+
+A pair file, such as the paraphrase pairs and the instruction flips, takes `--pairs`. Its report also has the pair metrics (`same_answer` and `both_right`, described [below](#how-calibration-the-gate-and-the-metrics-work)). A pair file is scored whole, since a split or a limit would separate the two rows of a pair, and a pair with a row longer than `--max_len` is left out whole.
+
+```bash
+hmf decision-eval evaluate path/to/decision-model --adapter_name_or_path path/to/lora \
+    --data data/strands-decider/flips_v20_eval.jsonl --pairs --out reports/flips.json
 ```
 
 **4. Run JevBench.** JevBench's harness sends each task to a decision server over HTTP and scores the answers itself. It uses JevBench's "typesafe" protocol (`POST /v1/systemone`), which `server.py` serves. No API key, paid service, or judge model is needed for the public tasks. Run the server and the harness on the same machine:
@@ -72,7 +122,7 @@ kill %1   # stop the server
 
 `summary.json` holds the number of tasks answered correctly (`n_correct`) and the accuracy.
 
-**Comparing two runs.** Two runs are compared task by task, with an exact McNemar test on the tasks that only one of them answers correctly. A value of `p ≥ 0.05` means that the difference is not significant.
+**Two runs are compared task by task,** with an exact McNemar test on the tasks that only one of them answers correctly. A value of `p ≥ 0.05` means that the difference is not significant.
 
 ```bash
 hmf decision-eval compare reports/jevbench/results.jsonl path/to/other/results.jsonl
@@ -80,7 +130,7 @@ hmf decision-eval compare reports/jevbench/results.jsonl path/to/other/results.j
 
 Each run is a `results.jsonl` from JevBench, or a CSV with the columns `run`, `task_id`, and `correct` with `--b_run <name>` (the layout of Strands Decider's `research/data/jevbench_results.csv`, which holds its published runs, v19's included). Two training runs of the same recipe differ by about 3 tasks, so a difference of under about 10 tasks between two single runs can be noise.
 
-**The server's options** (`hmf decision-serve MODEL [options]`):
+<a id="serving-options"></a>**The server takes these options** (`hmf decision-serve MODEL [options]`):
 
 | option | default | meaning |
 | --- | --- | --- |
@@ -89,14 +139,16 @@ Each run is a `results.jsonl` from JevBench, or a CSV with the columns `run`, `t
 | `--port` | `8099` | the port to listen on |
 | `--calibration` | `auto` | the temperatures to answer at. `auto` reads `decision_calibration.json` in the adapter's folder (or in the model's folder without an adapter) if it exists, and a path reads that calibration file |
 | `--raw` | off | answer at temperature 1, ignoring any calibration |
-| `--max_len` | `4096` | the context window, which is the most tokens a prompt may have |
+| `--max_len` | `auto` | the context window, which is the most tokens a prompt may have. `auto` takes the model's (see below), else 4,096 |
 | `--strict_window` | off | refuse a prompt longer than `--max_len` with status 422, instead of shortening it. Without it, the question and its options keep all their tokens (up to 3/4 of the window) and the state is cut from its end to fit, as Strands Decider's server does. Use it for benchmarks that forbid shortening their prompts. |
-| `--prompt_format` | `strands` | the prompt format the model was trained with (`decision_prompt_format`) |
-| `--force_bos` | off | start prompts with the BOS token, if the model was trained with `decision_force_bos: true` |
+| `--prompt_format` | `auto` | the prompt format the model was trained with (`decision_prompt_format`), which is `strands`, `question_first`, or `read_twice` (see [Decision Prompt Formats](../../../../data/README.md#decision-prompt-formats)). `auto` takes the model's, else `strands`. A prompt longer than the window is shortened by cutting its state from its end: with `strands` as Strands Decider's server does, and with the other formats by rendering the prompt again with the longest state that fits |
+| `--force_bos` | `auto` | start prompts with the BOS token, if the model was trained with `decision_force_bos: true`. `auto` takes the model's, else off |
+| `--option_labels` | `auto` | how the options are labeled, `numbers` or `letters`, as the model was trained with (`decision_option_labels`). `auto` takes the model's, else the labels its head reads (letters for a label head) |
 | `--model_name` | the adapter's folder name, else the model's | the name the replies give as their model |
 | `--device` | the first GPU, else MPS (Apple silicon), else the CPU | where to run the model |
+| `--cuda_graphs` | off | answer through CUDA graphs, which record the model's pass once per prompt length and replay it without the CPU launching each kernel. Requests then take about the GPU's own work, several times less than without graphs at one request at a time, with the same answers. It needs a GPU, the `flash_attn` package, and a stock Hugging Face backbone (not one of HMF's hybrid models), which it loads with flash attention. The graphs of every prompt length up to `--max_len` are recorded at startup, which takes about half a second per 128 tokens of window (under 20 seconds for 4,096 tokens) |
 
-**The protocol.** A request holds a state and one or more named questions; the reply holds one answer per question:
+**A request holds a state and one or more named questions,** and the reply holds one answer per question:
 
 | question | request fields | answer fields |
 | --- | --- | --- |
@@ -104,11 +156,11 @@ Each run is a `results.jsonl` from JevBench, or a CSV with the columns `run`, `t
 | `choice` | `instructions`, and `criteria` (`{option name: description or null}`, with 2 to 255 options) | `choice` (the most probable option), `probabilities` by option name, and `confidence` |
 | `score` | `instructions`, and `criteria` (a list of 2 to 10 levels, lowest first) | `score` (the expected level), `legend` (what each level means), `probabilities` by level, and `confidence` |
 
-An invalid request (an unknown question type, too few or too many options, or images) is refused with status 422 and the reason. `GET /health` describes the model served and its temperatures.
+If the model's calibration holds a gate, every answer also has `take`, which is `true` when the caller should act on it ([how the gate works](#gating-answers)). An invalid request (an unknown question type, too few or too many options, or images) is refused with status 422 and the reason. `GET /health` describes the model served, its temperatures, and its gate.
 
 ## All at Once: Evaluation Suites
 
-A suite runs calibration, a list of benchmarks, and JevBench in one command, and writes every result to one folder, with a summary table (`summary.md`). It is described by a YAML file, and `examples/decision/eval/strands_v19.yaml` runs the evaluation above.
+A suite runs calibration, a list of benchmarks, and JevBench in one command, and writes every result to one folder, with a summary table (`summary.md`). It is described by a YAML file. `examples/decision/eval/strands_v19.yaml` runs the evaluation above, with the benchmarks that Strands Decider's v19 model was evaluated on, and `examples/decision/eval/strands_v20.yaml` also runs the catch-all options, the paraphrase pairs, and the instruction flips, as Strands Decider's recipe does.
 
 ```bash
 hmf decision-eval run examples/decision/eval/strands_v19.yaml \
@@ -118,15 +170,16 @@ hmf decision-eval run examples/decision/eval/strands_v19.yaml \
 
 - **Values on the command line** (`key=value`) override the file. For example, `jevbench.max_len=3072` runs JevBench with a 3,072-token window.
 - **Each section is optional,** and the run does only what the file has. For example, removing `jevbench` skips JevBench, and keeping a single benchmark evaluates one file. Without a `calibration` section, the model answers at its saved calibration if it has one, else at temperature 1.
-- **Each data file** is a name in `data/dataset_info.json` (`dataset:`) or a path (`data:`).
+- **Each data file** is a name in `data/dataset_info.json` (`dataset:`) or a path (`data:`), and a pair file has `pairs: true`. The summary table then also shows its pair metrics.
+- **A gate is fitted with the calibration** when the `calibration` section has a `gate` subsection with its settings. Each benchmark's report then also shows how many of its rows the gate would act on, and how often the model's answers on those rows are right.
 - **For JevBench,** the suite starts the server, runs JevBench from its checkout, and stops the server, also if JevBench fails. Before anything runs, it checks that the checkout is at `jevbench.commit`, that the port is free, and that the reference runs to compare with exist.
 
 To evaluate on your own data, copy the file and change its sections.
 
-## How It Measures
+## How Calibration, the Gate, and the Metrics Work
 
-**Calibration.** A decision model's raw probabilities are usually over- or under-confident. Calibration divides its scores for the options (its logits) by one temperature per question kind (`noul`, `choice`, `score`), fitted on the calibration half of the held-out tasks.
-- **How the temperatures are fitted:**
+**Calibration corrects the model's confidence.** A decision model's raw probabilities are usually over- or under-confident, so calibration divides its scores for the options (its logits) by one temperature per question kind (`noul`, `choice`, `score`), fitted on the calibration half of the held-out tasks.
+- **Temperatures are fitted in two steps:**
   - an overall temperature, minimizing the negative log-likelihood (NLL)
   - then one per kind with at least 200 rows, by `--method`:
     - `nll` (the default) minimizes the NLL, as temperature scaling usually does, so that the probabilities match how often the answers are right
@@ -134,24 +187,47 @@ To evaluate on your own data, copy the file and change its sections.
     - `strands_decider` minimizes the ECE of the confidence (below) over the same temperatures, as Strands Decider does, so that the confidence a server reports matches accuracy. The confidence rescales the top probability for chance, so this calibrates the confidence rather than the probabilities, which differ most for `noul` questions. Use it to compare with Strands Decider's numbers, and `nll` where the probabilities themselves are used
   - a kind with fewer rows uses the overall temperature
 - **The method is saved with the temperatures.** A calibration saved before the method was recorded was fitted the `strands_decider` way, and the predictor notes this when it loads one.
-- **What a temperature changes.** A temperature above 1 makes the model less confident, and one below 1 makes it more confident. It never changes which option is most probable, so accuracy is unchanged.
-- **Where it is saved.** The temperatures are saved in `decision_calibration.json` in the adapter's folder (the training `output_dir`). Several adapters can be trained on one decision model, so the decision model's folder is never written to. A model without an adapter (trained with `finetuning_type: full`, or merged with `hmf export`) gets the file in its own folder.
+- **A temperature changes how confident the model is, but not its answers.** A temperature above 1 makes the model less confident and one below 1 more confident, while the most probable option stays the same, so accuracy is unchanged.
+- **The prompt settings are saved with the model.** Training writes `decision_prompt.json` into its `output_dir`: the prompt format, whether prompts start with the BOS token, and the window (`cutoff_len`). Evaluation and serving use them for every setting left at `auto` (the default), so a model is asked as it was trained without being told. A setting given explicitly is used as given, with a warning if it differs. A model without the file, trained before it existed, gets `strands`, no BOS token, and 4,096 tokens. `hmf export` copies the adapter's `decision_prompt.json` and `decision_calibration.json` into the merged model, since they describe it, but not the base model's, which describe the base model alone.
+- **The temperatures are saved in the adapter's folder,** in `decision_calibration.json` (the training `output_dir`), since several adapters can be trained on one decision model, whose own folder is therefore never written to. A model without an adapter (trained with `finetuning_type: full`, or merged with `hmf export`) gets the file in its own folder.
 
-**How a file is split.** Calibration and evaluation use two halves of the same file, so temperatures are never scored on the rows they were fitted on.
-- **Which half.** A row's half depends on its position in the file, by the parity of the first byte of `sha256("<seed>:<position>")`.
+<a id="gating-answers"></a>**A gate tells a caller which answers to act on.** A caller that falls back to an LLM when the decision model is unsure needs to know which answers to trust, so the gate gives each question kind a threshold on the calibrated probability of the model's answer (its top probability, not the confidence below), and an answer is taken when its option is one the caller acts on and its probability reaches the threshold. The thresholds are fitted after the temperatures, on the same rows, and saved with them in `decision_calibration.json`, so that the two always match.
+- **A gate's settings are given with `--gate`,** or in the suite's `calibration.gate`:
+
+  | setting | default | meaning |
+  | --- | --- | --- |
+  | `rule` | `accuracy` | what the taken answers must achieve (below) |
+  | `target` | none | the value the rule must meet |
+  | `params` | `{}` | the rule's own settings |
+  | `take_options` | every option | the options the caller acts on. Answers with other options are never taken (and `noul` options are `true` and `false`) |
+  | `min_count` | 50 | the fewest rows a threshold rests on |
+  | `use_weights` | off | weigh rows by their `weight` field, for example to count each row of a 10% sample of some kind of row ten times |
+
+- **Each rule is computed on the answers the gate would take at each possible threshold,** most probable first, and the threshold is the lowest one that meets the target:
+  - `accuracy`: the share of the taken answers that are right is at least `target`
+  - `accuracy_lower_bound`: the lower end of that share's 95% Wilson interval is at least `target`, so a threshold resting on few answers must clear a higher share
+  - `marginal_accuracy`: the share of right answers among the last `params.window` (50) taken ones is at least `target`, so the answers near the threshold, not only those above it, are right often enough
+  - `coverage`: the share of all rows taken is at most `target`
+  - `cost`: the accuracy of the taken answers falls short of the fallback's (`params.reference`, 1 when the labels are the fallback's own answers) by at most `target`, the cost of a fallback call divided by the cost of a wrong answer
+  - `net_saving`: the threshold with the highest `params.saved_cost` × taken − `params.error_cost` × wrong, with no target
+- **A threshold never falls inside a group of equal probabilities,** since it would also take rows the rule did not count, and it rests on at least `min_count` rows. A kind where no threshold meets the target gets none, so its answers are never taken.
+- **`evaluate` checks the gate on other rows,** reporting per kind the share of the rows it takes and how often those answers are right, which shows whether the thresholds hold on rows they were not fitted on. Since a gate only applies at the temperatures it was fitted at, `--raw` evaluation and serving ignore it.
+
+**Calibration and evaluation use two halves of the same file,** so temperatures are never scored on the rows they were fitted on.
+- **A row's half depends only on its position in the file,** by the parity of the first byte of `sha256("<seed>:<position>")`.
 - **`--limit`** keeps at most that many rows of the half, chosen by a shuffle with a fixed seed (`--seed`, default 0), so every task is represented.
-- **Both are the same as in Strands Decider,** so the same file gives the same rows in HMF and in Strands Decider.
+- **The split and the sampling are the same as in Strands Decider,** so the same file gives the same rows in HMF and in Strands Decider.
 
 **Confidence** is what a decision server reports with each answer, not the top probability:
-- **`noul` and `choice`.** The confidence is `(N·p_max − 1)/(N − 1)`, which is 0 for a uniform answer and 1 for a certain one, whatever the number of options.
-- **`score`.** The confidence measures how tightly the probability mass clusters on the levels, as `(σ_max − σ)/(σ_max − √ε)` clipped to [0, 1], where
+- **For `noul` and `choice`, the confidence is** `(N·p_max − 1)/(N − 1)`, which is 0 for a uniform answer and 1 for a certain one, whatever the number of options.
+- **For `score`, the confidence measures** how tightly the probability mass clusters on the levels, as `(σ_max − σ)/(σ_max − √ε)` clipped to [0, 1], where
   - σ is the standard deviation of the level under the model's probabilities
   - σ_max = (L − 1)/2 is the largest possible, with half the mass on each end of L levels
   - ε is the ordinal smoothing of training (0.1). Training targets put ε of the mass on neighboring levels, so a model that fits them exactly has σ = √ε, and gets confidence 1.
 
   Mass split between two neighboring levels is a confident "in between", not doubt, which the top probability would miss.
 
-**The metrics,** overall and by kind, by task, and by confidence band (below 0.5, 0.5 to 0.9, 0.9 and above):
+**Every metric is reported** overall and by kind, by task, and by confidence band (below 0.5, 0.5 to 0.9, 0.9 and above):
 
 | metric | meaning |
 | --- | --- |
@@ -163,13 +239,22 @@ To evaluate on your own data, copy the file and change its sections.
 | `mean_confidence` | mean confidence |
 | `score_mae` | `score` answers only: mean absolute distance from the expected level to the label, in levels |
 
+**A pair file's report also has the pair metrics** (`pairs` in the report), as Strands Decider's `evaluation/pair_eval.py` defines them:
+
+| metric | meaning |
+| --- | --- |
+| `pairs` | the number of pairs scored, and `num_pairs_skipped` the number left out because a row was longer than `max_len` |
+| `acc_first`, `acc_second` | the accuracy of the first and of the second rows of the pairs |
+| `same_answer` | the share of pairs whose two rows get the same answer, which for the paraphrase pairs measures whether the wording changes the answer |
+| `both_right` | the share of pairs whose two rows are both answered right, which for the instruction flips measures whether the model follows the instruction rather than the document |
+
 The confidence bands show whether confidence can be used to route decisions, which requires accuracy above 0.9 confidence to be clearly higher than below 0.5.
 
 Prompts longer than `--max_len` tokens (default 4,096) are skipped, not truncated, and counted in the report (`num_skipped`).
 
-## Reference Values
+## Reference Values for the v19 Recipe
 
-These values give a reference to compare a setup against. They are those of Strands Decider's published v19 model, and of the same recipe trained with HMF (the v19 recipe's model 2; see `examples/decision/recipes.md`). The HMF column was measured with Strands Decider's tools, on the converted model.
+These values, which give a reference to compare a setup against, are those of Strands Decider's published v19 model and of the same recipe trained with HMF (the v19 recipe's model 2, see `examples/decision/recipes.md`). The HMF column was measured with Strands Decider's tools, on the converted model.
 
 | benchmark | Strands Decider v19 | HMF, v19 recipe |
 | --- | --- | --- |

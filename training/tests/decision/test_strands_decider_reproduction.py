@@ -432,6 +432,9 @@ def test_strands_checkpoint_converts_to_an_adapter(trained, tmp_path):
 
     assert sorted(os.listdir(output_dir)) == ["adapter", "model"]
     assert not (output_dir / "adapter" / "decision_calibration.json").exists()  # The checkpoint is uncalibrated
+    # Its prompt settings are Strands Decider's strands format, with the checkpoint's BOS setting and window
+    settings = json.loads((output_dir / "adapter" / "decision_prompt.json").read_text())
+    assert settings == {"prompt_format": "strands", "force_bos": False, "max_len": 4096, "option_labels": "numbers"}
     with open(output_dir / "adapter" / "adapter_config.json") as f:
         adapter_config = json.load(f)
     assert adapter_config["base_model_name_or_path"] == str(output_dir / "model")
@@ -450,6 +453,25 @@ def test_strands_checkpoint_converts_to_an_adapter(trained, tmp_path):
     )
 
 
+def test_strands_checkpoint_converts_from_a_local_base_model(trained, tmp_path):
+    # The checkpoint names a model that is not on the Hub, so only the local copy can be converted
+    converter = _script("strands_to_hmf_decision")
+    checkpoint = _strands_checkpoint(trained, tmp_path, base_model="no-such-org/no-such-model", base_revision="abc")
+    output_dir = tmp_path / "converted"
+
+    converter.convert(str(checkpoint), str(output_dir), base_model=trained["source_dir"])
+
+    torch.testing.assert_close(
+        _decision_logits(output_dir / "model", output_dir / "adapter"),
+        _decision_logits(trained["decision_dir"], trained["adapter_dir"]),
+    )
+    # The check's copy of the checkpoint names the local base model, without a revision
+    copy = Path(converter._checkpoint_on_local_base(str(checkpoint), str(tmp_path / "copy"), trained["source_dir"]))
+    settings = json.loads((copy / "strands_decider_config.json").read_text())
+    assert settings["base_model"] == os.path.abspath(trained["source_dir"]) and settings["base_revision"] is None
+    assert (copy / "lora" / "adapter_model.safetensors").exists()
+
+
 def test_strands_checkpoint_converts_to_a_merged_model(trained, tmp_path):
     output_dir = tmp_path / "merged"
 
@@ -463,6 +485,7 @@ def test_strands_checkpoint_converts_to_a_merged_model(trained, tmp_path):
     assert not any("lora_" in key or "modules_to_save" in key for key in weights)
     assert {dtype for key, dtype in weights.items() if key.startswith("decision_head.")} == {"F32"}
     assert not (output_dir / "adapter_config.json").exists()
+    assert json.loads((output_dir / "decision_prompt.json").read_text())["prompt_format"] == "strands"
     assert not [name for name in os.listdir(tmp_path) if name.startswith(".strands_to_hmf_decision-")]  # Steps deleted
     torch.testing.assert_close(
         _decision_logits(output_dir), _decision_logits(trained["decision_dir"], trained["adapter_dir"]),
@@ -541,11 +564,14 @@ def test_strands_conversion_refuses(trained, tmp_path):
     convert_with("only LoRA checkpoints", full_weight_targets=["q_proj"])
     convert_with("the head's width is 16", pointer_dim=32)
 
-    # A Gemma 4 base model, refused from its config.json alone
-    gemma = tmp_path / "gemma"
-    gemma.mkdir()
-    (gemma / "config.json").write_text(json.dumps({"model_type": "gemma4"}))
-    convert_with("cannot convert yet", base_model=str(gemma))
+    # A local base model must be a folder, and cannot be given with an existing decision model
+    with pytest.raises(ValueError, match="is not a folder"):
+        converter.convert(str(checkpoint), str(tmp_path / "out"), base_model=str(tmp_path / "missing"))
+    with pytest.raises(ValueError, match="not both"):
+        converter.convert(
+            str(checkpoint), str(tmp_path / "out"), base_model=trained["source_dir"],
+            decision_model=trained["decision_dir"],
+        )
 
     # An existing decision model whose head has another width
     other_dir = tmp_path / "other_decision"

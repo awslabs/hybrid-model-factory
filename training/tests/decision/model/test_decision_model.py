@@ -185,6 +185,8 @@ def test_decision_config_validation():
         DecisionConfig(decision_head_dim=0)
     with pytest.raises(ValueError):
         DecisionConfig(decision_head_dropout=1.0)
+    with pytest.raises(ValueError, match="decision_attention"):
+        DecisionConfig(decision_attention="non_causal")
 
 
 def test_decision_config_round_trip(tmp_path):
@@ -207,6 +209,7 @@ def test_decision_config_round_trip(tmp_path):
     assert loaded.decision_head_dropout == 0.1
     assert loaded.decision_head_init == "random"
     assert loaded.source_model_name_or_path == "some/model"
+    assert loaded.decision_attention == "causal"
     assert loaded.tie_word_embeddings is False
 
 
@@ -221,7 +224,8 @@ def test_load_config(tmp_path):
 
     assert config.dtype == torch.bfloat16
     assert config.seed == 3
-    assert config.decision_head_init == "random"
+    assert config.decision_head_type == "pointer"
+    assert config.decision_head_init == "auto"
 
     path.write_text(yaml.safe_dump({"base_model_name_or_path": "a", "output_dir": "b", "head_dim": 8}))
     with pytest.raises(ValueError, match="head_dim"):
@@ -285,11 +289,40 @@ def _tiny_qwen3_5_multimodal():
     return model_cls(config)
 
 
+def _tiny_gemma4_multimodal():
+    """
+    A Gemma 4 checkpoint as Google releases it, multimodal (here without its vision and audio towers), with
+    sliding window and full attention layers of different head sizes, shared keys and values, and per-layer
+    embeddings, as in E2B. Its last five layers share the keys and values of the last layer of their kind before
+    them, layer 3 (sliding) or 4 (full).
+    """
+    config_cls, model_cls = _require("Gemma4Config", "Gemma4ForConditionalGeneration")
+    text_config = dict(
+        vocab_size=VOCAB_SIZE,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=128,
+        num_hidden_layers=10,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=16,
+        global_head_dim=32,
+        layer_types=(["sliding_attention"] * 4 + ["full_attention"]) * 2,
+        sliding_window=4,
+        num_kv_shared_layers=5,
+        hidden_size_per_layer_input=8,
+        vocab_size_per_layer_input=VOCAB_SIZE,
+        max_position_embeddings=256,
+        pad_token_id=1,
+    )
+    return model_cls(config_cls(text_config=text_config, vision_config=None, audio_config=None))
+
+
 SOURCES = {
     "qwen3_tied": lambda: transformers.Qwen3ForCausalLM(_tiny_qwen3_config(tie_word_embeddings=True)),
     "qwen3_untied": lambda: transformers.Qwen3ForCausalLM(_tiny_qwen3_config(tie_word_embeddings=False)),
     "qwen3_5_text": _tiny_qwen3_5_text,
     "qwen3_5_multimodal": _tiny_qwen3_5_multimodal,
+    "gemma4_multimodal": _tiny_gemma4_multimodal,
 }
 
 
@@ -376,8 +409,15 @@ def test_config(converted):
 
 def test_backbone_matches_source(converted):
     decision = AutoModel.from_pretrained(converted["output_dir"], dtype=torch.bfloat16)
-    source = transformers.AutoModelForCausalLM.from_pretrained(converted["source_dir"], dtype=torch.bfloat16)
-    source_backbone = source.base_model
+    if converted["name"].startswith("gemma4"):
+        # Gemma 4's text weights load only through the multimodal class, whose text decoder is the backbone
+        source = transformers.Gemma4ForConditionalGeneration.from_pretrained(
+            converted["source_dir"], dtype=torch.bfloat16
+        )
+        source_backbone = source.model.language_model
+    else:
+        source = transformers.AutoModelForCausalLM.from_pretrained(converted["source_dir"], dtype=torch.bfloat16)
+        source_backbone = source.base_model
 
     assert isinstance(decision, DecisionModel)
     assert type(decision.model) is type(source_backbone)
@@ -467,3 +507,256 @@ def test_load_with_sdpa(converted):
     decision = AutoModel.from_pretrained(converted["output_dir"], attn_implementation="sdpa")
 
     assert decision.model.config._attn_implementation == "sdpa"
+
+
+# Bidirectional attention (decision_attention)
+
+
+ATTENTION_BACKBONES = {
+    "qwen3": lambda: _tiny_qwen3_config(),
+    "qwen3_5_text": lambda: _require("Qwen3_5TextConfig")[0](**_qwen3_5_text_kwargs()),
+}
+
+
+def _decision_models(name: str):
+    """
+    A causal and a bidirectional decision model with the same weights, in float32, on the GPU if there is one.
+    Qwen3.5's Gated DeltaNet kernels run on the GPU only.
+    """
+    if name.startswith("qwen3_5") and DEVICE != "cuda":
+        pytest.skip("Qwen3.5's Gated DeltaNet kernels need a GPU")
+    torch.manual_seed(SEED)
+    causal = DecisionModel(DecisionConfig(text_config=ATTENTION_BACKBONES[name](), decision_head_dim=HEAD_DIM)).eval()
+    config = DecisionConfig(text_config=causal.config.text_config, decision_head_dim=HEAD_DIM,
+                            decision_attention="bidirectional")
+    bidirectional = DecisionModel(config).eval()
+    bidirectional.load_state_dict(causal.state_dict())
+    return causal.to(DEVICE), bidirectional.to(DEVICE)
+
+
+def _hidden_states(model: DecisionModel, input_ids, attention_mask) -> torch.Tensor:
+    input_ids, attention_mask = input_ids.to(DEVICE), attention_mask.to(DEVICE)
+    with torch.no_grad():
+        if model.config.decision_attention == "bidirectional":
+            out = model._bidirectional_backbone(input_ids, attention_mask, None)
+        else:
+            out = model.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+    return out.last_hidden_state
+
+
+@pytest.mark.parametrize("name", list(ATTENTION_BACKBONES))
+def test_bidirectional_attention_sees_later_tokens(name):
+    causal, bidirectional = _decision_models(name)
+    input_ids = torch.randint(2, VOCAB_SIZE, (1, 10), generator=torch.Generator().manual_seed(SEED))
+    changed = input_ids.clone()
+    changed[0, -1] = (changed[0, -1] + 1) % VOCAB_SIZE
+    mask = torch.ones_like(input_ids)
+
+    # A causal model's early states ignore a change to the last token, but a bidirectional model's do not
+    torch.testing.assert_close(
+        _hidden_states(causal, input_ids, mask)[:, :9],
+        _hidden_states(causal, changed, mask)[:, :9],
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    assert not torch.allclose(_hidden_states(bidirectional, input_ids, mask)[:, 0],
+                              _hidden_states(bidirectional, changed, mask)[:, 0])
+
+
+@pytest.mark.parametrize("name", list(ATTENTION_BACKBONES))
+def test_bidirectional_attention_ignores_padding(name):
+    _, bidirectional = _decision_models(name)
+    input_ids = torch.randint(2, VOCAB_SIZE, (1, 8), generator=torch.Generator().manual_seed(SEED))
+    padded = torch.cat([input_ids, torch.full((1, 4), 1)], dim=1)
+    padded_mask = torch.cat([torch.ones(1, 8, dtype=torch.long), torch.zeros(1, 4, dtype=torch.long)], dim=1)
+
+    # The real tokens' states are the same with and without right padding, up to the GPU kernels, which split
+    # prompts of different lengths differently
+    torch.testing.assert_close(
+        _hidden_states(bidirectional, padded, padded_mask)[:, :8],
+        _hidden_states(bidirectional, input_ids, torch.ones_like(input_ids)),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+def test_bidirectional_forward_and_saved_setting(tmp_path):
+    _, bidirectional = _decision_models("qwen3")
+    batch = _batch(DEVICE)
+    with torch.no_grad():
+        out = bidirectional(**batch)
+    assert torch.isfinite(out.log_probs[batch["opt_idx"] >= 0]).all()
+
+    bidirectional.save_pretrained(tmp_path)
+    assert AutoConfig.from_pretrained(tmp_path).decision_attention == "bidirectional"
+
+
+# Running from prompt lengths (seq_lens)
+
+def _flash_attention_models(name: str):
+    """
+    A causal and a bidirectional decision model with the same weights, in bfloat16, with flash attention, on
+    the GPU. Skipped without a GPU or without the flash_attn package.
+    """
+    if DEVICE != "cuda":
+        pytest.skip("flash attention needs a GPU")
+    pytest.importorskip("flash_attn")
+    torch.manual_seed(SEED)
+    text_config = ATTENTION_BACKBONES[name]()
+    causal = DecisionModel(DecisionConfig(text_config=text_config, decision_head_dim=HEAD_DIM)).eval()
+    bidirectional = DecisionModel(DecisionConfig(text_config=text_config, decision_head_dim=HEAD_DIM,
+                                                 decision_attention="bidirectional")).eval()
+    bidirectional.load_state_dict(causal.state_dict())
+    models = [model.to(DEVICE, torch.bfloat16) for model in (causal, bidirectional)]
+    # Set on the backbone once it is on the GPU in bfloat16: DecisionConfig rebuilds the text config it is
+    # given, which drops an attention implementation set on it
+    for model in models:
+        model.model.set_attn_implementation("flash_attention_2")
+    return models
+
+
+def _padded_batch(lengths, seq_len: int) -> dict:
+    """Right-padded prompts of the given lengths, each with three options and its answer marker last."""
+    generator = torch.Generator().manual_seed(SEED)
+    input_ids = torch.ones(len(lengths), seq_len, dtype=torch.long)
+    attention_mask = torch.zeros(len(lengths), seq_len, dtype=torch.long)
+    for row, length in enumerate(lengths):
+        input_ids[row, :length] = torch.randint(2, VOCAB_SIZE, (length,), generator=generator)
+        attention_mask[row, :length] = 1
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "opt_idx": torch.tensor([[length - 4, length - 3, length - 2] for length in lengths]),
+        "answer_idx": torch.tensor([length - 1 for length in lengths]),
+        "seq_lens": torch.tensor(lengths, dtype=torch.int32),
+    }
+    return {k: v.to(DEVICE) for k, v in batch.items()}
+
+
+def _log_probs(model: DecisionModel, batch: dict, varlen: bool) -> torch.Tensor:
+    inputs = dict(batch) if varlen else {k: v for k, v in batch.items() if k != "seq_lens"}
+    with torch.no_grad():
+        return model(**inputs).log_probs
+
+
+@pytest.mark.parametrize("name", list(ATTENTION_BACKBONES))
+@pytest.mark.parametrize("attention", ["causal", "bidirectional"])
+def test_varlen_matches_the_masked_forward(name, attention):
+    model = dict(zip(["causal", "bidirectional"], _flash_attention_models(name)))[attention]
+    batch = _padded_batch([16, 11, 7], seq_len=16)
+    torch.testing.assert_close(_log_probs(model, batch, varlen=True), _log_probs(model, batch, varlen=False),
+                               rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("name", list(ATTENTION_BACKBONES))
+@pytest.mark.parametrize("attention", ["causal", "bidirectional"])
+def test_varlen_ignores_padding(name, attention):
+    model = dict(zip(["causal", "bidirectional"], _flash_attention_models(name)))[attention]
+    # The same prompts padded to two lengths, as length buckets pad them, give the same answers
+    torch.testing.assert_close(_log_probs(model, _padded_batch([16, 11, 7], seq_len=32), varlen=True),
+                               _log_probs(model, _padded_batch([16, 11, 7], seq_len=16), varlen=True),
+                               rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("name", list(ATTENTION_BACKBONES))
+def test_varlen_makes_the_cpu_wait_for_nothing(name):
+    _, model = _flash_attention_models(name)
+    batch = _padded_batch([16, 11, 7], seq_len=16)
+    _log_probs(model, batch, varlen=True)  # The first pass may compile kernels and wait for them
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _log_probs(model, batch, varlen=True)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+def test_varlen_needs_flash_attention():
+    model = DecisionModel(DecisionConfig(text_config=_tiny_qwen3_config(), decision_head_dim=HEAD_DIM)).eval()
+    batch = {k: v.cpu() for k, v in _batch("cpu").items()}
+    with pytest.raises(ValueError, match="flash attention"):
+        model(**batch, seq_lens=batch["attention_mask"].sum(dim=1))
+
+
+# Fewer active experts without renormalization (moe_topk_renormalize)
+
+def _tiny_moe_config(**overrides):
+    config_cls = _require("Qwen3_5MoeTextConfig")[0]
+    kwargs = dict(
+        vocab_size=VOCAB_SIZE, hidden_size=HIDDEN_SIZE, num_hidden_layers=2, num_attention_heads=2,
+        num_key_value_heads=1, head_dim=16, moe_intermediate_size=32, shared_expert_intermediate_size=32,
+        num_experts=8, num_experts_per_tok=4, layer_types=["full_attention", "full_attention"],
+        tie_word_embeddings=True,
+    )
+    return config_cls(**{**kwargs, **overrides})
+
+
+def _moe_decision_model(**text_overrides) -> DecisionModel:
+    torch.manual_seed(SEED)
+    config = DecisionConfig(text_config=_tiny_moe_config(**text_overrides), decision_head_dim=HEAD_DIM)
+    return DecisionModel(config).eval()
+
+
+def _routers(model: DecisionModel) -> list:
+    return [m for m in model.model.modules() if type(m).__name__.endswith("TopKRouter")]
+
+
+def test_keeping_topk_weights_at_the_trained_k_changes_nothing():
+    plain = _moe_decision_model()
+    kept = _moe_decision_model(moe_topk_renormalize=False, moe_topk_norm_k=4)
+    kept.load_state_dict(plain.state_dict())
+    batch = {k: v.cpu() for k, v in _batch("cpu").items()}
+    with torch.no_grad():
+        torch.testing.assert_close(kept(**batch).log_probs, plain(**batch).log_probs, rtol=0, atol=0)
+
+
+def test_keeping_topk_weights_at_the_trained_k_changes_nothing_in_bfloat16():
+    # The experts multiply their outputs by the routing weights, so the weights must come back in the dtype
+    # transformers' router gives them, or the product runs in another precision and the answers move
+    plain = _moe_decision_model().to(torch.bfloat16)
+    kept = _moe_decision_model(moe_topk_renormalize=False, moe_topk_norm_k=4).to(torch.bfloat16)
+    kept.load_state_dict(plain.state_dict())
+    hidden = torch.randn(5, HIDDEN_SIZE, generator=torch.Generator().manual_seed(SEED)).to(torch.bfloat16)
+    expected, got = _routers(plain)[0](hidden), _routers(kept)[0](hidden)
+    assert got[1].dtype == expected[1].dtype
+    # All three outputs match transformers' router: the logits (which its auxiliary loss reads), weights and indices
+    assert all(torch.equal(g, e) for g, e in zip(got, expected))
+    batch = {k: v.cpu() for k, v in _batch("cpu").items()}
+    with torch.no_grad():
+        torch.testing.assert_close(kept(**batch).log_probs, plain(**batch).log_probs, rtol=0, atol=0)
+
+
+def test_fewer_active_experts_keep_their_weights_at_the_trained_k():
+    model = _moe_decision_model(num_experts_per_tok=2, moe_topk_renormalize=False, moe_topk_norm_k=4)
+    router = _routers(model)[0]
+    hidden = torch.randn(5, HIDDEN_SIZE, generator=torch.Generator().manual_seed(SEED))
+    logits, weights, indices = router(hidden)
+    top4, top4_indices = torch.topk(torch.softmax(hidden @ router.weight.T, dim=-1), 4, dim=-1)
+    # The two experts kept get the weights they have among the top four, which sum to less than 1
+    torch.testing.assert_close(weights, top4[:, :2] / top4.sum(dim=-1, keepdim=True))
+    assert torch.equal(indices, top4_indices[:, :2])
+    assert (weights.sum(dim=-1) < 1).all() and weights.dtype == torch.float32
+    torch.testing.assert_close(logits, hidden @ router.weight.T)
+
+
+def test_transformers_renormalizes_fewer_active_experts_by_default():
+    router = _routers(_moe_decision_model(num_experts_per_tok=2))[0]
+    _, weights, _ = router(torch.randn(5, HIDDEN_SIZE, generator=torch.Generator().manual_seed(SEED)))
+    torch.testing.assert_close(weights.sum(dim=-1), torch.ones(5))
+
+
+def test_keeping_topk_weights_survives_saving_and_loading(tmp_path):
+    model = _moe_decision_model(num_experts_per_tok=2, moe_topk_renormalize=False, moe_topk_norm_k=4)
+    model.save_pretrained(tmp_path)
+    loaded = AutoModel.from_pretrained(tmp_path).eval()
+    assert all(router.norm_k == 4 for router in _routers(loaded)) and len(_routers(loaded)) == 2
+    batch = {k: v.cpu() for k, v in _batch("cpu").items()}
+    with torch.no_grad():
+        torch.testing.assert_close(loaded(**batch).log_probs, model(**batch).log_probs)
+
+
+def test_keeping_topk_weights_needs_a_mixture_of_experts():
+    config = _tiny_qwen3_config()
+    config.moe_topk_renormalize = False
+    with pytest.raises(ValueError, match="no TopK routers"):
+        DecisionModel(DecisionConfig(text_config=config, decision_head_dim=HEAD_DIM))

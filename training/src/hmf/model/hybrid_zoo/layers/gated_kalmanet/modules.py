@@ -57,19 +57,19 @@ class GatedKalmaNetLayer(GatedKalmaNet):
         self,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,
-        past_key_values: Optional["HybridCache"] = None,
+        cache: Optional["HybridCache"] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
         **kwargs,
     ) -> Tuple[Tensor, Optional[Tensor], Optional["GatedKalmaNetCache"]]:
         """
         Forward pass through GKA layer. Extracts layer-specific cache from
-        past_key_values if provided.
+        cache if provided.
 
         Args:
             hidden_states: Input tensor of shape [batch, seq_len, hidden_size]
             attention_mask: Optional attention mask tensor
-            past_key_values: HybridCache object, extracts GKA-specific cache if present
+            cache: HybridCache object, extracts GKA-specific cache if present
             use_cache: Whether to use caching
             output_attentions: Whether to output attention weights
             **kwargs: Additional arguments passed to parent forward
@@ -81,15 +81,15 @@ class GatedKalmaNetLayer(GatedKalmaNet):
                 - cache: GatedKalmaNetCache or None
         """
 
-        if hasattr(past_key_values, "gated_kalmanet"):
-            gka_past_key_values = past_key_values.gated_kalmanet
+        if hasattr(cache, "gated_kalmanet"):
+            gka_cache = cache.gated_kalmanet
         else:
-            gka_past_key_values = None
+            gka_cache = None
 
         return super().forward(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            past_key_values=gka_past_key_values,
+            cache=gka_cache,
             use_cache=use_cache,
             output_attentions=output_attentions,
             **kwargs,

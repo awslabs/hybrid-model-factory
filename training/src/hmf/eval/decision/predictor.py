@@ -5,16 +5,28 @@ A trained model is a decision model (from hmf decision-init) and, when trained w
 (the training output_dir, the folder that holds adapter_config.json). Calibration (see calibrate.py)
 saves its temperatures in decision_calibration.json in the adapter's folder, never in the decision
 model's folder, which several adapters may be trained on. A model without an adapter (trained with
-finetuning_type: full, or merged with hmf export) gets the file in its own folder.
+finetuning_type: full, or merged with hmf export) gets the file in its own folder. The file also
+holds the model's gate, if calibration fitted one (see gate.py).
+
+Training saves the prompt settings it trained with in decision_prompt.json, in the same folder: the prompt format
+(decision_prompt_format), whether prompts start with the BOS token (decision_force_bos), the longest prompt
+(cutoff_len), and how the options are labeled (decision_option_labels). A predictor uses them for every setting left
+at "auto", so that a model is asked in the format it was trained on without being told. A model without the file
+(trained before it existed, or not trained yet) gets the defaults, strands, no BOS token, 4096 tokens, and the labels
+its head reads (letters for a label head, else numbers). A setting given explicitly is used as given, with a warning
+if it differs from the file's.
 """
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Union
+
+import torch
 
 from ...data.decision_teachers import DecisionModelTeacher
 from ...extras import logging
 from ...extras.misc import get_current_device
+from .gate import takes
 from .metrics import apply_temperature
 
 
@@ -22,11 +34,72 @@ logger = logging.get_logger(__name__)
 
 
 CALIBRATION_FILE = "decision_calibration.json"
+PROMPT_FILE = "decision_prompt.json"
+# A setting that comes from the model's decision_prompt.json, else from DEFAULT_PROMPT
+AUTO = "auto"
+DEFAULT_PROMPT = {"prompt_format": "strands", "force_bos": False, "max_len": 4096, "option_labels": "numbers"}
 
 
 def calibration_path(model_name_or_path: str, adapter_name_or_path: Optional[str] = None) -> str:
     """Where a trained model's calibration is saved, which is its adapter's folder, else the model's folder."""
     return os.path.join(adapter_name_or_path or model_name_or_path, CALIBRATION_FILE)
+
+
+def prompt_path(model_name_or_path: str, adapter_name_or_path: Optional[str] = None) -> str:
+    """Where a trained model's prompt settings are saved, which is its adapter's folder, else the model's folder."""
+    return os.path.join(adapter_name_or_path or model_name_or_path, PROMPT_FILE)
+
+
+def save_prompt_settings(
+    folder: str, prompt_format: str, force_bos: bool, max_len: Optional[int], option_labels: str = "numbers"
+) -> str:
+    """Writes the prompt settings a model was trained with to decision_prompt.json in folder, and returns its path."""
+    path = os.path.join(folder, PROMPT_FILE)
+    settings = {"prompt_format": prompt_format, "force_bos": bool(force_bos), "max_len": max_len}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({**settings, "option_labels": option_labels}, f, indent=2)
+    return path
+
+
+def head_option_labels(model_name_or_path: str) -> Optional[str]:
+    """The labels a decision model's head reads (letters for a label head), or None for the pointer head."""
+    path = os.path.join(model_name_or_path, "config.json")
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f).get("decision_option_labels")
+
+
+def resolve_prompt_settings(
+    model_name_or_path: str, adapter_name_or_path: Optional[str], **given: Any
+) -> Dict[str, Any]:
+    """
+    Returns the prompt settings to ask a model with. Each setting given as "auto" comes from the model's
+    decision_prompt.json if it has one, else from DEFAULT_PROMPT, and any other value is used as given, with a
+    warning if it differs from the file's.
+
+    Args:
+        model_name_or_path: The decision model.
+        adapter_name_or_path: Its LoRA adapter, whose folder holds the file, if any.
+        given: prompt_format, force_bos, max_len, and option_labels, each a value or "auto".
+    """
+    path = prompt_path(model_name_or_path, adapter_name_or_path)
+    saved = {}
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            saved = json.load(f)
+    defaults = dict(DEFAULT_PROMPT, option_labels=head_option_labels(model_name_or_path) or "numbers")
+    settings = {}
+    for key, value in given.items():
+        if isinstance(value, str) and value == AUTO:
+            settings[key] = saved.get(key, defaults[key])
+            continue
+        if key in saved and saved[key] != value:
+            logger.warning_rank0(
+                f"{key}={value!r} differs from {saved[key]!r}, the value the model was trained with ({path})."
+            )
+        settings[key] = value
+    return settings
 
 
 def load_calibration(path: str) -> Optional[Dict[str, Any]]:
@@ -53,12 +126,19 @@ class DecisionPredictor:
             Defaults to None.
         device: Where to run the model. Defaults to the first GPU, else MPS (Apple silicon), else the CPU.
         prompt_format: The prompt format's name (decision_prompt_format in training). Defaults to
-            "strands".
+            "auto", the model's own (see the module's docstring), else "strands".
         force_bos: Whether prompts start with the BOS token (decision_force_bos in training).
-            Defaults to False.
-        max_len: The longest prompt answered, in tokens. Defaults to 4096.
+            Defaults to "auto", the model's own, else False.
+        max_len: The longest prompt answered, in tokens, or None for no limit. Defaults to "auto",
+            the model's own, else 4096.
         calibration: "auto" (the model's saved calibration, if any), the path of a calibration file,
             or None (temperature 1). Defaults to "auto".
+        cuda_graphs: Whether to answer through CUDA graphs (see graphs.py), which makes one decision at a
+            time several times faster on a GPU, with the same answers. It needs a stock backbone and loads
+            it with flash attention. Defaults to False.
+        option_labels: How the options are labeled, "numbers" or "letters" (decision_option_labels in
+            training). Defaults to "auto", the model's own, else the labels its head reads.
+        dtype: The model's dtype. Defaults to bfloat16 on GPU or MPS and float32 on CPU.
     """
 
     def __init__(
@@ -66,22 +146,34 @@ class DecisionPredictor:
         model_name_or_path: str,
         adapter_name_or_path: Optional[str] = None,
         device: Optional[str] = None,
-        prompt_format: str = "strands",
-        force_bos: bool = False,
-        max_len: Optional[int] = 4096,
+        prompt_format: str = AUTO,
+        force_bos: Union[bool, str] = AUTO,
+        max_len: Union[int, None, str] = AUTO,
         calibration: Optional[str] = "auto",
+        cuda_graphs: bool = False,
+        option_labels: str = AUTO,
+        dtype: Optional[torch.dtype] = None,
     ):
         self.model_name_or_path = model_name_or_path
         self.adapter_name_or_path = adapter_name_or_path
         self.device = device or str(get_current_device())
-        self.max_len = max_len
+        self.prompt_settings = resolve_prompt_settings(
+            model_name_or_path,
+            adapter_name_or_path,
+            prompt_format=prompt_format,
+            force_bos=force_bos,
+            max_len=max_len,
+            option_labels=option_labels,
+        )
+        self.max_len = self.prompt_settings["max_len"]
+        logger.info_rank0(f"Prompt settings: {self.prompt_settings}.")
         self.model = DecisionModelTeacher(
             model_name_or_path,
             self.device,
             adapter_name_or_path=adapter_name_or_path,
-            prompt_format=prompt_format,
-            force_bos=force_bos,
-            max_len=max_len,
+            cuda_graphs=cuda_graphs,
+            dtype=dtype,
+            **self.prompt_settings,
         )
         if calibration == "auto":
             calibration = calibration_path(model_name_or_path, adapter_name_or_path)
@@ -104,6 +196,15 @@ class DecisionPredictor:
         if self.calibration is None:
             return 1.0
         return float(self.calibration["temperature_by_kind"].get(kind, self.calibration["temperature"]))
+
+    @property
+    def gate(self) -> Optional[Dict[str, Any]]:
+        """The gate fitted with the calibration, or None if there is none."""
+        return (self.calibration or {}).get("gate")
+
+    def takes(self, kind: str, option: str, probability: float) -> Optional[bool]:
+        """Whether the gate takes an answer, from its option's name and calibrated probability, or None."""
+        return takes(self.gate, kind, option, probability)
 
     def log_probs(self, rows: Sequence[Dict[str, Any]]) -> List[Optional[List[float]]]:
         """Each row's log-probabilities over its options at temperature 1, or None if its prompt is too long."""

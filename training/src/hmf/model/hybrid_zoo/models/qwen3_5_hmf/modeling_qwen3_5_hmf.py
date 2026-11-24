@@ -144,14 +144,13 @@ class Qwen3_5DynamicCache:
             return 0
         return self.key_cache[layer_idx].shape[-2]
 
-    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
+    def get_mask_sizes(self, query_length: int, layer_idx: int) -> tuple[int, int]:
         """
         Return a tuple (kv_length, kv_offset) corresponding to the length and offset that will be returned for
         the given layer at `layer_idx`.
         The masks are then prepared according to the given lengths (kv_length, kv_offset) and patterns for each layer.
         """
         kv_offset = 0
-        query_length = cache_position.shape[0]
         past_seen_tokens = self.get_seq_length(layer_idx)
         kv_length = query_length + past_seen_tokens
         return kv_length, kv_offset
@@ -518,8 +517,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_params: Qwen3_5DynamicCache | None = None,
-        cache_position: torch.LongTensor | None = None,
+        cache: Qwen3_5DynamicCache | None = None,
         attention_mask: torch.Tensor | None = None,
     ):
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
@@ -528,16 +526,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
 
         use_precomputed_states = (
-            cache_params is not None
-            and cache_params.has_previous_state
+            cache is not None
+            and cache.has_previous_state
             and seq_len == 1
-            and cache_position is not None
         )
 
         # getting projected states from cache if it exists
-        if cache_params is not None:
-            conv_state = cache_params.conv_states[self.layer_idx]
-            recurrent_state = cache_params.recurrent_states[self.layer_idx]
+        if cache is not None:
+            conv_state = cache.conv_states[self.layer_idx]
+            recurrent_state = cache.recurrent_states[self.layer_idx]
 
         mixed_qkv = self.in_proj_qkv(hidden_states)
         mixed_qkv = mixed_qkv.transpose(1, 2)
@@ -559,9 +556,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.activation,
             )
         else:
-            if cache_params is not None:
+            if cache is not None:
                 conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
-                cache_params.conv_states[self.layer_idx] = conv_state
+                cache.conv_states[self.layer_idx] = conv_state
             if self.causal_conv1d_fn is not None:
                 mixed_qkv = self.causal_conv1d_fn(
                     x=mixed_qkv,
@@ -603,7 +600,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 g=g,
                 beta=beta,
                 initial_state=None,
-                output_final_state=cache_params is not None,
+                output_final_state=cache is not None,
                 use_qk_l2norm_in_kernel=True,
             )
 
@@ -615,13 +612,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 g=g,
                 beta=beta,
                 initial_state=recurrent_state,
-                output_final_state=cache_params is not None,
+                output_final_state=cache is not None,
                 use_qk_l2norm_in_kernel=True,
             )
 
         # Update cache
-        if cache_params is not None:
-            cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
+        if cache is not None:
+            cache.recurrent_states[self.layer_idx] = last_recurrent_state
 
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
@@ -749,8 +746,7 @@ class Qwen3_5Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
-        past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
+        cache: Cache | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -768,10 +764,8 @@ class Qwen3_5Attention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        if cache is not None:
+            key_states, value_states = cache.update(key_states, value_states, self.layer_idx)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -858,8 +852,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
+        cache: Cache | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.FloatTensor:
         residual = hidden_states
@@ -870,8 +863,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
+            cache=cache,
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -929,8 +921,7 @@ class Qwen3_5HybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: HybridCache | None = None,
-        cache_position: torch.LongTensor | None = None,
+        cache: HybridCache | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.FloatTensor:
         residual = hidden_states
@@ -940,8 +931,7 @@ class Qwen3_5HybridDecoderLayerBase(GradientCheckpointingLayer, ABC):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
+            cache=cache,
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -1005,13 +995,13 @@ class Qwen3_5DualAttDecoderLayer(GradientCheckpointingLayer):
         self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def _forward(self, hidden_states, position_embeddings=None, attention_mask=None,
-                 position_ids=None, past_key_values=None, cache_position=None, **kwargs):
+                 position_ids=None, cache=None, **kwargs):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         attn_mixer_out, _ = self.self_attn(
             hidden_states=hidden_states, attention_mask=attention_mask,
-            position_ids=position_ids, past_key_values=past_key_values,
-            cache_position=cache_position, position_embeddings=position_embeddings,
+            position_ids=position_ids, cache=cache,
+            position_embeddings=position_embeddings,
         )
         hidden_states = residual + attn_mixer_out
         residual = hidden_states
@@ -1021,17 +1011,17 @@ class Qwen3_5DualAttDecoderLayer(GradientCheckpointingLayer):
         return hidden_states, hidden_states_mlp, attn_mixer_out
 
     def forward(self, hidden_states, attention_hidden_states=None, attention_mask=None,
-                position_ids=None, past_key_values=None, output_attentions=False,
-                use_cache=False, cache_position=None, position_embeddings=None, **kwargs):
+                position_ids=None, cache=None, output_attentions=False,
+                use_cache=False, position_embeddings=None, **kwargs):
         hybrid_out, hybrid_mlp_out, hybrid_mixer_out = self._forward(
             hidden_states=hidden_states, attention_mask=attention_mask,
-            position_ids=position_ids, cache_position=cache_position,
+            position_ids=position_ids,
             position_embeddings=position_embeddings,
         )
         if attention_hidden_states is not None:
             attn_out, attn_mlp_out, attn_mixer_out = self._forward(
                 hidden_states=attention_hidden_states, attention_mask=attention_mask,
-                position_ids=position_ids, cache_position=cache_position,
+                position_ids=position_ids,
                 position_embeddings=position_embeddings,
             )
         else:
@@ -1063,14 +1053,14 @@ class Qwen3_5FusedAttHybridDecoderLayer(GradientCheckpointingLayer, ABC):
         pass
 
     def _hybrid_forward(self, hidden_states, attention_mask=None, position_ids=None,
-                        past_key_values=None, use_cache=False, cache_position=None,
+                        cache=None, use_cache=False,
                         position_embeddings=None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hybrid_mixer_out, _, _ = self.hybrid_seq_mixer(
             hidden_states=hidden_states, attention_mask=attention_mask,
-            position_ids=position_ids, past_key_values=past_key_values,
-            use_cache=use_cache, cache_position=cache_position,
+            position_ids=position_ids, cache=cache,
+            use_cache=use_cache,
             position_embeddings=position_embeddings,
         )
         hidden_states = residual + hybrid_mixer_out
@@ -1081,14 +1071,14 @@ class Qwen3_5FusedAttHybridDecoderLayer(GradientCheckpointingLayer, ABC):
         return hidden_states, hidden_states_mlp, hybrid_mixer_out
 
     def _attn_forward(self, hidden_states, attention_mask=None, position_ids=None,
-                      past_key_values=None, use_cache=False, cache_position=None,
+                      cache=None, use_cache=False,
                       position_embeddings=None, **kwargs):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         attn_mixer_out, _ = self.self_attn(
             hidden_states=hidden_states, attention_mask=attention_mask,
-            position_ids=position_ids, past_key_values=past_key_values,
-            cache_position=cache_position, position_embeddings=position_embeddings,
+            position_ids=position_ids, cache=cache,
+            position_embeddings=position_embeddings,
         )
         hidden_states = residual + attn_mixer_out
         residual = hidden_states
@@ -1098,18 +1088,18 @@ class Qwen3_5FusedAttHybridDecoderLayer(GradientCheckpointingLayer, ABC):
         return hidden_states.detach(), hidden_states_mlp.detach(), attn_mixer_out.detach()
 
     def forward(self, hidden_states, attention_hidden_states=None, attention_mask=None,
-                position_ids=None, past_key_values=None, output_attentions=False,
-                use_cache=False, cache_position=None, position_embeddings=None, **kwargs):
+                position_ids=None, cache=None, output_attentions=False,
+                use_cache=False, position_embeddings=None, **kwargs):
         hybrid_out, hybrid_mlp_out, hybrid_mixer_out = self._hybrid_forward(
             hidden_states=hidden_states, attention_mask=attention_mask,
-            position_ids=position_ids, past_key_values=past_key_values,
-            use_cache=use_cache, cache_position=cache_position,
+            position_ids=position_ids, cache=cache,
+            use_cache=use_cache,
             position_embeddings=position_embeddings,
         )
         attn_out, attn_mlp_out, attn_mixer_out = self._attn_forward(
             hidden_states=attention_hidden_states, attention_mask=attention_mask,
             position_ids=position_ids, use_cache=use_cache,
-            cache_position=cache_position, position_embeddings=position_embeddings,
+            position_embeddings=position_embeddings,
         )
         return (hybrid_out, attn_out, hybrid_mixer_out, attn_mixer_out, hybrid_mlp_out, attn_mlp_out)
 
@@ -1176,15 +1166,15 @@ class Qwen3_5FusedHybridHybridDecoderLayer(GradientCheckpointingLayer, ABC):
         pass
 
     def _forward(self, hidden_states, is_source, attention_mask=None, position_ids=None,
-                 past_key_values=None, use_cache=False, cache_position=None,
+                 cache=None, use_cache=False,
                  position_embeddings=None):
         seq_mixer = self.source_seq_mixer if is_source else self.target_seq_mixer
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hybrid_mixer_out, _, _ = seq_mixer(
             hidden_states=hidden_states, attention_mask=attention_mask,
-            position_ids=position_ids, past_key_values=past_key_values,
-            use_cache=use_cache, cache_position=cache_position,
+            position_ids=position_ids, cache=cache,
+            use_cache=use_cache,
             position_embeddings=position_embeddings,
         )
         hidden_states = residual + hybrid_mixer_out
@@ -1197,18 +1187,18 @@ class Qwen3_5FusedHybridHybridDecoderLayer(GradientCheckpointingLayer, ABC):
         return hidden_states, hidden_states_mlp, hybrid_mixer_out
 
     def forward(self, hidden_states, attention_hidden_states=None, attention_mask=None,
-                position_ids=None, past_key_values=None, output_attentions=False,
-                use_cache=False, cache_position=None, position_embeddings=None, **kwargs):
+                position_ids=None, cache=None, output_attentions=False,
+                use_cache=False, position_embeddings=None, **kwargs):
         target_out, target_mlp_out, target_mixer_out = self._forward(
             hidden_states=hidden_states, is_source=False, attention_mask=attention_mask,
-            position_ids=position_ids, past_key_values=past_key_values,
-            use_cache=use_cache, cache_position=cache_position,
+            position_ids=position_ids, cache=cache,
+            use_cache=use_cache,
             position_embeddings=position_embeddings,
         )
         source_out, source_mlp_out, source_mixer_out = self._forward(
             hidden_states=attention_hidden_states, is_source=True, attention_mask=attention_mask,
             position_ids=position_ids, use_cache=use_cache,
-            cache_position=cache_position, position_embeddings=position_embeddings,
+            position_embeddings=position_embeddings,
         )
         return (target_out, source_out, target_mixer_out, source_mixer_out, target_mlp_out, source_mlp_out)
 
@@ -1259,14 +1249,14 @@ class Qwen3_5FusedAttentionAttentionDecoderLayer(GradientCheckpointingLayer):
         self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def _attn_forward(self, attn_module, hidden_states, attention_mask=None, position_ids=None,
-                      past_key_values=None, use_cache=False, cache_position=None,
+                      cache=None, use_cache=False,
                       position_embeddings=None, **kwargs):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         attn_mixer_out, _ = attn_module(
             hidden_states=hidden_states, attention_mask=attention_mask,
-            position_ids=position_ids, past_key_values=past_key_values,
-            cache_position=cache_position, position_embeddings=position_embeddings, **kwargs,
+            position_ids=position_ids, cache=cache,
+            position_embeddings=position_embeddings, **kwargs,
         )
         hidden_states = residual + attn_mixer_out
         residual = hidden_states
@@ -1276,18 +1266,18 @@ class Qwen3_5FusedAttentionAttentionDecoderLayer(GradientCheckpointingLayer):
         return hidden_states, hidden_states_mlp, attn_mixer_out
 
     def forward(self, hidden_states, attention_hidden_states=None, attention_mask=None,
-                position_ids=None, past_key_values=None, output_attentions=False,
-                use_cache=False, cache_position=None, position_embeddings=None, **kwargs):
+                position_ids=None, cache=None, output_attentions=False,
+                use_cache=False, position_embeddings=None, **kwargs):
         target_out, target_mlp_out, target_mixer_out = self._attn_forward(
             self.target_attn, hidden_states=hidden_states, attention_mask=attention_mask,
-            position_ids=position_ids, past_key_values=past_key_values,
-            use_cache=use_cache, cache_position=cache_position,
+            position_ids=position_ids, cache=cache,
+            use_cache=use_cache,
             position_embeddings=position_embeddings, **kwargs,
         )
         source_out, source_mlp_out, source_mixer_out = self._attn_forward(
             self.source_attn, hidden_states=attention_hidden_states, attention_mask=attention_mask,
             position_ids=position_ids, use_cache=use_cache,
-            cache_position=cache_position, position_embeddings=position_embeddings, **kwargs,
+            position_embeddings=position_embeddings, **kwargs,
         )
         return (target_out, source_out.detach(), target_mixer_out, source_mixer_out.detach(),
                 target_mlp_out, source_mlp_out.detach())
@@ -1308,7 +1298,7 @@ class Qwen3_5HMFPreTrainedModel(PreTrainedModel):
         name for name in globals()
         if name.endswith("DecoderLayer") and "Qwen3_5" in name
     ] + ["Qwen3_5VisionBlock"]
-    _skip_keys_device_placement = "past_key_values"
+    _skip_keys_device_placement = "cache"
     _supports_flash_attn = True
     _supports_sdpa = True
     _keys_to_ignore_on_load_unexpected = [r"^mtp.*"]
@@ -1703,14 +1693,14 @@ class Qwen3_5VisionModel(Qwen3_5HMFPreTrainedModel):
 )
 class Qwen3_5HMFModelOutputWithPast(ModelOutput):
     r"""
-    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+    cache (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
         It is a [`~cache_utils.Cache`] instance.
     rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
         The rope index difference between sequence length and multimodal rope.
     """
 
     last_hidden_state: torch.FloatTensor | None = None
-    past_key_values: Cache | None = None
+    cache: Cache | None = None
     hidden_states: tuple[torch.FloatTensor] | None = None
     attentions: tuple[torch.FloatTensor] | None = None
     rope_deltas: torch.LongTensor | None = None
@@ -1745,10 +1735,9 @@ class Qwen3_5HMFTextModel(Qwen3_5HMFPreTrainedModel):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
+        cache: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1758,24 +1747,21 @@ class Qwen3_5HMFTextModel(Qwen3_5HMFPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if not self.training and use_cache and (
-            past_key_values is None or not isinstance(past_key_values, HybridCache)
+            cache is None or not isinstance(cache, HybridCache)
         ):
             logger.warning_once(
-                "You are passing `use_cache=True` and `past_key_values` is `None`. "
-                "We are setting `past_key_values` to a new instance of `HybridCache`."
+                "You are passing `use_cache=True` and `cache` is `None`. "
+                "We are setting `cache` to a new instance of `HybridCache`."
             )
-            del past_key_values
-            past_key_values = HybridCache(self.config)
+            del cache
+            cache = HybridCache(self.config)
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
+        past_seen_tokens = cache.get_seq_length() if cache is not None else 0
 
         # mrope: the hard coded `4` is for text, temporal, height and width.
         if position_ids is None:
-            position_ids = cache_position.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
 
@@ -1789,11 +1775,10 @@ class Qwen3_5HMFTextModel(Qwen3_5HMFPreTrainedModel):
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
+            cache=cache,
             position_ids=text_position_ids,
         )
-        linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
+        linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_seen_tokens)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -1805,9 +1790,8 @@ class Qwen3_5HMFTextModel(Qwen3_5HMFPreTrainedModel):
                 position_embeddings=position_embeddings,
                 attention_mask=layer_mask,
                 position_ids=position_ids,
-                past_key_values=past_key_values,
+                cache=cache,
                 use_cache=use_cache,
-                cache_position=cache_position,
                 **kwargs,
             )
 
@@ -1815,10 +1799,10 @@ class Qwen3_5HMFTextModel(Qwen3_5HMFPreTrainedModel):
 
         return Qwen3_5HMFModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=past_key_values,
+            cache=cache,
         )
 
-    def _update_linear_attn_mask(self, attention_mask, cache_position):
+    def _update_linear_attn_mask(self, attention_mask, past_seen_tokens):
         """
         NOTE: Left-padding is used for linear attention mask.
         No need for zeroing states when
@@ -1826,7 +1810,7 @@ class Qwen3_5HMFTextModel(Qwen3_5HMFPreTrainedModel):
             2. Attending to all inputs
         """
         linear_attn_mask = attention_mask
-        if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
+        if past_seen_tokens > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
             linear_attn_mask = None
         return linear_attn_mask
 
@@ -2108,17 +2092,17 @@ class Qwen3_5HMFModel(Qwen3_5HMFPreTrainedModel):
         image_grid_thw: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        past_key_values: torch.Tensor | None = None,
+        cache: torch.Tensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
     ) -> torch.Tensor | None:
-        past_key_values_length = 0 if past_key_values is None else past_key_values.get_seq_length()
+        cache_length = 0 if cache is None else cache.get_seq_length()
         can_compute_mrope = (
             input_ids is not None
             and mm_token_type_ids is not None
             and (image_grid_thw is not None or video_grid_thw is not None)
         )
 
-        if can_compute_mrope and (self.rope_deltas is None or past_key_values_length == 0):
+        if can_compute_mrope and (self.rope_deltas is None or cache_length == 0):
             position_ids, rope_deltas = self.get_rope_index(
                 input_ids,
                 image_grid_thw=image_grid_thw,
@@ -2135,12 +2119,12 @@ class Qwen3_5HMFModel(Qwen3_5HMFPreTrainedModel):
                 position_ids = position_ids.masked_fill(attention_mask == 0, 0)
                 position_ids = position_ids.view(1, batch_size, -1).repeat(3, 1, 1).to(inputs_embeds.device)
             else:
-                position_ids = torch.arange(past_key_values_length, past_key_values_length + seq_length)
+                position_ids = torch.arange(cache_length, cache_length + seq_length)
                 position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1).to(inputs_embeds.device)
             delta = self.rope_deltas.repeat_interleave(batch_size // self.rope_deltas.shape[0], dim=0)
             position_ids = position_ids + delta.to(device=inputs_embeds.device)
         else:
-            # Can't build correct 3D positions. Let the model infer it from `cache_position`
+            # Can't build correct 3D positions. Let the model infer them from the cache's length
             position_ids = None
         return position_ids
 
@@ -2151,14 +2135,13 @@ class Qwen3_5HMFModel(Qwen3_5HMFPreTrainedModel):
         input_ids: torch.LongTensor = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
+        cache: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.Tensor | None = None,
         pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5HMFModelOutputWithPast:
         r"""
@@ -2202,7 +2185,7 @@ class Qwen3_5HMFModel(Qwen3_5HMFPreTrainedModel):
                 video_grid_thw=video_grid_thw,
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                past_key_values=past_key_values,
+                cache=cache,
                 mm_token_type_ids=mm_token_type_ids,
             )
 
@@ -2210,9 +2193,8 @@ class Qwen3_5HMFModel(Qwen3_5HMFPreTrainedModel):
             input_ids=None,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
+            cache=cache,
             inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
             **kwargs,
         )
 
@@ -2239,6 +2221,16 @@ class Qwen3_5HMFForCausalLM(Qwen3_5HMFPreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def _prepare_cache_for_generation(self, generation_config, model_kwargs, *args, **kwargs):
+        """
+        Gives generate() a HybridCache, which holds the state of every layer type. Otherwise, generate() would
+        build transformers' own cache from config.layer_types, and that cache has no room for the states of the
+        hybrid layers.
+        """
+        if model_kwargs.get("cache") is None and generation_config.use_cache is not False:
+            model_kwargs["cache"] = HybridCache(self.config.get_text_config())
+        return super()._prepare_cache_for_generation(generation_config, model_kwargs, *args, **kwargs)
+
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -2246,11 +2238,10 @@ class Qwen3_5HMFForCausalLM(Qwen3_5HMFPreTrainedModel, GenerationMixin):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
+        cache: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
@@ -2280,10 +2271,9 @@ class Qwen3_5HMFForCausalLM(Qwen3_5HMFPreTrainedModel, GenerationMixin):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            cache=cache,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            cache_position=cache_position,
             **kwargs,
         )
 
@@ -2296,17 +2286,10 @@ class Qwen3_5HMFForCausalLM(Qwen3_5HMFPreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        # Keep track of sequence offset (e.g., # tokens seen) for Hybrid layers
-        past_key_values_ = outputs.past_key_values
-        if use_cache and past_key_values_ is not None:
-            if hasattr(past_key_values_, "update_offset"):
-                seq_len = hidden_states.shape[1]
-                past_key_values_.update_offset(seq_len)
-
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=outputs.past_key_values,
+            cache=outputs.cache,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
@@ -2328,7 +2311,7 @@ class Qwen3_5HMFCausalLMOutputWithPast(ModelOutput):
         Language modeling loss (for next-token prediction).
     logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
         Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+    cache (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
         It is a [`~cache_utils.Cache`] instance.
     rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
         The rope index difference between sequence length and multimodal rope.
@@ -2336,7 +2319,7 @@ class Qwen3_5HMFCausalLMOutputWithPast(ModelOutput):
 
     loss: torch.FloatTensor | None = None
     logits: torch.FloatTensor | None = None
-    past_key_values: Cache | None = None
+    cache: Cache | None = None
     hidden_states: tuple[torch.FloatTensor] | None = None
     attentions: tuple[torch.FloatTensor] | None = None
     rope_deltas: torch.LongTensor | None = None
@@ -2355,6 +2338,16 @@ class Qwen3_5HMFForConditionalGeneration(Qwen3_5HMFPreTrainedModel, GenerationMi
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
         self.post_init()
+
+    def _prepare_cache_for_generation(self, generation_config, model_kwargs, *args, **kwargs):
+        """
+        Gives generate() a HybridCache, which holds the state of every layer type. Otherwise, generate() would
+        build transformers' own cache from config.layer_types, and that cache has no room for the states of the
+        hybrid layers.
+        """
+        if model_kwargs.get("cache") is None and generation_config.use_cache is not False:
+            model_kwargs["cache"] = HybridCache(self.config.get_text_config())
+        return super()._prepare_cache_for_generation(generation_config, model_kwargs, *args, **kwargs)
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
@@ -2400,7 +2393,7 @@ class Qwen3_5HMFForConditionalGeneration(Qwen3_5HMFPreTrainedModel, GenerationMi
         input_ids: torch.LongTensor = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
+        cache: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         pixel_values: torch.Tensor | None = None,
@@ -2408,7 +2401,6 @@ class Qwen3_5HMFForConditionalGeneration(Qwen3_5HMFPreTrainedModel, GenerationMi
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
-        cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5HMFCausalLMOutputWithPast:
@@ -2467,9 +2459,8 @@ class Qwen3_5HMFForConditionalGeneration(Qwen3_5HMFPreTrainedModel, GenerationMi
             video_grid_thw=video_grid_thw,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
+            cache=cache,
             inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
             mm_token_type_ids=mm_token_type_ids,
             **kwargs,
         )
@@ -2487,7 +2478,7 @@ class Qwen3_5HMFForConditionalGeneration(Qwen3_5HMFPreTrainedModel, GenerationMi
         return Qwen3_5HMFCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=outputs.past_key_values,
+            cache=outputs.cache,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
@@ -2496,10 +2487,9 @@ class Qwen3_5HMFForConditionalGeneration(Qwen3_5HMFPreTrainedModel, GenerationMi
     def prepare_inputs_for_generation(
         self,
         input_ids,
-        past_key_values=None,
+        cache=None,
         attention_mask=None,
         inputs_embeds=None,
-        cache_position=None,
         position_ids=None,
         use_cache=True,
         pixel_values=None,
@@ -2513,10 +2503,9 @@ class Qwen3_5HMFForConditionalGeneration(Qwen3_5HMFPreTrainedModel, GenerationMi
 
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
-            past_key_values=past_key_values,
+            cache=cache,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
             position_ids=position_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
@@ -2540,7 +2529,7 @@ class Qwen3_5HMFForConditionalGeneration(Qwen3_5HMFPreTrainedModel, GenerationMi
 
         # Early exit in case we are continuing generation from past kv
         past_length = 0
-        if (cache := model_kwargs.get("past_key_values")) is not None:
+        if (cache := model_kwargs.get("cache")) is not None:
             past_length = cache.get_seq_length()
         if past_length != 0 and self.model.rope_deltas is not None:
             position_ids = text_positions[None, ...] + self.model.rope_deltas
@@ -2697,8 +2686,7 @@ class Qwen3_5HMFForConditionalGeneration(Qwen3_5HMFPreTrainedModel, GenerationMi
                 if key == "position_ids" and dict_to_expand[key].ndim == 3:
                     dict_to_expand[key] = dict_to_expand[key].repeat_interleave(expand_size, dim=1)
                 elif (
-                    key != "cache_position"
-                    and dict_to_expand[key] is not None
+                    dict_to_expand[key] is not None
                     and isinstance(dict_to_expand[key], torch.Tensor)
                     and key not in visual_keys
                 ):

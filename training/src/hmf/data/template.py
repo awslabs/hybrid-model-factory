@@ -55,6 +55,9 @@ class Template:
     replace_jinja_template: bool
     enable_thinking: Optional[bool]
     mm_plugin: "BasePlugin"
+    # Whether to drop the tool prompt's leading newlines when there is no system message, as some models' chat
+    # templates do (see MiniCPM5Template)
+    strip_tool_prompt_without_system = False
 
     def encode_oneturn(
         self,
@@ -148,6 +151,9 @@ class Template:
                 elements += self.format_prefix.apply()
                 if system or tools:
                     tool_text = self.format_tools.apply(content=tools)[0] if tools else ""
+                    if tools and not system and self.strip_tool_prompt_without_system:
+                        tool_text = tool_text.lstrip("\n")
+
                     elements += self.format_system.apply(content=(system + tool_text))
 
             if message["role"] == Role.USER:
@@ -457,6 +463,66 @@ class ReasoningTemplate(Template):
                     encoded_messages[i + 1] = self.get_thought_word_ids(tokenizer) + encoded_messages[i + 1]
 
         return [(encoded_messages[i], encoded_messages[i + 1]) for i in range(0, len(encoded_messages), 2)]
+
+
+@dataclass
+class Gemma4Template(Template):
+    r"""
+    Gemma 4's chat template (the -it models' chat_template.jinja). It keeps the thinking of the last model turn only,
+    and writes no empty thought blocks where a turn has no thinking, unlike ReasoningTemplate. When the last turn's
+    thinking is kept, the system turn starts with <|think|>, as Gemma 4's template writes it with enable_thinking
+    (creating a system turn when there is none). With enable_thinking False, all thinking is removed. Tool calls and
+    responses, which Gemma 4 keeps inside the model turn and names after their tool, are not supported yet.
+    """
+
+    def _prepare(
+        self, messages: list[dict[str, str]], system: Optional[str], tools: Optional[str]
+    ) -> tuple[list[dict[str, str]], Optional[str]]:
+        if tools or any(message["role"] in (Role.FUNCTION, Role.OBSERVATION) for message in messages):
+            raise NotImplementedError("The gemma4 template does not support tool calls and responses yet.")
+
+        messages = deepcopy(messages)
+        last = len(messages) - 1
+        for i in range(1, len(messages), 2):
+            if i != last or self.enable_thinking is False:
+                messages[i]["content"] = self.remove_thought(messages[i]["content"])
+
+        if self.enable_thinking is not False and self.thought_words[0] in messages[last]["content"]:
+            system = "<|think|>\n" + (system or self.default_system)
+        return messages, system
+
+    @override
+    def encode_oneturn(
+        self,
+        tokenizer: "PreTrainedTokenizer",
+        messages: list[dict[str, str]],
+        system: Optional[str] = None,
+        tools: Optional[str] = None,
+    ) -> tuple[list[int], list[int]]:
+        messages, system = self._prepare(messages, system, tools)
+        return super().encode_oneturn(tokenizer, messages, system, tools)
+
+    @override
+    def encode_multiturn(
+        self,
+        tokenizer: "PreTrainedTokenizer",
+        messages: list[dict[str, str]],
+        system: Optional[str] = None,
+        tools: Optional[str] = None,
+    ) -> list[tuple[list[int], list[int]]]:
+        messages, system = self._prepare(messages, system, tools)
+        return super().encode_multiturn(tokenizer, messages, system, tools)
+
+
+@dataclass
+class MiniCPM5Template(ReasoningTemplate):
+    r"""
+    MiniCPM5's chat template, which ReasoningTemplate writes for text and thinking: an empty thought block in every
+    assistant turn without thinking, and the thinking of every turn kept. Its tool prompt starts with two newlines,
+    which separate it from the system message and which MiniCPM5's template drops when there is no system message.
+    """
+
+    strip_tool_prompt_without_system = True
 
 
 @dataclass
@@ -1086,6 +1152,20 @@ register_template(
 )
 
 
+# Gemma 4's chat template, as gemma-4-E4B-it's chat_template.jinja renders it (see Gemma4Template)
+register_template(
+    name="gemma4",
+    format_user=StringFormatter(slots=["<|turn>user\n{{content}}<turn|>\n<|turn>model\n"]),
+    format_assistant=StringFormatter(slots=["{{content}}<turn|>\n"]),
+    format_system=StringFormatter(slots=["<|turn>system\n{{content}}<turn|>\n"]),
+    format_prefix=EmptyFormatter(slots=[{"bos_token"}]),
+    stop_words=["<turn|>"],
+    thought_words=("<|channel>thought\n", "\n<channel|>"),
+    replace_eos=True,
+    template_class=Gemma4Template,
+)
+
+
 register_template(
     name="glm4",
     format_user=StringFormatter(slots=["<|user|>\n{{content}}<|assistant|>"]),
@@ -1688,6 +1768,23 @@ register_template(
     stop_words=["<|im_end|>"],
     default_system="You are a helpful assistant. You can accept audio and text input and output voice and text.",
     mm_plugin=get_mm_plugin(name="minicpm_v", image_token="<image>", video_token="<video>", audio_token="<audio>"),
+)
+
+
+register_template(
+    name="minicpm5",
+    format_user=StringFormatter(slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),
+    format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
+    format_system=StringFormatter(slots=["<|im_start|>system\n{{content}}<|im_end|>\n"]),
+    format_function=FunctionFormatter(slots=["{{content}}<|im_end|>\n"], tool_format="minicpm5"),
+    format_observation=StringFormatter(
+        slots=["<|im_start|>user\n<tool_response>\n{{content}}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"]
+    ),
+    format_tools=ToolFormatter(tool_format="minicpm5"),
+    format_prefix=EmptyFormatter(slots=[{"bos_token"}]),
+    stop_words=["<|im_end|>"],
+    replace_eos=True,
+    template_class=MiniCPM5Template,
 )
 
 

@@ -44,6 +44,8 @@ The data preprocessing splits each training sample into this zig-zag layout befo
 
 Attention layers use [ring flash attention](https://github.com/zhuzilin/ring-flash-attention) (zigzag-ring mode) to compute attention across distributed chunks. The implementation monkey-patches the HuggingFace `transformers` flash attention forward to route through the distributed attention backend.
 
+**Note:** Hybrid Gemma 4's attention layers don't use ring attention, which can't run its full attention heads of 512 or its sliding windows, and instead exchange keys and values between the GPUs themselves. Its sliding window layers need each GPU's chunks to be at least `window - 1` tokens long (511 for E2B and E4B), and they support `zigzag-ring` only.
+
 ### State-Space Model (SSM) Layer
 
 SSM layers (Mamba2, GKA, GDN, etc.) have a sequential dependency along the sequence dimension through two operations:
@@ -443,7 +445,7 @@ A: Yes. SP can be composed with DeepSpeed ZeRO. See the example configs in `trai
 A: `zigzag-ring` is the default and recommended mode. It provides better load balancing for Hybrid models. `ulysses` is available as an alternative for attention layers but is not currently supported for SSM layers.
 
 **Q: Can I use SP with a Hugging Face model that is not an HMF model?**
-A: Yes, for models such as Qwen3 or Llama, whose layers all use full attention without softcapping. SP runs their attention as ring attention. Layers of other kinds, such as the Gated DeltaNet layers of stock Qwen3.5, only see their own GPU's part of each sequence. Ring attention also ignores sliding windows and attention softcapping (as in Gemma 2). Such models would silently train with wrong results, so the SFT, pre-training, and decision trainers check every layer at their first batch, and stop with an error that names the unsupported layers. To train such a model with SP, convert it to an HMF model with `hmf prime-init` first. With `ulysses`, the trainers also stop with this error for HMF's layers other than attention (such as GKA, GDN, Mamba2, and SWA), because these layers support `zigzag-ring` only.
+A: Yes, for models such as Qwen3 or Llama, whose layers all use full attention without softcapping. SP runs their attention as ring attention. Layers of other kinds, such as the Gated DeltaNet layers of stock Qwen3.5, only see their own GPU's part of each sequence. Ring attention also ignores sliding windows and attention softcapping. Such models would silently train with wrong results, so the SFT, pre-training, and decision trainers check every layer at their first batch, and stop with an error that names the unsupported layers. To train such a model with SP, convert it to an HMF model with `hmf prime-init` first. For example, stock Gemma 4, whose sliding window layers ring attention would get wrong, trains with SP once converted, and a pattern of `*` layers keeps its attention as it is. With `ulysses`, the trainers also stop with this error for HMF's layers other than attention (such as GKA, GDN, Mamba2, and SWA), because these layers support `zigzag-ring` only.
 
 **Q: How does SP interact with the data pipeline?**
 A: The data pipeline splits each sample into zig-zag chunks during preprocessing (via `preprocess_sp_dataset` in `data_utils.py`). Each GPU's dataloader yields only its assigned chunks. This means tokenized datasets must be prepared with the target SP size--you cannot change SP size without re-tokenizing.

@@ -82,12 +82,23 @@ class SaveShardMixin:
 
     @override
     def _save(self, output_dir: str | None = None, state_dict: dict | None = None) -> None:
-        """Save model weights, configuration, and processing class to `output_dir`."""
+        """
+        Save model weights, configuration, and processing class to `output_dir`, as transformers' Trainer._save does,
+        with save_max_shard_size as the largest shard. Transformers 5.24's save_model calls this method on every
+        rank, so it returns early on the ranks that do not write, except for a model sharded at load time, whose
+        ranks all take part in gathering its weights. Otherwise, a ZeRO-3 rank would save its own empty part of the
+        weights over the full ones.
+        """
         output_dir = output_dir if output_dir is not None else self.args.output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        logger.info_rank0(f"Saving model checkpoint to {output_dir}")
+        distributed_loading = getattr(self, "is_distributed_loading_by_transformers", False)
+        if not self.args.should_save and not distributed_loading:
+            return
+        if self.args.should_save:
+            os.makedirs(output_dir, exist_ok=True)
+            logger.info_rank0(f"Saving model checkpoint to {output_dir}")
 
         max_shard_size = getattr(self.finetuning_args, "save_max_shard_size", "5GB")
+        save_kwargs = {"max_shard_size": max_shard_size, "is_main_process": self.args.should_save}
 
         supported_classes = (PreTrainedModel,) if not is_peft_available() else (PreTrainedModel, PeftModel)
         # Save a trained model and configuration using `save_pretrained()`.
@@ -98,15 +109,19 @@ class SaveShardMixin:
 
             if isinstance(self.accelerator.unwrap_model(self.model, keep_torch_compile=False), supported_classes):
                 self.accelerator.unwrap_model(self.model, keep_torch_compile=False).save_pretrained(
-                    output_dir, state_dict=state_dict, max_shard_size=max_shard_size
+                    output_dir, state_dict=state_dict, **save_kwargs
                 )
-            else:
+            elif self.args.should_save:
                 logger.info_rank0("Trainer.model is not a `PreTrainedModel`, only saving its state dict.")
                 safetensors.torch.save_file(
                     state_dict, os.path.join(output_dir, SAFE_WEIGHTS_NAME), metadata={"format": "pt"}
                 )
         else:
-            self.model.save_pretrained(output_dir, state_dict=state_dict, max_shard_size=max_shard_size)
+            self.model.save_pretrained(output_dir, state_dict=state_dict, **save_kwargs)
+
+        # A rank that does not write is only here to take part in gathering the weights above
+        if not self.args.should_save:
+            return
 
         if self.processing_class is not None:
             self.processing_class.save_pretrained(output_dir)

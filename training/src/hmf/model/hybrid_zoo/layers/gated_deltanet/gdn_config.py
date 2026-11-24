@@ -3,8 +3,15 @@ from typing import Optional, Union, TYPE_CHECKING
 
 from transformers.configuration_utils import PretrainedConfig
 
+from ..head_split import split_heads
+
 if TYPE_CHECKING:
     from ..hybrid_dataclasses import HybridGatedDeltaNetConfig
+
+# The largest head size that GDN's kernels (from fla) support, which refuse larger heads with "current kernel does
+# not support head dimension larger than 256". Larger attention heads are split into heads of this size (see
+# split_heads).
+GDN_MAX_HEAD_DIM = 256
 
 
 @dataclass
@@ -101,6 +108,7 @@ def _construct_from_transformer(
     num_heads = config.num_attention_heads
     num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
     head_dim = getattr(config, "head_dim", config.hidden_size // num_heads)
+    head_dim, num_heads, num_kv_heads = split_heads(head_dim, num_heads, num_kv_heads, GDN_MAX_HEAD_DIM)
 
     # Standard GQA: Q has more heads, K/V have fewer
     return GDNConfig(

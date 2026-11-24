@@ -67,7 +67,7 @@ class CacheComposerMixin:
         self,
         input_ids,
         next_sequence_length=None,
-        past_key_values=None,
+        cache=None,
         use_cache=True,
         **kwargs,
     ):
@@ -81,55 +81,55 @@ class CacheComposerMixin:
         next_sequence_length=1, since the cache already contains everything else.
         """
         # Initialize HybridCache if needed
-        if use_cache and past_key_values is not None and not isinstance(past_key_values, HybridCache):
-            del past_key_values
+        if use_cache and cache is not None and not isinstance(cache, HybridCache):
+            del cache
             gc.collect()
             torch.cuda.empty_cache()
-            past_key_values = HybridCache(self.config)
+            cache = HybridCache(self.config)
 
         kwargs['use_cache'] = use_cache
         
         # Perform chunked prefill composition
         composed = kwargs.get("compose_type") is not None
-        input_ids, past_key_values, kwargs = self.compose_cache(input_ids, past_key_values, kwargs)
+        input_ids, cache, kwargs = self.compose_cache(input_ids, cache, kwargs)
 
         # After composition the cache is fully populated — only the last token
         # needs to go through the model forward. In v5.x _prefill() passes
         # next_sequence_length=None for the first call, but we need to override
         # that so the base class slices input_ids down to 1 token.
-        if composed and past_key_values is not None and past_key_values.get_seq_length() > 0:
+        if composed and cache is not None and cache.get_seq_length() > 0:
             next_sequence_length = 1
 
         return super().prepare_inputs_for_generation(
             input_ids,
             next_sequence_length=next_sequence_length,
-            past_key_values=past_key_values,
+            cache=cache,
             **kwargs,
         )
 
     def compose_cache(
         self, 
         input_ids: torch.Tensor, 
-        past_key_values: Optional[HybridCache], 
+        cache: Optional[HybridCache], 
         kwargs: Dict[str, Any]
     ) -> Tuple[torch.Tensor, Optional[HybridCache], Dict[str, Any]]:
         """Handle chunking and processing of context during prefill.
         
         Returns:
-            Tuple of (input_ids, past_key_values, kwargs)
+            Tuple of (input_ids, cache, kwargs)
         """
         compose_type = kwargs.get("compose_type")
         
         # Early return: no composition needed
         if compose_type is None:
-            return input_ids, past_key_values, kwargs
+            return input_ids, cache, kwargs
         
         kwargs['use_cache'] = True
         
         # Early return: cache already populated
-        if past_key_values is not None and past_key_values.get_seq_length() > 0:
-            input_ids = self._prepare_final_inputs(input_ids, past_key_values, kwargs)
-            return input_ids, past_key_values, kwargs
+        if cache is not None and cache.get_seq_length() > 0:
+            input_ids = self._prepare_final_inputs(input_ids, cache, kwargs)
+            return input_ids, cache, kwargs
         
         # === Main composition prefill logic ===
         config = self._parse_composition_config(kwargs)
@@ -145,33 +145,33 @@ class CacheComposerMixin:
         
         # Compose cache based on strategy
         if config['kv_strategy'] == 'full':
-            self.prefix_ids, past_key_values = self._compose_fullkv_hybrid(
+            self.prefix_ids, cache = self._compose_fullkv_hybrid(
                 context_ids, config['num_chunks'], strategy=config['ssm_strategy']
             )
         else:
-            self.prefix_ids, past_key_values = self._compose_batch_hybrid(
+            self.prefix_ids, cache = self._compose_batch_hybrid(
                 context_ids, config['num_chunks'], strategy=config['ssm_strategy'],
                 min_prepend=config['min_prepend'],
                 prefix_input_ids=config['prefix_input_ids'],
                 sequential_positions=config['sequential_positions']
             )
             if config['kv_strategy'] == 'sw':
-                past_key_values = self._apply_sliding_window_mask(
-                    past_key_values, context_ids, config['num_chunks'],
+                cache = self._apply_sliding_window_mask(
+                    cache, context_ids, config['num_chunks'],
                     config['min_prepend'], config['prefix_input_ids']
                 )
         
         # Prefill tokens from the query part of the prompt
         self._store_composition_metadata(context_ids, config['num_chunks'])
-        past_key_values = self.prefill_query(query_ids, config['query_len'], past_key_values)
+        cache = self.prefill_query(query_ids, config['query_len'], cache)
         
-        logger.info(f"After prefill_query: seqlen_offset={past_key_values.seqlen_offset}, "
-                   f"kv_seq_len={past_key_values.get_seq_length()}")
+        logger.info(f"After prefill_query: tokens read={cache.get_seq_length()}, "
+                   f"kv_seq_len={cache.cached_attention_length()}")
         
         # Prepare final inputs
-        input_ids = self._prepare_final_inputs(input_ids, past_key_values, kwargs)
+        input_ids = self._prepare_final_inputs(input_ids, cache, kwargs)
         
-        return input_ids, past_key_values, kwargs
+        return input_ids, cache, kwargs
 
     # =========================================================================
     # Helper Methods
@@ -235,10 +235,13 @@ class CacheComposerMixin:
     def _prepare_final_inputs(
         self, 
         input_ids: torch.Tensor, 
-        past_key_values: HybridCache,
+        cache: HybridCache,
         kwargs: Dict[str, Any]
     ) -> torch.Tensor:
-        """Prepend prefix, create attention mask, compute cache position."""
+        """
+        Prepends the prefix, builds the attention mask, and sets the positions when the attention cache holds
+        fewer tokens than the composed cache has read (see HybridCache.get_seq_length).
+        """
         attention_mask = torch.ones_like(input_ids)
         final_input_ids = input_ids
         
@@ -248,19 +251,16 @@ class CacheComposerMixin:
             self.prefix_ids.numel() > 0
         ):
             final_input_ids = torch.cat([self.prefix_ids, input_ids], dim=1)
-            attention_mask = self._create_attention_mask(final_input_ids, past_key_values)
+            attention_mask = self._create_attention_mask(final_input_ids, cache)
         
         kwargs['attention_mask'] = attention_mask
-        kwargs['cache_position'] = torch.tensor(
-            [final_input_ids.shape[1] - 1], 
-            device=final_input_ids.device,
-            dtype=torch.long
-        )
         
-        if past_key_values is not None and not past_key_values.check_seqlen_match():
+        if cache is not None and (
+            cache.get_seq_length() != cache.cached_attention_length()
+        ):
             kwargs['position_ids'] = torch.full(
                 (final_input_ids.shape[0], 1), 
-                past_key_values.seqlen_offset, 
+                cache.get_seq_length(), 
                 device=final_input_ids.device, 
                 dtype=torch.long
             )
@@ -270,16 +270,16 @@ class CacheComposerMixin:
     def _create_attention_mask(
         self, 
         input_ids: torch.Tensor, 
-        past_key_values: HybridCache
+        cache: HybridCache
     ) -> torch.Tensor:
         """Create attention mask, handling sliding window case."""
         attention_mask = torch.ones_like(input_ids)
         
-        if not self._is_sliding_window(past_key_values):
+        if not self._is_sliding_window(cache):
             return attention_mask
         
-        gap_size = past_key_values._sw_gap_size
-        prefix_size = past_key_values._sw_prefix_size
+        gap_size = cache._sw_gap_size
+        prefix_size = cache._sw_prefix_size
         attention_mask[:, prefix_size:prefix_size + gap_size] = 0
         
         logger.debug(
@@ -289,11 +289,11 @@ class CacheComposerMixin:
         
         return attention_mask
 
-    def _is_sliding_window(self, past_key_values: HybridCache) -> bool:
+    def _is_sliding_window(self, cache: HybridCache) -> bool:
         """Check if cache is configured for sliding window."""
         return (
-            hasattr(past_key_values, '_sw_gap_size') and 
-            past_key_values._sw_gap_size > 0
+            hasattr(cache, '_sw_gap_size') and 
+            cache._sw_gap_size > 0
         )
 
 
@@ -330,16 +330,13 @@ class CacheComposerMixin:
         # Get full KV cache from concatenated inputs
         concat_tokenize_inputs = torch.cat(tokenized_inputs, dim=1)
         output = self.model(input_ids=concat_tokenize_inputs, use_cache=True)
-        concat_cache = output.past_key_values
-        seq_len = output[0].shape[1]
-        concat_cache.update_offset(seq_len)
+        concat_cache = output.cache
         
         # Process chunks for SSM combination if needed
         chunked_cache = None
         if use_chunked_cache:
             position_ids = self.create_position_ids_for_chunks(tokenized_inputs, 0, is_sequential=False)
-            chunked_cache, chunk_seq_len = self._process_chunked_inputs(tokenized_inputs, position_ids)
-            chunked_cache.update_offset(chunk_seq_len)
+            chunked_cache, _ = self._process_chunked_inputs(tokenized_inputs, position_ids)
             
             if strategy == 'fuse':
                 if chunked_cache._mamba_memory_dict:
@@ -426,7 +423,6 @@ class CacheComposerMixin:
         logger.debug(position_ids)
         
         chunked_cache, seq_len = self._process_chunked_inputs(tokenized_inputs, position_ids)
-        chunked_cache.update_offset(seq_len)
         
         if strategy == 'fuse':
             if chunked_cache._mamba_memory_dict:
@@ -437,7 +433,6 @@ class CacheComposerMixin:
 
         new_cache = HybridCache(self.model.config)
         effective_seq_len = prefix_masks.sum().item() if sequential_positions else seq_len
-        new_cache.update_offset(effective_seq_len)
         logger.debug(f'Original Input seqlen: {input_ids.shape[1]}')
         logger.debug(f'Post-padding seqlen: {effective_seq_len}')
 
@@ -452,7 +447,9 @@ class CacheComposerMixin:
                 kalmanet_combine_fn(chunked_cache, layer_idx, new_cache)
             else:
                 raise KeyError(f"Layer {layer_idx} not in cache")
-        
+        # The composed cache counts every token that composition read, even though the attention cache may keep fewer
+        new_cache.set_seq_length(effective_seq_len)
+
         kept_prefix_ids = (first_prefix_ids if keep_first_prefix 
                           else torch.empty((1, 0), dtype=input_ids.dtype, device=input_ids.device))
         
@@ -580,7 +577,7 @@ class CacheComposerMixin:
                 position_ids=position_ids,
                 use_cache=True
             )
-            return chunked_out.past_key_values, chunked_out[0].shape[1]
+            return chunked_out.cache, chunked_out[0].shape[1]
             
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
             if "out of memory" not in str(e).lower():
@@ -610,9 +607,9 @@ class CacheComposerMixin:
                 )
                 
                 if chunked_cache is None:
-                    chunked_cache, seq_len = chunk_out.past_key_values, chunk_out[0].shape[1]
+                    chunked_cache, seq_len = chunk_out.cache, chunk_out[0].shape[1]
                 else:
-                    self._merge_chunked_cache(chunked_cache, chunk_out.past_key_values)
+                    self._merge_chunked_cache(chunked_cache, chunk_out.cache)
                 
                 del chunk_out
                 torch.cuda.empty_cache()
@@ -668,13 +665,13 @@ class CacheComposerMixin:
             
             target_cache.gated_deltanet.key_value_memory_dict[layer_idx] = new_dict
 
-    def prefill_query(self, tokens_to_process, query_len, past_key_values):
+    def prefill_query(self, tokens_to_process, query_len, cache):
         """Process query tokens one at a time."""
         if query_len > 1:
             logger.debug(f'Processing {tokens_to_process.shape[1]} query tokens')
             for i in range(tokens_to_process.shape[1]):
                 current_token = tokens_to_process[:, i:i+1]
-                current_position = past_key_values.seqlen_offset
+                current_position = cache.get_seq_length()
                 batch_size = current_token.shape[0]
                 position_ids = torch.full(
                     (batch_size, 1), current_position, 
@@ -682,22 +679,20 @@ class CacheComposerMixin:
                 )
                 temp_inputs = {
                     "input_ids": current_token,
-                    "past_key_values": past_key_values,
+                    "cache": cache,
                     "position_ids": position_ids,
                     "use_cache": True,
                     "return_dict": True,
                 }
                 
                 outputs = self.model(**temp_inputs)
-                past_key_values = outputs.past_key_values
-                out_len = outputs[0].shape[1]
-                past_key_values.update_offset(out_len)
+                cache = outputs.cache
 
-        return past_key_values
+        return cache
 
     def _apply_sliding_window_mask(
         self,
-        past_key_values: HybridCache,
+        cache: HybridCache,
         context_ids: torch.Tensor,
         num_chunks: int,
         min_prepend: int,
@@ -715,15 +710,15 @@ class CacheComposerMixin:
         total_content_tokens = prefix_masks.sum().item() - n_first_prefix
         n_gap = total_content_tokens - n_last_chunk
         
-        past_key_values._sw_gap_size = n_gap
-        past_key_values._sw_prefix_size = n_first_prefix
+        cache._sw_gap_size = n_gap
+        cache._sw_prefix_size = n_first_prefix
         
         logger.debug(
             f'SW: prefix={n_first_prefix}, gap={n_gap}, '
-            f'last_chunk={n_last_chunk}, total_cache={past_key_values.get_seq_length()}'
+            f'last_chunk={n_last_chunk}, total_cache={cache.cached_attention_length()}'
         )
         
-        return past_key_values
+        return cache
 
 
 

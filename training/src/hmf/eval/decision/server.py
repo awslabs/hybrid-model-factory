@@ -29,17 +29,22 @@ The reply holds one answer per question (probabilities rounded to 4 decimals):
     - score: {"type": "score", "score": the expected level, "legend": {"0": level 0's text, ...},
       "probabilities": {"0": p, ...}, "confidence": c}
 
-Confidence is defined in metrics.py. GET /health describes the model served. An invalid request is
+Confidence is defined in metrics.py. If the model's calibration holds a gate (see gate.py), each
+answer also has "take": true when its option is one the caller can act on and its calibrated
+probability reaches its kind's threshold, else false. The gate compares the top probability, not
+the confidence. GET /health describes the model served, with its gate. An invalid request is
 refused with status 422 and the reason.
 
 Each question is rendered with the model's prompt format, its options in the order the request lists
 them, and answered at the model's calibrated temperatures (see calibrate.py), or at temperature 1
 with --raw. The questions of a request are answered in one forward pass.
 
-A prompt longer than the window (--max_len) is shortened as Strands Decider's server shortens it,
-unless --strict_window is set. The question and its options keep all their tokens (up to 3/4 of the
-window), and the state is cut to fit, from its end. Without truncation, a prompt is tokenized exactly
-as in training.
+A prompt longer than the window (--max_len) is shortened, unless --strict_window is set. With the strands
+prompt format, it is shortened as Strands Decider's server shortens it: the question and its options keep all
+their tokens (up to 3/4 of the window), and the state is cut to fit, from its end. With the other formats, whose
+prompts do not start with the state alone (question_first, read_twice), the prompt is rendered again with the state
+cut from its end, at a token boundary, to the longest that fits, and the question and its options keep all their
+tokens. Without truncation, a prompt is tokenized exactly as in training.
 """
 
 import ipaddress
@@ -63,7 +68,7 @@ from ...data.decision_prompt import (
 )
 from ...extras import logging
 from .metrics import DEFAULT_ORDINAL_SMOOTHING, apply_temperature, choice_confidence, score_confidence
-from .predictor import DecisionPredictor
+from .predictor import AUTO, DecisionPredictor
 
 
 logger = logging.get_logger(__name__)
@@ -162,7 +167,7 @@ class DecisionServer:
 
     Args:
         predictor: The model (see predictor.py), with its calibration unless raw.
-        raw: Whether to answer at temperature 1, ignoring the calibration. Defaults to False.
+        raw: Whether to answer at temperature 1, ignoring the calibration and its gate. Defaults to False.
         strict_window: Whether to refuse prompts longer than the window rather than cut their state.
             Defaults to False.
         model_name: The name replies give as their model. Defaults to the adapter's folder name, else
@@ -182,7 +187,7 @@ class DecisionServer:
         self.raw = raw
         self.strict_window = strict_window
         self.tokenizer = predictor.model.tokenizer
-        self.prompt = predictor.model.prompt  # the prompt format and force_bos, as in training
+        self.prompt = predictor.model.prompt  # the prompt format, force_bos, and option labels, as in training
         self.max_len = max_len or predictor.max_len
         self.ordinal_smoothing = (predictor.calibration or {}).get("ordinal_smoothing", DEFAULT_ORDINAL_SMOOTHING)
         source = predictor.adapter_name_or_path or predictor.model_name_or_path
@@ -191,6 +196,11 @@ class DecisionServer:
 
     def temperature(self, kind: str) -> float:
         return 1.0 if self.raw else self.predictor.temperature(kind)
+
+    @property
+    def gate(self) -> Optional[Dict[str, Any]]:
+        """The model's gate, which applies only to calibrated answers, as it was fitted on them."""
+        return None if self.raw else self.predictor.gate
 
     def health(self) -> Dict[str, Any]:
         return {
@@ -201,17 +211,20 @@ class DecisionServer:
             "max_length": self.max_len,
             "calibrated": self.predictor.calibration is not None and not self.raw,
             "temperature_by_kind": {kind: self.temperature(kind) for kind in ("noul", "choice", "score")},
+            "gate": None if self.gate is None else {
+                key: self.gate.get(key) for key in ("rule", "target", "params", "take_options", "thresholds")
+            },
             "strict_window": self.strict_window,
             "device": self.predictor.device,
         }
 
-    def _render(self, row: Dict[str, Any]) -> Tuple[RenderedPrompt, str]:
+    def _render(self, row: Dict[str, Any]) -> Tuple[RenderedPrompt, Dict[str, Any]]:
+        """A question's prompt, and its row (state, instructions, kind, and options), for shortening it if needed."""
         flat = flatten_decision_row(row)
-        options = [tuple(option) for option in flat["options"] or []]
-        rendered = self.prompt.prompt_format.render(flat["state"], flat["instructions"], flat["kind"], options)
-        return rendered, flat["state"]
+        flat["options"] = [tuple(option) for option in flat["options"] or []]
+        return self.prompt.render(self.tokenizer, flat), flat
 
-    def _encode(self, rendered: List[RenderedPrompt], states: List[str]) -> List[EncodedPrompt]:
+    def _encode(self, rendered: List[RenderedPrompt], rows: List[Dict[str, Any]]) -> List[EncodedPrompt]:
         """The questions' prompts as model inputs, shortened to the window if they do not fit."""
         encoded = [encode_decision_prompt(self.tokenizer, r, force_bos=self.prompt.force_bos) for r in rendered]
         if self.max_len is None or all(len(e.input_ids) <= self.max_len for e in encoded):
@@ -219,7 +232,35 @@ class DecisionServer:
         if self.strict_window:
             longest = max(len(e.input_ids) for e in encoded)
             raise WindowError(f"prompt of {longest} tokens exceeds the context window of {self.max_len} tokens")
-        return self._truncate(rendered, states)
+        if self.prompt.prompt_format.STATE_FIRST:
+            return self._truncate(rendered, [row["state"] for row in rows])
+        return [self._shorten_state(row) for row in rows]
+
+    def _shorten_state(self, row: Dict[str, Any]) -> EncodedPrompt:
+        """
+        The prompt of a row rendered with its state cut from its end, at a token boundary, to the longest state with
+        which the whole prompt fits the window. The question and its options are kept whole.
+        """
+        state = render_content(row["state"])
+        offsets = self.tokenizer(state, add_special_tokens=False, return_offsets_mapping=True)["offset_mapping"]
+
+        def encode(num_tokens: int) -> EncodedPrompt:
+            cut = state[: offsets[num_tokens - 1][1]] if num_tokens > 0 else ""
+            rendered = self.prompt.render(self.tokenizer, {**row, "state": cut})
+            return encode_decision_prompt(self.tokenizer, rendered, force_bos=self.prompt.force_bos)
+
+        best = encode(0)
+        if len(best.input_ids) > self.max_len:
+            raise WindowError("the question and its options do not fit the context window")
+        low, high = 0, len(offsets)  # the longest state that fits has between low and high tokens
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = encode(middle)
+            if len(candidate.input_ids) <= self.max_len:
+                low, best = middle, candidate
+            else:
+                high = middle - 1
+        return best
 
     def _truncate(self, rendered: List[RenderedPrompt], states: List[str]) -> List[EncodedPrompt]:
         """
@@ -265,9 +306,34 @@ class DecisionServer:
         """The reply to a request."""
         names = list(request.questions)
         questions = [request.questions[name] for name in names]
-        rendered, states = zip(*(self._render(question_row(request.state, q)) for q in questions))
-        encoded = self._encode(list(rendered), list(states))
+        rendered, rows = zip(*(self._render(question_row(request.state, q)) for q in questions))
+        encoded = self._encode(list(rendered), list(rows))
 
+        all_log_probs = self._log_probs(encoded)
+        answers = {}
+        for i, (name, question) in enumerate(zip(names, questions)):
+            probs = apply_temperature(all_log_probs[i], self.temperature(question.type))
+            answers[name] = self._to_answer(question, probs)
+            if self.gate is not None:
+                top = max(range(len(probs)), key=probs.__getitem__)
+                option = self._option_names(question)[top]
+                answers[name]["take"] = self.predictor.takes(question.type, option, probs[top])
+        return {
+            "model": self.model_name,
+            "answers": answers,
+            "usage": {"input_tokens": sum(len(e.input_ids) for e in encoded), "output_tokens": len(names)},
+        }
+
+    def _log_probs(self, encoded: List[EncodedPrompt]) -> List[List[float]]:
+        """
+        Each encoded prompt's log-probabilities over its options at temperature 1, in one pass. A request with
+        no more questions than a CUDA graph takes goes through the predictor's graphs if it has them (see
+        graphs.py), and a larger one in one padded batch, which keeps the GPU busy without them and is faster than
+        splitting it into graph-sized batches.
+        """
+        graphs = getattr(self.predictor.model, "graphs", None)
+        if graphs is not None and len(encoded) <= graphs.max_batch:
+            return graphs([e.input_ids for e in encoded], [e.opt_idx for e in encoded], [e.answer_idx for e in encoded])
         seq_len = max(len(e.input_ids) for e in encoded)
         num_options = max(len(e.opt_idx) for e in encoded)
         pad = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
@@ -285,17 +351,16 @@ class DecisionServer:
             opt_idx=opt_idx.to(device),
             answer_idx=torch.tensor([e.answer_idx for e in encoded]).to(device),
         )
+        return [out.log_probs[i, : len(e.opt_idx)].float().tolist() for i, e in enumerate(encoded)]
 
-        answers = {}
-        for i, (name, question) in enumerate(zip(names, questions)):
-            log_probs = out.log_probs[i, : len(encoded[i].opt_idx)].float().tolist()
-            probs = apply_temperature(log_probs, self.temperature(question.type))
-            answers[name] = self._to_answer(question, probs)
-        return {
-            "model": self.model_name,
-            "answers": answers,
-            "usage": {"input_tokens": int(attention_mask.sum()), "output_tokens": len(names)},
-        }
+    @staticmethod
+    def _option_names(question) -> List[str]:
+        """The names of a question's options, in the order of its probabilities."""
+        if question.type == "noul":
+            return list(NOUL_OPTION_NAMES)
+        if question.type == "choice":
+            return list(question.criteria)
+        return [str(level) for level in range(len(question.criteria))]
 
     def _to_answer(self, question, probs: List[float]) -> Dict[str, Any]:
         if question.type == "noul":
@@ -363,11 +428,13 @@ def serve(
     raw: bool = False,
     calibration: Optional[str] = "auto",
     strict_window: bool = False,
-    max_len: int = 4096,
-    prompt_format: str = "strands",
-    force_bos: bool = False,
+    max_len: Union[int, str] = AUTO,
+    prompt_format: str = AUTO,
+    force_bos: Union[bool, str] = AUTO,
+    option_labels: str = AUTO,
     model_name: Optional[str] = None,
     device: Optional[str] = None,
+    cuda_graphs: bool = False,
 ) -> None:
     """
     Serves a trained decision model on 127.0.0.1.
@@ -386,13 +453,20 @@ def serve(
         strict_window: Whether to refuse (status 422) a prompt longer than max_len, instead of cutting
             its state to fit. Benchmarks that forbid shortening their prompts need it. Defaults to
             False.
-        max_len: The context window, in tokens: the longest prompt answered. Defaults to 4096.
-        prompt_format: The prompt format of training (decision_prompt_format). Defaults to "strands".
+        max_len: The context window, in tokens, which is the longest prompt answered. Defaults to
+            "auto", the model's decision_prompt.json (see predictor.py), else 4096.
+        prompt_format: The prompt format of training (decision_prompt_format). Defaults to "auto",
+            the model's, else "strands".
         force_bos: Whether prompts start with the BOS token (decision_force_bos in training).
-            Defaults to False.
+            Defaults to "auto", the model's, else False.
+        option_labels: How the options are labeled, "numbers" or "letters" (decision_option_labels in training).
+            Defaults to "auto", the model's, else the labels its head reads.
         model_name: The name replies give as their model. Defaults to the adapter's folder name, else
             the model's.
         device: Where to run the model. Defaults to the first GPU, else MPS (Apple silicon), else the CPU.
+        cuda_graphs: Whether to answer through CUDA graphs (see graphs.py), which makes each request several
+            times faster on a GPU, with the same answers. It needs a stock backbone, which it loads with flash
+            attention, and records the graph of every prompt length up to max_len at startup. Defaults to False.
     """
     if not is_loopback(host):
         raise ValueError(
@@ -404,8 +478,14 @@ def serve(
 
     predictor = DecisionPredictor(
         model_name_or_path, adapter_name_or_path, device=device, prompt_format=prompt_format, force_bos=force_bos,
-        max_len=max_len, calibration=calibration,
+        max_len=max_len, option_labels=option_labels, calibration=calibration, cuda_graphs=cuda_graphs,
     )
+    graphs = predictor.model.graphs
+    if graphs is not None:
+        started = time.perf_counter()
+        longest = min(predictor.max_len or graphs.max_length, graphs.max_length)
+        graphs.warm_up(range(graphs.length_multiple, longest + graphs.length_multiple, graphs.length_multiple))
+        logger.info_rank0(f"Recorded {len(graphs.graphs)} CUDA graphs in {time.perf_counter() - started:.0f} s.")
     server = DecisionServer(predictor, raw=raw, strict_window=strict_window, model_name=model_name)
     logger.info_rank0(f"Serving {server.model_name} on http://{host}:{port} (POST /v1/systemone, GET /health).")
     uvicorn.run(create_app(server), host=host, port=port, workers=1)

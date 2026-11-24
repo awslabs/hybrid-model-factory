@@ -169,7 +169,23 @@ class DataArguments:
     )
     decision_prompt_format: str = field(
         default="strands",
-        metadata={"help": "Prompt format used to render decision rows (stage `decision`)."},
+        metadata={
+            "help": (
+                "Prompt format used to render decision rows (stage `decision`): `strands`, `question_first` (the "
+                "question and options before the state), or `read_twice` (the state and question twice, read in "
+                "the second copy)."
+            )
+        },
+    )
+    decision_option_labels: str = field(
+        default="numbers",
+        metadata={
+            "help": (
+                "How each option's line of a decision prompt is labeled: `numbers` (1, 2, ...) or `letters` (A, "
+                "B, ..., then two-letter codes that are one token each). The label heads of decision models need "
+                "`letters`."
+            )
+        },
     )
     decision_num_augmentations: int = field(
         default=1,
@@ -323,6 +339,9 @@ class DataArguments:
 
         if not 0.0 <= self.decision_ordinal_smoothing < 1.0:
             raise ValueError("`decision_ordinal_smoothing` must be in [0, 1).")
+
+        if self.decision_option_labels not in ("numbers", "letters"):
+            raise ValueError("`decision_option_labels` must be `numbers` or `letters`.")
 
 
     def to_dict(self) -> dict[str, Any]:

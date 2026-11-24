@@ -48,7 +48,7 @@ Hybrid Model Factory extends [LlamaFactory](https://github.com/hiyouga/LlamaFact
 |----------|---------|
 | Hybrid layer types | Gated KalmaNet (GKA), Gated DeltaNet (GDN), Mamba2, B'MOJO-F |
 | Hybrid models | Qwen3Next, Qwen3.5, Primed Qwen3-GKA, Primed Qwen3-BMOJOF, Primed Ministral3-GDN, ... |
-| Priming pipeline | Initialize (Stage 0) → Distill (Stage 1) → Fine-tune (Stage 2), with Qwen3, Qwen3-MoE, Qwen2.5, Llama3, Ministral3 as base Transformers |
+| Priming pipeline | Initialize (Stage 0) → Distill (Stage 1) → Fine-tune (Stage 2), with Qwen3, Qwen3-MoE, Qwen2.5, Llama3, Ministral3, Gemma 4 as base Transformers |
 | Decision models | Conversion of a Transformer or Hybrid model into a decision model, which scores a list of options, then LoRA training with optional anchor and teacher targets, and calibrated evaluation |
 | Sequence Parallelism | Universal SP implementation for any SSM layer (GKA, GDN, Mamba2, ...) to train on 128K+ contexts across multiple GPUs. |
 | Inference | Optimized vLLM plugin for inference with continuous batching and tensor parallelism for Hybrid and Primed models (Qwen2.5/3/3-MoE,3-Next,3.5) |
@@ -151,6 +151,8 @@ cd hybrid-model-factory/training
 pip install -e .
 hmf train examples/priming/stage2/hqwen3_8b_gka_sft_it.yaml
 ```
+
+HMF requires transformers 5.24.0 and PEFT 0.22.0, which both the Docker image and `pip install -e .` install, so an environment set up for an earlier version of HMF needs the image rebuilt and the install repeated.
 
 See [docs/Training.md](docs/Training.md) for detailed training documentation.
 
@@ -275,9 +277,11 @@ Hybrid models also support training-free context extension up to 2-4× their nat
 
 A decision model reads a situation, a question about it, and a list of possible answers, and returns the probability of each answer. It answers in a single forward pass, without generating text, and its probabilities are calibrated, so its confidence shows when to trust an answer and when to hand the question to a larger model or a person. This suits the many small decisions inside agent workflows, such as routing a request, checking whether a response answers the question, or rating text on a scale.
 
-HMF converts a language model, Transformer or Hybrid, into a decision model by replacing its language model head with a small head that scores the options. It then trains the model with LoRA, optionally learning from the base model's and a teacher model's answers, and calibrates and evaluates it. An existing decision model, including one published by [Strands Decider](https://github.com/strands-labs/strands-decider), can also be converted and fine-tuned on your own questions.
+HMF converts a language model, Transformer or Hybrid, into a decision model by replacing its language model head with a small head that scores the options. It then trains the model with LoRA, optionally learning from the base model's and a teacher model's answers, and calibrates and evaluates it. Any text language model that transformers loads with `AutoModelForCausalLM` can be converted, and Qwen3, Qwen3.5, Gemma 4, and Llama-architecture models have been tested. An existing decision model, including one published by [Strands Decider](https://github.com/strands-labs/strands-decider), can also be converted and fine-tuned on your own questions.
 
 [training/examples/decision/README.md](training/examples/decision/README.md) walks through both, with example configs for Qwen3.5-2B-Base and GKA-primed-HQwen3-8B-Instruct, and through training Qwen3 and Qwen3.5 decision models on a Mac with Apple silicon, with example configs for Qwen3-0.6B-Base.
+
+HMF supports training decision models on a Mac with Apple silicon, using MLX, on the [`hmf-mac`](https://github.com/awslabs/hybrid-model-factory/tree/hmf-mac) branch. It includes two scripts for a Mac, one that fine-tunes an off-the-shelf decision model in under an hour (tested on an M3 Pro with 36 GB), and one that trains a new decision model from Qwen3-0.6B-Base through the whole decision pipeline, from building the data to evaluating the model.
 
 ---
 
@@ -290,6 +294,7 @@ HMF converts a language model, Transformer or Hybrid, into a decision model by r
 | Qwen | Qwen3, Qwen3-MoE, Qwen2.5, Qwen3Next, Qwen3.5 |
 | Llama | Llama3, Llama3.1 |
 | Mistral | Ministral3 |
+| Gemma | Gemma 4 (E2B, E4B, text only) |
 
 ### Hybrid Layer Types
 

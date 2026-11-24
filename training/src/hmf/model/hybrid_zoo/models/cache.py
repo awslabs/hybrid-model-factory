@@ -8,20 +8,55 @@ manages layer-specific states. The HybridCache class provides a unified interfac
 that coordinates all cache types within a single model.
 """
 
-import gc
+import weakref
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 from transformers.cache_utils import Cache
 
 
-class Mamba2Cache:
+# The layer types whose tokens HybridCache counts, in the order in which get_seq_length searches them for a layer.
+# A B'MOJO layer and its SSM keep separate counts under the same layer index, and the two always agree.
+_COUNTED_PARTS = ("attention", "bmojo_f", "mamba2", "gated_deltanet", "gated_kalmanet")
+
+
+class _HybridCachePart:
+    """
+    Base class of the per-layer-type caches (Mamba2Cache, BMojoCache, GatedDeltaNetCache, and GatedKalmaNetCache),
+    which store their states in the HybridCache that creates them and access it through their parent property. They
+    keep only a weak reference to it, because a strong one would form a reference cycle with the HybridCache's
+    references to them. Python frees such a cycle only when its garbage collector runs, so a finished cache's GPU
+    memory would stay allocated until then.
+    """
+
+    def __init__(self, parent_cache):
+        self._parent = weakref.ref(parent_cache)
+
+    @property
+    def parent(self) -> "HybridCache":
+        parent = self._parent()
+        if parent is None:
+            raise ReferenceError(f"the HybridCache that created this {type(self).__name__} has been freed")
+        return parent
+
+    def seen_tokens(self, layer_idx: int) -> int:
+        """Returns the number of tokens that this layer type has processed at layer_idx, or 0 before any update."""
+        return self.parent._seen_tokens[self.part].get(layer_idx, 0)
+
+    def record_tokens(self, layer_idx: int, count: int):
+        """Adds count to the number of tokens that this layer type has processed at layer_idx."""
+        self.parent._record_tokens(self.part, layer_idx, count)
+
+
+class Mamba2Cache(_HybridCachePart):
     """Cache for Mamba2 layer.
-    
+
     Attributes:
         cache_aprods: If True, store cumulative A products (log_aprods) for PICASO composition.
         log_aprods: Dict mapping layer_idx to log(A_prod) tensors for state composition.
     """
+
+    part = "mamba2"
 
     def __init__(
         self,
@@ -29,7 +64,7 @@ class Mamba2Cache:
         max_sequence_length: Optional[int] = None,
         max_batch_size: Optional[int] = None,
     ):
-        self.parent = parent_cache
+        super().__init__(parent_cache)
 
         # Enable caching of cumulative A products for PICASO state composition
         self.cache_aprods = True
@@ -53,21 +88,12 @@ class Mamba2Cache:
     def key_value_memory_dict(self, value: Dict[int, Any]):
         self.parent._mamba_memory_dict = value
 
-    @property
-    def seqlen_offset(self) -> int:
-        """
-        Expose parent's global seqlen_offset for Mamba2 to read
-        """
-        return self.parent.seqlen_offset
 
 
-class BMojoCache:
+class BMojoCache(_HybridCachePart):
     """Cache for B'MOJO-F layer."""
 
-    def __init__(self, parent_cache):
-        self.parent = parent_cache
-        self.max_sequence_length = parent_cache.config.max_position_embeddings
-        self.max_batch_size = getattr(parent_cache.config, "batch_size", 1)
+    part = "bmojo_f"
 
     @property
     def key_value_memory_dict(self) -> Dict[int, Any]:
@@ -77,20 +103,11 @@ class BMojoCache:
     def key_value_memory_dict(self, value: Dict[int, Any]):
         self.parent._bmojo_f_memory_dict = value
 
-    @property
-    def seqlen_offset(self) -> int:
-        """Expose parent's global seqlen_offset for BMojo attention"""
-        return self.parent.seqlen_offset
 
-    @property
-    def batch_size_offset(self) -> int:
-        """Expose batch_size_offset for batched inference"""
-        # If parent doesn't have it, default to 0
-        return getattr(self.parent, "batch_size_offset", 0)
-
-
-class GatedDeltaNetCache:
+class GatedDeltaNetCache(_HybridCachePart):
     """Cache for Gated DeltaNet layer."""
+
+    part = "gated_deltanet"
 
     def __init__(
         self,
@@ -98,7 +115,7 @@ class GatedDeltaNetCache:
         max_sequence_length: Optional[int] = None,
         max_batch_size: Optional[int] = None,
     ):
-        self.parent = parent_cache
+        super().__init__(parent_cache)
 
         if max_sequence_length is None:
             self.max_sequence_length = parent_cache.config.max_position_embeddings
@@ -135,8 +152,9 @@ class GatedDeltaNetCache:
             recurrent_state: The recurrent hidden state
             conv_state: Tuple of (conv_state_q, conv_state_k, conv_state_v) if using short conv, else None
             layer_idx: Index of the layer
-            offset: Sequence length offset (not used here, offset updated globally in model forward). Kept for BC.
+            offset: The number of new tokens, which the cache adds to the layer's count (see get_seq_length)
         """
+        self.record_tokens(layer_idx, offset)
         if conv_state is not None:
             self.key_value_memory_dict[layer_idx] = {
                 "recurrent_state": recurrent_state,
@@ -146,8 +164,10 @@ class GatedDeltaNetCache:
             self.key_value_memory_dict[layer_idx] = {"recurrent_state": recurrent_state}
 
 
-class GatedKalmaNetCache:
+class GatedKalmaNetCache(_HybridCachePart):
     """Cache for Gated KalmaNet layer."""
+
+    part = "gated_kalmanet"
 
     def __init__(
         self,
@@ -155,7 +175,7 @@ class GatedKalmaNetCache:
         max_sequence_length: Optional[int] = None,
         max_batch_size: Optional[int] = None,
     ):
-        self.parent = parent_cache
+        super().__init__(parent_cache)
 
         if max_sequence_length is None:
             self.max_sequence_length = parent_cache.config.max_position_embeddings
@@ -188,8 +208,9 @@ class GatedKalmaNetCache:
             recurrent_state: Tuple of (h_kk, h_kv) - the recurrent hidden states
             conv_state: Tuple of (conv_state_q, conv_state_k, conv_state_v) - convolution states
             layer_idx: Index of the layer
-            offset: Sequence length offset (not used here, offset updated globally in model forward). Kept for BC.
+            offset: The number of new tokens, which the cache adds to the layer's count (see get_seq_length)
         """
+        self.record_tokens(layer_idx, offset)
         self.key_value_memory_dict[layer_idx] = {
             "recurrent_state": recurrent_state,
             "conv_state": conv_state,
@@ -202,13 +223,15 @@ class HybridCache(Cache):
     
     Manages separate memory dictionaries for each layer type (Attention, Mamba2,
     B'MOJO-F, GDN, GKA) and provides specialized interfaces for each.
-    
-    The cache maintains a global sequence offset that is shared across all layers
-    and updated after each forward pass via update_offset().
-    
+
+    Each layer adds its new tokens to its own count when it updates its state, and get_seq_length returns that
+    count, which is also the position of the next token. The count therefore needs no updates from outside the
+    cache, and it is also correct when the inner model runs without the ForCausalLM around it. Cache composition
+    sets the counts of the caches it builds with set_seq_length, since it can keep fewer tokens in the attention
+    cache than it has read.
+
     Attributes:
         config: Model configuration
-        seqlen_offset: Global sequence position tracker
         bmojo_f: BMojoCache interface for B'MOJO-F layers
         mamba2: Mamba2Cache interface for Mamba2 layers
         gated_deltanet: GatedDeltaNetCache interface for GDN layers
@@ -221,8 +244,8 @@ class HybridCache(Cache):
         
         self.config = config
 
-        # Global sequence length offset. Shared across all layers
-        self.seqlen_offset = 0
+        # The number of tokens each layer has processed, for each layer type
+        self._seen_tokens: Dict[str, Dict[int, int]] = {part: {} for part in _COUNTED_PARTS}
 
         # Separate dictionaries for each layer type
         self._attention_memory_dict = {}
@@ -246,14 +269,9 @@ class HybridCache(Cache):
     def key_value_memory_dict(self, value: Dict[int, Any]):
         self._attention_memory_dict = value
 
-    def update_offset(self, seq_len: int):
-        """
-        Update global sequence length offset after processing tokens.
-        
-        Args:
-            seq_len: Number of new tokens processed
-        """
-        self.seqlen_offset += seq_len
+    def _record_tokens(self, part: str, layer_idx: int, count: int):
+        counts = self._seen_tokens[part]
+        counts[layer_idx] = counts.get(layer_idx, 0) + count
 
     def update(
         self,
@@ -263,6 +281,7 @@ class HybridCache(Cache):
         cache_kwargs: Optional[Dict] = None,  # Kept for compatibility purposes
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Standard Cache interface for attention layers"""
+        self._record_tokens("attention", layer_idx, key_states.shape[-2])
         if layer_idx not in self._attention_memory_dict:
             self._attention_memory_dict[layer_idx] = {
                 "keys": key_states,
@@ -282,33 +301,38 @@ class HybridCache(Cache):
         return key_states, value_states
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
-        """Returns the sequence length of the cached states
-        
-        For attention layers, returns the actual cached sequence length from the key tensor.
-        For all other layer types (GDN, GKA, Mamba2, BMOJO), returns the global offset.
-        
-        Args:
-            layer_idx: Layer index to check (only used for attention layers)
-            
-        Returns:
-            Sequence length as an integer
         """
-        # Check if this is a standard attention layer with cached keys
-        if layer_idx in self._attention_memory_dict:
-            cache_entry = self._attention_memory_dict[layer_idx]
-            if isinstance(cache_entry, dict) and "keys" in cache_entry:
-                keys = cache_entry["keys"]
-                if isinstance(keys, torch.Tensor):
-                    return keys.size(-2)
-
-        # For all non-attention layers, return the global offset
-        # This includes: GDN, GKA, Mamba2, and B'MOJO
-        return self.seqlen_offset
-
-    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> Tuple[int, int]:
+        Returns the number of tokens that the layer at layer_idx has processed, which is also the position of the
+        next token, and 0 before its first update. The count includes every token that the layer has read, whatever
+        its type, so it can be larger than the attention cache when cache composition keeps fewer tokens there (see
+        cached_attention_length).
         """
-        Returns the key length and offset that the attention masks of transformers' create_causal_mask
-        cover, which are the tokens already in the attention cache plus the new ones, starting at 0.
+        layer_idx = 0 if layer_idx is None else layer_idx
+        for part in _COUNTED_PARTS:
+            if layer_idx in self._seen_tokens[part]:
+                return self._seen_tokens[part][layer_idx]
+        return 0
+
+    def set_seq_length(self, length: int):
+        """
+        Sets the count of every layer that holds a state to length. Cache composition uses it for the caches it
+        builds, which count every token that composition read, even where the attention cache keeps fewer of them
+        (see get_seq_length).
+        """
+        stores = {
+            "attention": self._attention_memory_dict,
+            "bmojo_f": self._bmojo_f_memory_dict,
+            "mamba2": self._mamba_memory_dict,
+            "gated_deltanet": self._gated_deltanet_memory_dict,
+            "gated_kalmanet": self._gated_kalmanet_memory_dict,
+        }
+        for part, store in stores.items():
+            self._seen_tokens[part] = {layer_idx: length for layer_idx in set(store) | set(self._seen_tokens[part])}
+
+    def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> Tuple[int, int]:
+        """
+        Returns the key length and offset that the attention masks of transformers' create_causal_mask cover,
+        which are the tokens already in the attention cache plus the query_length new ones, starting at 0.
 
         The base Cache reads these sizes from self.layers, which HybridCache leaves empty, so without this
         override the masks would cover only the new tokens. The padding of the cached tokens would then go
@@ -317,9 +341,16 @@ class HybridCache(Cache):
         entry gives the cached length. layer_idx is not used, because the layer that create_causal_mask asks
         about may be a GDN or other non-attention layer.
         """
-        return self._cached_attention_length() + cache_position.shape[0], 0
+        return self.cached_attention_length() + query_length, 0
 
-    def _cached_attention_length(self) -> int:
+    def get_query_offset(self, layer_idx: int = 0) -> int:
+        """
+        Returns the position of the first new query among the keys that create_causal_mask covers, which is the
+        number of tokens already in the attention cache (see get_mask_sizes, whose keys start at 0).
+        """
+        return self.cached_attention_length()
+
+    def cached_attention_length(self) -> int:
         """Returns the number of tokens in the attention key and value cache, 0 before the first update."""
         for entry in self._attention_memory_dict.values():
             keys = entry.get("keys") if isinstance(entry, dict) else None
@@ -330,26 +361,6 @@ class HybridCache(Cache):
     def get_max_length(self) -> int:
         """Get maximum allowed sequence length"""
         return self.config.max_position_embeddings
-
-    def check_seqlen_match(self, layer_idx: Optional[int] = None) -> bool:
-        """Check whether KV cache sequence length matches the global sequence offset.
-        
-        Args:
-            layer_idx: Specific attention layer to check. If None, uses first available.
-            
-        Returns:
-            True if KV cache length matches seqlen_offset, False otherwise.
-        """
-        if layer_idx is None:
-            if not self._attention_memory_dict:
-                kv_seqlen = 0
-            else:
-                first_layer = min(self._attention_memory_dict.keys())
-                kv_seqlen = self.get_seq_length(first_layer)
-        else:
-            kv_seqlen = self.get_seq_length(layer_idx)
-        
-        return kv_seqlen == self.seqlen_offset
 
     def clear(self):
         """Clear all cached tensors and reset state."""
@@ -383,17 +394,7 @@ class HybridCache(Cache):
                 self.mamba2.log_aprods[key].detach_()
         self.mamba2.log_aprods.clear()
 
-        # Reset offsets
-        self.seqlen_offset = 0
-
-    def __del__(self):
-        try:
-            self.clear()
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        self._seen_tokens = {part: {} for part in _COUNTED_PARTS}
 
     def copy(self) -> "HybridCache":
         """Create a deep copy of this cache."""
@@ -430,7 +431,6 @@ class HybridCache(Cache):
         }
         new_cache.mamba2.cache_aprods = self.mamba2.cache_aprods
 
-        # Copy offset
-        new_cache.seqlen_offset = self.seqlen_offset
+        new_cache._seen_tokens = {part: dict(counts) for part, counts in self._seen_tokens.items()}
 
         return new_cache

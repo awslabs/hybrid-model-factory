@@ -19,6 +19,7 @@ from safetensors import safe_open
 from transformers import AutoModel, TrainingArguments, get_scheduler
 
 from hmf.hparams.parser import _parse_train_args
+from hmf.eval.decision.predictor import CALIBRATION_FILE, PROMPT_FILE, save_prompt_settings
 from hmf.model import load_model, load_tokenizer
 from hmf.model.hybrid_zoo.models.decision.modeling_decision import DecisionModel
 from hmf.train.decision.trainer import MODEL_INPUTS, DecisionTrainer
@@ -280,6 +281,10 @@ def test_export_merges_into_a_decision_checkpoint(
         source, decision_model_dir, lora_targets, device, make_batch, tmp_path
     )
     export_dir = str(tmp_path / "export")
+    # The adapter gets a calibration and prompt settings, which the merged model must take along
+    save_prompt_settings(adapter_dir, "read_twice", False, 8192)
+    with open(os.path.join(adapter_dir, CALIBRATION_FILE), "w") as f:
+        json.dump({"temperature": 1.5, "temperature_by_kind": {}}, f)
 
     export_model(
         {
@@ -300,6 +305,12 @@ def test_export_merges_into_a_decision_checkpoint(
     assert all(key.startswith(("model.", "decision_head.")) for key in keys), sorted(keys)[:10]
     assert not any("lora_" in key or "modules_to_save" in key for key in keys)
     assert {dtype for key, dtype in keys.items() if key.startswith("decision_head.")} == {"F32"}
+    with open(os.path.join(export_dir, PROMPT_FILE)) as f:
+        assert json.load(f) == {
+            "prompt_format": "read_twice", "force_bos": False, "max_len": 8192, "option_labels": "numbers"
+        }
+    with open(os.path.join(export_dir, CALIBRATION_FILE)) as f:
+        assert json.load(f)["temperature"] == 1.5
 
     exported = AutoModel.from_pretrained(export_dir, dtype=dtype).to(device)
     assert isinstance(exported, DecisionModel)

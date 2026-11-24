@@ -35,6 +35,79 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def fused_layer_outputs(model: nn.Module, inputs: Dict[str, Any]):
+    """
+    Runs the two streams of a fused model and yields each decoder layer's six outputs: the SSM and Attention
+    decoder layer outputs, the mixer outputs, and the MLP outputs. A model whose backbone has its own
+    stage1_layer_outputs, such as hybrid Gemma 4, whose embeddings, per-layer inputs, masks, RoPE, and shared keys
+    and values differ from what this loop builds, runs through it instead.
+    """
+    backbone = model.model
+    if hasattr(backbone, "stage1_layer_outputs"):
+        yield from backbone.stage1_layer_outputs(
+            inputs["input_ids"], inputs["attention_mask"], inputs.get("position_ids")
+        )
+        return
+
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+
+    inputs_embeds = backbone.embed_tokens(input_ids)
+
+    # Use position_ids from inputs if available (handles SP correctly), otherwise compute local position IDs
+    if "position_ids" in inputs:
+        position_ids = inputs["position_ids"]
+    else:
+        position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
+
+    # Create causal mask mapping for different attention types
+    mask_kwargs = {
+        "config": backbone.config,
+        "inputs_embeds": inputs_embeds,
+        "attention_mask": attention_mask,
+        "cache": None,
+        "position_ids": position_ids,
+    }
+    causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
+
+    hidden_states = inputs_embeds
+
+    # Create position embeddings to be shared across the decoder layers
+    position_embeddings = backbone.rotary_emb(hidden_states, position_ids)
+
+    attn_hidden_states = hidden_states
+
+    # Use attention-style masking
+    causal_mask = causal_mask_mapping["full_attention"]
+    for decoder_layer in backbone.layers:
+        if backbone.gradient_checkpointing and backbone.training:
+            layer_outputs = backbone._gradient_checkpointing_func(
+                decoder_layer.__call__,
+                hidden_states,
+                attn_hidden_states,
+                causal_mask,
+                position_ids,
+                None,  # cache (we do not use fused layers for inference)
+                False,  # output_attentions
+                False,  # use_cache
+                position_embeddings,
+            )
+        else:
+            layer_outputs = decoder_layer(
+                hidden_states=hidden_states,
+                attention_hidden_states=attn_hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                cache=None,
+                output_attentions=False,
+                use_cache=False,
+                position_embeddings=position_embeddings,
+            )
+
+        hidden_states, attn_hidden_states = layer_outputs[0], layer_outputs[1]
+        yield layer_outputs
+
+
 class CustomTrainer(SaveShardMixin, Seq2SeqTrainer):
     r"""
     This trainer is used to train Hybrid models with fused Hybrid + Attention modules--typically
@@ -181,73 +254,8 @@ class CustomTrainer(SaveShardMixin, Seq2SeqTrainer):
         Returns:
             mse_loss: Layerwise MSE loss.
         """
-        input_ids = inputs["input_ids"]
-        attention_mask = inputs["attention_mask"]
-
-        inputs_embeds = model.model.embed_tokens(input_ids)
-
-        # Use position_ids from inputs if available (handles SP correctly), otherwise compute local position IDs
-        if "position_ids" in inputs:
-            position_ids = inputs["position_ids"]
-            cache_position = position_ids[0]
-        else:
-            past_seen_tokens = 0
-            cache_position = torch.arange(
-                past_seen_tokens,
-                past_seen_tokens + inputs_embeds.shape[1],
-                device=inputs_embeds.device,
-            )
-            position_ids = cache_position.unsqueeze(0)
-
-        # Create causal mask mapping for different attention types
-        mask_kwargs = {
-            "config": model.model.config,
-            "inputs_embeds": inputs_embeds,
-            "attention_mask": attention_mask,
-            "cache_position": cache_position,
-            "past_key_values": None,
-            "position_ids": position_ids,
-        }
-        causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
-
-        hidden_states = inputs_embeds
-
-        # Create position embeddings to be shared across the decoder layers
-        position_embeddings = model.model.rotary_emb(hidden_states, position_ids)
-
         mse_loss = 0
-
-        attn_hidden_states = hidden_states
-
-        # Use attention-style masking
-        causal_mask = causal_mask_mapping["full_attention"]
-        for decoder_layer in model.model.layers:
-            if model.model.gradient_checkpointing and model.model.training:
-                layer_outputs = model.model._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    attn_hidden_states,
-                    causal_mask,
-                    position_ids,
-                    None,  # past_key_values (we do not use fused layers for inference)
-                    False,  # output_attentions
-                    False,  # use_cache
-                    cache_position,
-                    position_embeddings,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states=hidden_states,
-                    attention_hidden_states=attn_hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_values=None,
-                    output_attentions=False,
-                    use_cache=False,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                )
-
+        for layer_outputs in fused_layer_outputs(model, inputs):
             (
                 hidden_states,  # SSM decoder layer outputs
                 attn_hidden_states,  # Attention decoder layer outputs

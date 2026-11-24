@@ -77,15 +77,24 @@ def get_unsloth_gradient_checkpointing_func() -> Callable:
     return UnslothGradientCheckpointing.apply
 
 
+def checkpointed_module(func: Callable) -> "torch.nn.Module":
+    """
+    Returns the layer whose forward is passed to a gradient checkpointing function. Transformers 5.24 passes it as
+    partial(forward, layer, **kwargs), with the layer as the first argument, and earlier versions pass
+    partial(layer.__call__, **kwargs) or the layer's bound forward method.
+    """
+    if isinstance(func, partial):
+        layer = getattr(func.func, "__self__", None)
+        return layer if layer is not None else func.args[0]
+    return func.__self__
+
+
 def get_custom_gradient_checkpointing_func(gradient_checkpointing_func: Callable) -> Callable:
     r"""Only applies gradient checkpointing to trainable layers."""
 
     @wraps(gradient_checkpointing_func, assigned=WRAPPER_ASSIGNMENTS + ("__self__",))
     def custom_gradient_checkpointing_func(func: Callable, *args: Union["torch.Tensor", Any], **kwargs):
-        if isinstance(func, partial):
-            module: torch.nn.Module = func.func.__self__
-        else:
-            module: torch.nn.Module = func.__self__
+        module: torch.nn.Module = checkpointed_module(func)
 
         has_grad = False
         if any(param.requires_grad for param in module.parameters()):
@@ -107,11 +116,17 @@ def _gradient_checkpointing_enable(
     self: "PreTrainedModel",
     gradient_checkpointing_kwargs: Optional[dict[str, Any]] = None,
     use_unsloth_gc: bool = False,
+    every_n_layers: int = 1,
+    offload: bool = False,
 ) -> None:
     r"""Activates gradient checkpointing for the current model.
 
-    Modification of the original method to enable gradient checkpointing for block-wise optimizer.
+    Modification of the original method to enable gradient checkpointing for block-wise optimizer. Transformers 5.24's
+    activation_checkpointing_enable also passes every_n_layers, which is handed on to transformers, and offload,
+    which HMF's checkpointing functions do not support.
     """
+    if offload:
+        raise NotImplementedError("HMF's gradient checkpointing does not offload activations to the host.")
     from torch.utils.checkpoint import checkpoint
 
     if not self.supports_gradient_checkpointing:
@@ -131,13 +146,24 @@ def _gradient_checkpointing_enable(
         self.enable_input_require_grads()
         logger.warning_rank0_once("You are using the old GC format, some features (e.g. BAdam) will be invalid.")
     else:  # have already enabled input require gradients
-        self._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=gradient_checkpointing_func)
+        layers = {"every_n_layers": every_n_layers} if every_n_layers != 1 else {}
+        self._set_gradient_checkpointing(
+            enable=True, gradient_checkpointing_func=gradient_checkpointing_func, **layers
+        )
 
 
 def _fp32_forward_post_hook(
     module: "torch.nn.Module", args: tuple["torch.Tensor"], output: "torch.Tensor"
 ) -> "torch.Tensor":
     return output.to(torch.float32)
+
+
+def shares_keys_and_values(model: "PreTrainedModel") -> bool:
+    r"""Returns whether some of the model's layers reuse the keys and values of an earlier layer, as Gemma 4's do."""
+    config = getattr(model, "config", None)
+    if hasattr(config, "get_text_config"):
+        config = config.get_text_config()
+    return (getattr(config, "num_kv_shared_layers", None) or 0) > 0
 
 
 def prepare_model_for_training(model: "PreTrainedModel", model_args: "ModelArguments") -> None:
@@ -160,6 +186,22 @@ def prepare_model_for_training(model: "PreTrainedModel", model_args: "ModelArgum
     ):
         model_args.use_reentrant_gc = False
         logger.warning_rank0("You are using fsdp2, `use_reentrant_gc` has been set to False.")
+
+    # The layers that share keys and values read them from a dict that an earlier layer fills, outside the inputs
+    # and outputs of the checkpointed layers. Reentrant checkpointing (and Unsloth's) runs each layer's first forward
+    # without a graph, so those keys and values would carry no gradient back to the earlier layers.
+    if not model_args.disable_gradient_checkpointing and shares_keys_and_values(model):
+        if model_args.use_unsloth_gc:
+            raise ValueError(
+                "Unsloth's gradient checkpointing drops the gradients through the keys and values that this model's "
+                "layers share. Set `use_unsloth_gc: false`."
+            )
+        if model_args.use_reentrant_gc:
+            model_args.use_reentrant_gc = False
+            logger.warning_rank0(
+                "This model's layers share keys and values, which need non-reentrant gradient checkpointing, so "
+                "`use_reentrant_gc` has been set to False."
+            )
 
     if not model_args.disable_gradient_checkpointing:
         if not getattr(model, "supports_gradient_checkpointing", False):

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from transformers.configuration_utils import PreTrainedConfig, layer_type_validation
+from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_rope_utils import RopeParameters
 
 
@@ -89,7 +89,7 @@ class Qwen3_5HMFTextConfig(PreTrainedConfig):
     """
 
     model_type = "qwen3_5_hmf_text"
-    keys_to_ignore_at_inference = ["past_key_values"]
+    keys_to_ignore_at_inference = ["cache"]
 
     base_model_tp_plan = {
         "layers.*.self_attn.q_proj": "colwise",
@@ -170,7 +170,7 @@ class Qwen3_5HMFTextConfig(PreTrainedConfig):
                 "linear_attention" if bool((i + 1) % interval_pattern) else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
-        layer_type_validation(self.layer_types, self.num_hidden_layers)
+        # Transformers checks layer_types at the end of PreTrainedConfig.__init__, so there's no check here
 
         # linear attention part
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
@@ -244,7 +244,7 @@ class Qwen3_5HMFConfig(PreTrainedConfig):
 
     model_type = "qwen3_5_hmf"
     sub_configs = {"vision_config": Qwen3_5HMFVisionConfig, "text_config": Qwen3_5HMFTextConfig}
-    keys_to_ignore_at_inference = ["past_key_values"]
+    keys_to_ignore_at_inference = ["cache"]
 
     def __init__(
         self,

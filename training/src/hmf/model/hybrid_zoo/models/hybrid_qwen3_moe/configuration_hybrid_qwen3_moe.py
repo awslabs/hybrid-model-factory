@@ -17,6 +17,8 @@ from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_rope_utils import RopeParameters
 from transformers.utils import logging
 
+from ..utils import hybrid_layer_types
+
 
 logger = logging.get_logger(__name__)
 
@@ -106,7 +108,7 @@ class HybridQwen3MoeConfig(PreTrainedConfig):
     """
 
     model_type = "hybrid_qwen3_moe"
-    keys_to_ignore_at_inference = ["past_key_values"]
+    keys_to_ignore_at_inference = ["cache"]
 
     attribute_map = {
         "num_experts": "num_local_experts",
@@ -194,9 +196,16 @@ class HybridQwen3MoeConfig(PreTrainedConfig):
                 rope_parameters.update(rope_scaling)
         self.rope_parameters = rope_parameters
 
-        # Set layer types to hybrid pattern
+        # A saved config holds layer_types, which reach this __init__ in kwargs, since it has no parameter for them.
+        # A config with a hybrid pattern derives them from the pattern instead, starting from the layers of the base
+        # Qwen3-MoE model, which are all full attention.
+        layer_types = kwargs.pop("layer_types", None)
         if self.hybrid_override_pattern is not None:
-            self.layer_types = self.hybrid_override_pattern.split("-")
+            layer_types = hybrid_layer_types(
+                self.hybrid_override_pattern, ["full_attention"] * self.num_hidden_layers
+            )
+        if layer_types is not None:
+            self.layer_types = layer_types
 
         # MoE arguments
         self.decoder_sparse_step = decoder_sparse_step

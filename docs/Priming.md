@@ -268,7 +268,7 @@ stage: sft
 ### Training ###
 learning_rate: 5.0e-5
 lr_scheduler_type: linear
-warmup_ratio: 0.03
+warmup_steps: 0.03
 num_train_epochs: 2.0
 cutoff_len: 32768
 ```
@@ -292,7 +292,7 @@ stage: sft
 ### Training ###
 learning_rate: 5.0e-5
 lr_scheduler_type: cosine
-warmup_ratio: 0.1
+warmup_steps: 0.1
 num_train_epochs: 1.0
 cutoff_len: 32768
 drop_exceed_length_data: true

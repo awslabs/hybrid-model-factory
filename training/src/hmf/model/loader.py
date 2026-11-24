@@ -81,6 +81,13 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
 
     Note: including inplace operation of model_args.
     """
+    # AutoTokenizer reads the model's config first, and without the hybrid models registered, it falls back to the
+    # base PreTrainedConfig, whose checks reject the hybrid pattern's entries (such as "GKA") that older hybrid
+    # checkpoints saved in layer_types. The registered hybrid configs ignore those entries and derive layer_types
+    # from the pattern.
+    from .hybrid_zoo.models.model_register import register_hybrid_models
+    register_hybrid_models()
+
     init_kwargs = _get_init_kwargs(model_args)
     try:
         tokenizer = AutoTokenizer.from_pretrained(

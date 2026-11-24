@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from itertools import chain
 from typing import Any
 
+from ..decision_prompt import adds_bos_token
 from .processor_utils import DatasetProcessor
 
 
@@ -34,7 +35,7 @@ class PretrainDatasetProcessor(DatasetProcessor):
             text_examples = [messages[0]["content"] for messages in examples["_prompt"]]
 
         if not self.data_args.packing:
-            if getattr(self.tokenizer, "add_bos_token", False):
+            if adds_bos_token(self.tokenizer):
                 text_examples = [self.tokenizer.bos_token + example for example in text_examples]
 
             result = self.tokenizer(
@@ -52,7 +53,7 @@ class PretrainDatasetProcessor(DatasetProcessor):
                 k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
                 for k, t in concatenated_examples.items()
             }
-            if getattr(self.tokenizer, "add_bos_token", False):
+            if adds_bos_token(self.tokenizer):
                 for i in range(len(result["input_ids"])):
                     result["input_ids"][i][0] = self.tokenizer.bos_token_id
             result["position_ids"] = [list(range(len(t))) for t in result["input_ids"]]

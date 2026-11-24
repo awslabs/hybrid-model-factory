@@ -50,8 +50,8 @@ def _incremental(model, ids, chunks, attention_mask=None):
         cache, start, steps = HybridCache(model.config), 0, []
         for n in chunks:
             kwargs = {} if attention_mask is None else {"attention_mask": attention_mask[:, : start + n]}
-            out = model(ids[:, start : start + n], past_key_values=cache, use_cache=True, **kwargs)
-            cache, start = out.past_key_values, start + n
+            out = model(ids[:, start : start + n], cache=cache, use_cache=True, **kwargs)
+            cache, start = out.cache, start + n
             steps.append(out.logits)
     return torch.cat(steps, dim=1)
 
@@ -64,12 +64,14 @@ def _left_padded_mask(ids, pad=4):
 
 def test_mask_sizes_count_cached_tokens():
     cache = HybridCache(_model().config)
-    assert cache.get_mask_sizes(torch.arange(5), 0) == (5, 0)  # nothing cached yet
+    assert cache.get_mask_sizes(5, 0) == (5, 0)  # nothing cached yet
+    assert cache.get_query_offset(0) == 0
     k = torch.zeros(1, 2, 7, 16)
     cache.update(k, k, layer_idx=3)
-    # Asked about a layer without K/V (e.g. a GDN layer 0): still the attention length.
-    assert cache.get_mask_sizes(torch.arange(7, 10), 0) == (10, 0)
-    assert cache.get_mask_sizes(torch.arange(7, 8), 3) == (8, 0)
+    # A layer without keys and values, such as a GDN layer 0, still gets the attention cache's length
+    assert cache.get_mask_sizes(3, 0) == (10, 0)
+    assert cache.get_mask_sizes(1, 3) == (8, 0)
+    assert cache.get_query_offset(0) == cache.get_query_offset(3) == 7
 
 
 @pytest.mark.parametrize("attn", ["sdpa", "eager"])

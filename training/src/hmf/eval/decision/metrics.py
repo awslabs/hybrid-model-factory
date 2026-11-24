@@ -26,6 +26,12 @@ The metrics of a set of answers (summarize), each overall, by kind, by task, and
     - mean_confidence: the mean confidence.
     - score_mae: for score answers, the mean absolute difference between the expected level and the
       label, in levels.
+
+The metrics of a pair file (pair_metrics), whose rows come in adjacent pairs:
+
+    - acc_first, acc_second: the accuracy of the first and of the second answers of the pairs.
+    - same_answer: the share of pairs whose two answers are the same option.
+    - both_right: the share of pairs whose two answers are both right.
 """
 
 import math
@@ -197,6 +203,29 @@ def summarize(preds: List[Prediction], by_task: bool = True) -> Dict[str, object
         band: _block([p for p in preds if low <= p.confidence < high]) for band, (low, high) in CONFIDENCE_BANDS.items()
     }
     return result
+
+
+def pair_metrics(preds: List[Prediction]) -> Dict[str, Optional[float]]:
+    """
+    The metrics of the answers to a pair file, whose rows come in adjacent pairs, as Strands Decider's
+    evaluation/pair_eval.py defines them. In a paraphrase pair, which asks one question in two wordings with
+    the same label, same_answer measures whether the wording changes the answer. In a flip pair, whose two
+    instructions have opposite answers on one document, both_right measures whether the model follows the
+    instruction rather than the document.
+    """
+    if len(preds) % 2:
+        raise ValueError(f"A pair file has an even number of answers, got {len(preds)}.")
+    first, second = preds[0::2], preds[1::2]
+    n = len(first)
+    if n == 0:
+        return {"pairs": 0, "acc_first": None, "acc_second": None, "same_answer": None, "both_right": None}
+    return {
+        "pairs": n,
+        "acc_first": sum(p.correct for p in first) / n,
+        "acc_second": sum(p.correct for p in second) / n,
+        "same_answer": sum(a.pred == b.pred for a, b in zip(first, second)) / n,
+        "both_right": sum(a.correct and b.correct for a, b in zip(first, second)) / n,
+    }
 
 
 def format_summary(summary: Dict[str, object], title: Optional[str] = None) -> str:

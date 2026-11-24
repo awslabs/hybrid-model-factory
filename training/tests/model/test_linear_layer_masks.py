@@ -10,8 +10,9 @@ The CPU tests check the helper on the masks transformers builds. The GPU tests n
 that GDN gives bit-identical outputs for a 2D mask and the 4D masks with the same padding, so flash attention
 runs are unchanged, and that tiny Qwen3.5 GDN hybrids decode from the cache as a full forward does under SDPA,
 eager, and flash attention. For tiny Qwen3 GKA hybrids, which decode one token at a time from a cache, they check
-that one-token decoding matches a full forward, that a step of several tokens on top of a cache raises, and that
-generate() and cache composition run without raising.
+that one-token decoding matches a full forward, that a step of several tokens on top of a cache raises, that a
+left-padded row matches its unpadded run while packed inputs raise, and that generate() and cache composition run
+without raising.
 """
 
 import importlib.util
@@ -67,8 +68,8 @@ def _mask_for(attn, padding, q_len, past=0):
         config=cfg,
         inputs_embeds=torch.zeros(padding.shape[0], q_len, HIDDEN),
         attention_mask=padding,
-        cache_position=torch.arange(past, past + q_len),
-        past_key_values=cache,
+        position_ids=torch.arange(past, past + q_len).unsqueeze(0),
+        cache=cache,
     )
 
 
@@ -176,8 +177,8 @@ def _incremental(model, ids, chunks, attention_mask=None):
     cache, start, steps = None, 0, []
     for n in chunks:
         kwargs = {} if attention_mask is None else {"attention_mask": attention_mask[:, : start + n]}
-        out = model(ids[:, start : start + n], past_key_values=cache, use_cache=True, **kwargs)
-        cache, start = out.past_key_values, start + n
+        out = model(ids[:, start : start + n], cache=cache, use_cache=True, **kwargs)
+        cache, start = out.cache, start + n
         steps.append(out.logits)
     return torch.cat(steps, dim=1)
 
@@ -261,10 +262,23 @@ def test_gka_multi_token_step_after_prefill_raises(attn, chunks):
 
 @needs_cuda
 @pytest.mark.parametrize("attn", BACKENDS)
-def test_gka_still_refuses_padding(attn):
+def test_gka_left_padded_row_matches_its_unpadded_run(attn):
     model = _qwen3_gka_model(attn)
+    ids = _ids()
+    with torch.no_grad():
+        padded = model(ids, attention_mask=_padding(12, left=4).cuda()).logits
+        alone = model(ids[:1, 4:]).logits
+    assert _max_err(padded[0, 4:], alone[0]) < TOL
+
+
+@needs_cuda
+@pytest.mark.parametrize("attn", BACKENDS)
+def test_gka_still_refuses_packed_inputs(attn):
+    """Neat packing's positions restart within a row, which GKA refuses rather than take its mask for padding."""
+    model = _qwen3_gka_model(attn)
+    position_ids = torch.cat([torch.arange(6), torch.arange(6)]).expand(2, -1).cuda()
     with torch.no_grad(), pytest.raises(NotImplementedError, match="varlen"):
-        model(_ids(), attention_mask=_padding(12, left=4).cuda())
+        model(_ids(), attention_mask=_padding(12, left=4).cuda(), position_ids=position_ids)
 
 
 @needs_cuda

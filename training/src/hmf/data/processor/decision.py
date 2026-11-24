@@ -23,7 +23,13 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from ...extras import logging
-from ..decision_prompt import NOUL_OPTION_NAMES, adds_bos_token, encode_decision_prompt, get_prompt_format
+from ..decision_prompt import (
+    NOUL_OPTION_NAMES,
+    OptionLabels,
+    adds_bos_token,
+    encode_decision_prompt,
+    get_prompt_format,
+)
 from .processor_utils import DatasetProcessor
 
 
@@ -81,6 +87,7 @@ class DecisionDatasetProcessor(DatasetProcessor):
 
     def preprocess_dataset(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
         prompt_format = get_prompt_format(self.data_args.decision_prompt_format)
+        option_labels = OptionLabels(self.data_args.decision_option_labels, self.tokenizer)
         num_augmentations = 1 if self.is_eval else self.data_args.decision_num_augmentations
         force_bos = self.data_args.decision_force_bos
 
@@ -110,7 +117,8 @@ class DecisionDatasetProcessor(DatasetProcessor):
                     examples["_instructions"][i], examples["_instruction_variants"][i] or [], rng
                 )
                 rendered = prompt_format.render(
-                    examples["_state"][i], instructions, kind, options, option_order=order
+                    examples["_state"][i], instructions, kind, options, option_order=order,
+                    labels=option_labels(num_options),
                 )
                 encoded = encode_decision_prompt(self.tokenizer, rendered, force_bos=force_bos)
                 if len(encoded.input_ids) > self.data_args.cutoff_len:

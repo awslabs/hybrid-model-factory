@@ -49,7 +49,7 @@ from datasets import Dataset, Features, Sequence as SequenceFeature, Value, conc
 from ..extras import logging
 from ..extras.misc import get_current_device, is_torch_mps_available, torch_gc
 from .data_utils import decision_dataset_files, decision_sources, read_decision_rows
-from .decision_prompt import get_prompt_format
+from .decision_prompt import OptionLabels
 from .decision_teachers import CausalLMScorer, ScoringQuery, TeacherFile, load_teacher_model, to_augmented_order
 from .parser import get_dataset_list
 
@@ -233,11 +233,11 @@ def label_shard(
                 f"The anchor model {data_args.decision_anchor_model} reads the tokenized prompts, so it must use the "
                 f"tokenizer the data was tokenized with ({model_args.model_name_or_path})."
             )
-        # The options' labels in the prompt format (1, 2, ...), in the order the prompt shows them
-        prompt_format = get_prompt_format(data_args.decision_prompt_format)
+        # The options' labels as the prompts show them (1, 2, ... or A, B, ...), in the order they show them
+        option_labels = OptionLabels(data_args.decision_option_labels, data_tokenizer)
         refs = anchor(
             [
-                ScoringQuery(ids, answer_idx, [prompt_format.option_label(k) for k in range(n)])
+                ScoringQuery(ids, answer_idx, option_labels(n))
                 for ids, answer_idx, n in zip(rows["input_ids"], rows["answer_idx"], num_options)
             ]
         )

@@ -41,7 +41,7 @@ learning_rate: 1.0e-4                # LoRA adapters
 decision_head_lr: 1.0e-3             # The head starts from a random initialization, so it needs a bigger step
 weight_decay: 0.01                   # Applies to the head's matrices only
 lr_scheduler_type: cosine
-warmup_ratio: 0.03
+warmup_steps: 0.03
 max_grad_norm: 1.0
 adam_beta2: 0.95
 seed: 0
