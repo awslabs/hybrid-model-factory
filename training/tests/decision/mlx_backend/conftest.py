@@ -46,6 +46,8 @@ def tiny_source(source: str) -> "transformers.PreTrainedModel":
 def _save_tiny_tokenizer(path) -> None:
     words = ["state", "question", "options", "answer", "true", "false", "refund", "ignore", "escalate", "words"]
     words += [f"tok{i}" for i in range(30)]
+    # Label heads read the options' labels as the letters A to Z (decision_option_labels: letters), one token each
+    words += [chr(ord("A") + i) for i in range(26)]
     vocab = {"[UNK]": 0, "[PAD]": PAD_TOKEN_ID, **{word: i + 2 for i, word in enumerate(words)}}
     tokenizer = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
@@ -54,23 +56,27 @@ def _save_tiny_tokenizer(path) -> None:
 
 @pytest.fixture(scope="session")
 def decision_model_dir(tmp_path_factory):
-    """Returns the folder of a tiny float32 decision model converted from a tiny causal LM of the source."""
+    """
+    Returns the folder of a tiny float32 decision model converted from a tiny causal LM of the source, with the
+    decision head of head_type (the pointer head by default).
+    """
     cache = {}
 
-    def make(source: str) -> str:
-        if source not in cache:
-            root = tmp_path_factory.mktemp(f"mlx_decision_{source}")
+    def make(source: str, head_type: str = "pointer") -> str:
+        if (source, head_type) not in cache:
+            root = tmp_path_factory.mktemp(f"mlx_decision_{source}_{head_type}")
             torch.manual_seed(0)
             tiny_source(source).save_pretrained(root / "source")
             _save_tiny_tokenizer(root / "source")
             init_decision_model(
                 DecisionInitConfig(
                     base_model_name_or_path=str(root / "source"), output_dir=str(root / "decision"),
-                    dtype=torch.float32, decision_head_dim=HEAD_DIM, decision_head_dropout=0.0, seed=0,
+                    dtype=torch.float32, decision_head_type=head_type, decision_head_dim=HEAD_DIM,
+                    decision_head_dropout=0.0, seed=0,
                 )
             )
-            cache[source] = str(root / "decision")
-        return cache[source]
+            cache[(source, head_type)] = str(root / "decision")
+        return cache[(source, head_type)]
 
     return make
 

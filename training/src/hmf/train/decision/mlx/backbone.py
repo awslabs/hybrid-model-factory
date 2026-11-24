@@ -3,7 +3,7 @@ Loads the backbone of a decision model (an hmf_decision checkpoint written by hm
 mlx-lm's text model of the same architecture, for training and running decision models on Apple silicon with MLX.
 
 A decision checkpoint stores its backbone's weights under `model.`, which is also where mlx-lm's Qwen3 and Qwen3.5
-text models keep their decoders, so the weights load by name. The pointer head's weights, under `decision_head.`,
+text models keep their decoders, so the weights load by name. The decision head's weights, under `decision_head.`,
 are returned separately (see model.py). Only Qwen3 and Qwen3.5 backbones are supported. HMF's hybrid models, whose
 layers mlx-lm does not have, are refused.
 """
@@ -48,7 +48,7 @@ class Backbone:
     Args:
         decoder: mlx-lm's decoder, which maps token ids of shape [batch, seq_len] to the final normalized hidden
             states of shape [batch, seq_len, hidden_size].
-        head_weights: The pointer head's weights, by name within the head (e.g., "q.weight"), in float32.
+        head_weights: The decision head's weights, by name within the head (e.g., "q.weight"), in float32.
         config: The decision model's configuration (config.json).
     """
 
@@ -148,7 +148,7 @@ def load_backbone(model_path: str, dtype: str = "bfloat16", config: Optional[Dic
         config: The decision model's configuration. Defaults to the folder's config.json.
 
     Returns:
-        The backbone, with the pointer head's weights and the configuration.
+        The backbone, with the decision head's weights and the configuration.
     """
     import importlib
 
@@ -173,8 +173,8 @@ def load_backbone(model_path: str, dtype: str = "bfloat16", config: Optional[Dic
     attention = config.get("decision_attention", "causal")
     if attention != "causal":
         raise ValueError(
-            f"{model_path} attends over the prompt with decision_attention={attention!r}, but the MLX backend supports "
-            "only causal attention. Train this model with PyTorch (decision_backend: torch)."
+            f"{model_path} attends over the prompt with decision_attention={attention!r}, but the MLX backend "
+            "supports only causal attention. Train this model with PyTorch (decision_backend: torch)."
         )
 
     module = importlib.import_module(f"mlx_lm.models.{MLX_MODULES[model_type]}")

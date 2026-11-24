@@ -1,9 +1,9 @@
 """
 LoRA adapters and trainable parameters for decision models in MLX, which mirror what HMF sets up for PyTorch training
-(model/adapter.py). With LoRA, the backbone's linear layers get adapters, and the pointer head is trained in full and
-saved with the adapters (PEFT's modules_to_save). With full fine-tuning, every parameter is trained, or with
-hybrid_learnable_params only those whose names contain one of its comma-separated parts (e.g., decision_head, to
-train the head alone).
+(model/adapter.py). With LoRA, the backbone's linear layers get adapters, and the decision head is trained in full,
+apart from the frozen rows of a label head, and saved with the adapters (PEFT's modules_to_save). With full
+fine-tuning, every parameter is trained, or with hybrid_learnable_params only those whose names contain one of its
+comma-separated parts (e.g., decision_head, to train the head alone).
 
 LoRA uses mlx-lm's LoRALinear layers, which hold A as [in_features, rank] and B as [rank, out_features] (PEFT holds
 the transposes, see checkpoint.py) and add scale * (x A) B to the base layer's output. A starts uniform in plus or
@@ -19,7 +19,7 @@ from mlx import nn
 from mlx.utils import tree_flatten, tree_unflatten
 
 from .backbone import KeyedDropout
-from .model import DecisionModelMLX
+from .model import DecisionModelMLX, freeze_fixed_rows
 
 
 __all__ = ["LoRALinear", "attach_lora", "lora_layers", "lora_scale", "lora_targets", "merge_lora", "set_trainable"]
@@ -46,7 +46,7 @@ def lora_scale(rank: int, alpha: float, use_rslora: bool = False) -> float:
 def lora_targets(model: DecisionModelMLX, lora_target: Sequence[str]) -> List[str]:
     """
     Returns the names of the layers to adapt. ["all"] stands for the names of all the backbone's linear layers, as
-    find_all_linear_modules gives for PyTorch (the pointer head, which is trained in full, has no adapters). Other
+    find_all_linear_modules gives for PyTorch (the decision head, which is trained in full, has no adapters). Other
     values are returned as they are.
 
     Args:
@@ -127,9 +127,10 @@ def set_trainable(
 ) -> List[str]:
     """
     Unfreezes the parameters to train, freezes the others, and casts the trainable ones to float32, as HMF keeps
-    trainable parameters by default. With LoRA, the trainable parameters are the adapters' A and B and the pointer
+    trainable parameters by default. With LoRA, the trainable parameters are the adapters' A and B and the decision
     head. With full fine-tuning, they are all parameters, or those whose paths contain one of the comma-separated
-    parts of hybrid_learnable_params.
+    parts of hybrid_learnable_params. In every case, the rows of a "label" or "label_pointer" head stay frozen, as
+    they are a buffer in PyTorch.
 
     Args:
         model: The decision model, with its adapters attached for LoRA.
@@ -165,7 +166,13 @@ def set_trainable(
             module_path, _, name = path.rpartition(".")
             module = model if not module_path else dict(model.named_modules())[module_path]
             module.unfreeze(keys=[name], recurse=False)
+    freeze_fixed_rows(model)
 
     trainable = tree_flatten(model.trainable_parameters())
+    if not trainable:
+        raise ValueError(
+            "No parameter of the model is trainable. The rows of a label or label_pointer head stay frozen, so "
+            "training the head alone (hybrid_learnable_params: decision_head) trains nothing with a label head."
+        )
     model.load_weights([(path, value.astype(mx.float32)) for path, value in trainable], strict=False)
     return sorted(path for path, _ in trainable)

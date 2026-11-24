@@ -5,7 +5,7 @@ depending on its finetuning_type, which are the same as the PyTorch DecisionTrai
 
     - With LoRA, it saves a PEFT adapter, with adapter_config.json, written by PEFT's own LoraConfig, and
       adapter_model.safetensors, whose keys are PEFT's, base_model.model.<path>.lora_A.weight and .lora_B.weight for
-      each adapted layer and base_model.model.decision_head.<name> for the pointer head, which PEFT saves with the
+      each adapted layer and base_model.model.decision_head.<name> for the decision head, which PEFT saves with the
       adapter (modules_to_save). mlx-lm holds A as [in_features, rank] and B as [rank, out_features], while PEFT
       holds the transposes, A as [rank, in_features] and B as [out_features, rank].
     - With full fine-tuning, it saves a decision model (an hmf_decision checkpoint), with config.json and
@@ -48,7 +48,7 @@ def save_adapter(
     base_model_name_or_path: Optional[str] = None,
 ) -> None:
     """
-    Saves a decision model's LoRA adapters and pointer head as a PEFT adapter, in float32.
+    Saves a decision model's LoRA adapters and decision head as a PEFT adapter, in float32.
 
     Args:
         model: The decision model, with its adapters attached.
@@ -83,7 +83,7 @@ def save_adapter(
 def load_adapter(model: DecisionModelMLX, adapter_dir: str) -> Dict[str, Any]:
     """
     Loads a PEFT adapter into a decision model, saved by MLX or by PyTorch. Its LoRA layers are attached with the
-    adapter's settings and loaded, in float32, and the pointer head is loaded from the adapter when it is there (as
+    adapter's settings and loaded, in float32, and the decision head is loaded from the adapter when it is there (as
     modules_to_save).
 
     Args:
