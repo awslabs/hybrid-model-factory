@@ -122,6 +122,17 @@ def test_refuses_an_unsupported_backbone(decision_model_dir, tmp_path):
         load_backbone(str(model_dir))
 
 
+def test_refuses_bidirectional_attention(decision_model_dir, tmp_path):
+    model_dir = tmp_path / "decision"
+    shutil.copytree(decision_model_dir("qwen3_5"), model_dir)
+    config = json.loads((model_dir / "config.json").read_text())
+    config["decision_attention"] = "bidirectional"
+    (model_dir / "config.json").write_text(json.dumps(config))
+
+    with pytest.raises(ValueError, match="only causal attention"):
+        load_backbone(str(model_dir))
+
+
 def test_refuses_an_unknown_dtype(decision_model_dir):
     with pytest.raises(ValueError, match="no dtype"):
         load_backbone(decision_model_dir("qwen3"), dtype="int8")

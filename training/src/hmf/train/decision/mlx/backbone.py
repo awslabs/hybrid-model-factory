@@ -168,6 +168,14 @@ def load_backbone(model_path: str, dtype: str = "bfloat16", config: Optional[Dic
         raise ValueError(
             f"The MLX backend supports decision models on {sorted(MLX_MODULES)} backbones, not {model_type!r}."
         )
+    # mlx-lm's attention is always causal, so a bidirectional model would train as a different model than the one
+    # PyTorch serves
+    attention = config.get("decision_attention", "causal")
+    if attention != "causal":
+        raise ValueError(
+            f"{model_path} attends over the prompt with decision_attention={attention!r}, but the MLX backend supports "
+            "only causal attention. Train this model with PyTorch (decision_backend: torch)."
+        )
 
     module = importlib.import_module(f"mlx_lm.models.{MLX_MODULES[model_type]}")
     text_config = _layer_pattern(text_config)
